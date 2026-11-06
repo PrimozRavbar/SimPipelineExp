@@ -1,4 +1,6 @@
-# SimPipeline
+# SimPipelineExp
+
+This is a clone of SimPipeline. Experimental repo.
 
 **SimPipeline is a simulation environment for building and operating realistic machine-learning systems.**
 
