@@ -87,9 +87,13 @@ one user is active per tick, so raw per-tick CTR is 0 or 1. Plot the rolling ser
 
 ## Known issues (next phases)
 
-- Recall@K in the notebooks is scored on training data. Use
-  `RetrievalEvaluator(movie_objects, num_users=..., seed=...)` for a held-out score.
-  `SimPip_DEMO_1p2.ipynb` still calls the old signature.
+- `SimPip_DEMO_1p2.ipynb` (legacy Colab notebook) still scores Recall@K on training data
+  and uses `/content/...` paths. The quickstart uses the held-out
+  `RetrievalEvaluator(movie_objects, num_users=..., seed=...)`.
+- **Retraining doesn't raise CTR yet.** In the quickstart (seed 42, 5000 ticks, then retrain),
+  CTR goes from 18.3% to 18.7%, about the same as a random slate. Held-out Recall@20 is 7.9%
+  vs 1.75% for random. The model ranks better than random offline, but that doesn't show up
+  in the top 10 users actually see.
 - Ratings and watch completion are random. They should depend on `rel(u, m)`.
 - `evaluate_popularity` pads its top-K list with movies drawn from the validation
   population. That leaks the answers, so its recall is inflated on small runs.
