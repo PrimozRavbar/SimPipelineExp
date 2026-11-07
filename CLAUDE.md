@@ -54,8 +54,10 @@ metrics, game scoring) uses that module. Don't redefine it elsewhere.
   genre-share vector and movie *m*'s 0/1 genre vector (over `GENRE_NAMES`). It is 0 if
   either vector is empty.
 - **Relevant (binary).** `rel(u, m) ≥ RELEVANCE_THRESHOLD`, which is currently 0.65. At that
-  threshold about 17% of the catalog is relevant for a typical user. A lower threshold lets
-  Drama-heavy taste make almost everything relevant. Use this label for
+  threshold the median user finds about 10% of the catalog relevant. The spread is wide and
+  skewed: p25 is about 6%, p75 about 34%, and the mean is about 17%. Users whose taste
+  matches a large genre such as Drama have many relevant movies. A lower threshold makes
+  almost everything relevant for them. Use this label for
   Recall/Precision/NDCG-style metrics against ground truth.
 - **World-side only.** It is computed from the World's `user_states`, which the ML system
   must never read directly. It is deterministic and uses no RNG.

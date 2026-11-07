@@ -68,8 +68,13 @@ def test_relevant_fraction_is_selective(data):
         )
         fractions.append(relevant / len(movies))
 
+    fractions.sort()
+    median_fraction = fractions[len(fractions) // 2]
     mean_fraction = sum(fractions) / len(fractions)
-    assert 0.05 < mean_fraction < 0.35, (RELEVANCE_THRESHOLD, mean_fraction)
+
+    # Pin the numbers quoted in CLAUDE.md ("Relevance"): median ~10%, mean ~17%.
+    assert 0.07 < median_fraction < 0.13, (RELEVANCE_THRESHOLD, median_fraction)
+    assert 0.14 < mean_fraction < 0.20, (RELEVANCE_THRESHOLD, mean_fraction)
 
 
 def click_through_rate(data, slate_for_user, seed=1):

@@ -8,7 +8,8 @@ Pure Python and deterministic: no RNG, no torch.
 
 import math
 
-# About 17% of the catalog is relevant for a typical MovieLens user.
+# Median MovieLens user: ~10% of the catalog is relevant (mean ~17%, skewed
+# up by users whose taste matches a big genre such as Drama).
 RELEVANCE_THRESHOLD = 0.65
 
 
