@@ -1,4 +1,8 @@
 
+import random
+
+import torch
+
 from ml_system.ann import HNSWIndex
 from ml_system.offline_feature_store import OfflineFeatureStore
 from ml_system.offline_pipeline import OfflineFeaturePipeline
@@ -8,16 +12,29 @@ from ml_system.two_tower import SimpleUserTower, SimpleItemTower
 
 
 class RetrievalEvaluator:
+    """Train a fresh two-tower model on the first `split_ratio` of the
+    events and score Recall@K on the held-out rest.
+
+    `num_users` must cover every user_id (the user tower has an ID
+    embedding); pass len(user_objects). `seed` fixes torch, negative
+    sampling and the HNSW graph so the same events give the same score.
+    """
 
     def __init__(
         self,
         movie_objects,
+        num_users,
         split_ratio=0.8,
-        k=20
+        k=20,
+        seed=0,
+        epochs=5
     ):
         self.movie_objects = movie_objects
+        self.num_users = num_users
         self.split_ratio = split_ratio
         self.k = k
+        self.seed = seed
+        self.epochs = epochs
 
 
     def evaluate(self, events):
@@ -28,6 +45,14 @@ class RetrievalEvaluator:
 
         train_events = events[:split_index]
         validation_events = events[split_index:]
+
+        if not train_events:
+            raise ValueError(
+                "RetrievalEvaluator needs at least one training event"
+            )
+
+        seeds = random.Random(self.seed)
+        torch.manual_seed(seeds.getrandbits(32))
 
 
         # ---------------------------------------------
@@ -51,7 +76,8 @@ class RetrievalEvaluator:
         # ---------------------------------------------
 
         dataset_generator = TrainingDatasetGenerator(
-            feature_store
+            feature_store,
+            rng=random.Random(seeds.getrandbits(64))
         )
 
         for event_order, event in enumerate(train_events):
@@ -68,7 +94,9 @@ class RetrievalEvaluator:
         # Train fresh Two-Tower
         # ---------------------------------------------
 
-        user_tower = SimpleUserTower()
+        user_tower = SimpleUserTower(
+            num_users=self.num_users
+        )
 
         item_tower = SimpleItemTower(
             num_movies=len(self.movie_objects)
@@ -76,7 +104,8 @@ class RetrievalEvaluator:
 
         trainer = TwoTowerTrainer(
             user_tower=user_tower,
-            item_tower=item_tower
+            item_tower=item_tower,
+            epochs=self.epochs
         )
 
         trainer.train(
@@ -110,7 +139,9 @@ class RetrievalEvaluator:
                 )
 
 
-        ann_index = HNSWIndex()
+        ann_index = HNSWIndex(
+            seed=seeds.getrandbits(32)
+        )
 
         ann_index.build(
             item_embeddings
@@ -157,6 +188,12 @@ class RetrievalEvaluator:
             if user_features is None:
                 continue
 
+            # The user tower needs the ID, which the feature store does not
+            # keep (TrainingDatasetGenerator adds it the same way).
+            user_features = {
+                **user_features,
+                "user_id": event.user_id
+            }
 
             user_embedding = user_tower.embed(
                 user_features

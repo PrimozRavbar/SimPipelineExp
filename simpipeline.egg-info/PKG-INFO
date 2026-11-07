@@ -1,0 +1,446 @@
+Metadata-Version: 2.4
+Name: simpipeline
+Version: 0.1.0
+Summary: Simulation environment for building and operating realistic ML systems.
+Author: Primoz Ravbar
+License: # PolyForm Noncommercial License 1.0.0
+        
+        <https://polyformproject.org/licenses/noncommercial/1.0.0>
+        
+        ## Acceptance
+        
+        In order to get any license under these terms, you must agree
+        to them as both strict obligations and conditions to all
+        your licenses.
+        
+        ## Copyright License
+        
+        The licensor grants you a copyright license for the
+        software to do everything you might do with the software
+        that would otherwise infringe the licensor's copyright
+        in it for any permitted purpose.  However, you may
+        only distribute the software according to [Distribution
+        License](#distribution-license) and make changes or new works
+        based on the software according to [Changes and New Works
+        License](#changes-and-new-works-license).
+        
+        ## Distribution License
+        
+        The licensor grants you an additional copyright license
+        to distribute copies of the software.  Your license
+        to distribute covers distributing the software with
+        changes and new works permitted by [Changes and New Works
+        License](#changes-and-new-works-license).
+        
+        ## Notices
+        
+        You must ensure that anyone who gets a copy of any part of
+        the software from you also gets a copy of these terms or the
+        URL for them above, as well as copies of any plain-text lines
+        beginning with `Required Notice:` that the licensor provided
+        with the software.  For example:
+        
+        > Required Notice: Copyright Yoyodyne, Inc. (http://example.com)
+        
+        ## Changes and New Works License
+        
+        The licensor grants you an additional copyright license to
+        make changes and new works based on the software for any
+        permitted purpose.
+        
+        ## Patent License
+        
+        The licensor grants you a patent license for the software that
+        covers patent claims the licensor can license, or becomes able
+        to license, that you would infringe by using the software.
+        
+        ## Noncommercial Purposes
+        
+        Any noncommercial purpose is a permitted purpose.
+        
+        ## Personal Uses
+        
+        Personal use for research, experiment, and testing for
+        the benefit of public knowledge, personal study, private
+        entertainment, hobby projects, amateur pursuits, or religious
+        observance, without any anticipated commercial application,
+        is use for a permitted purpose.
+        
+        ## Noncommercial Organizations
+        
+        Use by any charitable organization, educational institution,
+        public research organization, public safety or health
+        organization, environmental protection organization,
+        or government institution is use for a permitted purpose
+        regardless of the source of funding or obligations resulting
+        from the funding.
+        
+        ## Fair Use
+        
+        You may have "fair use" rights for the software under the
+        law. These terms do not limit them.
+        
+        ## No Other Rights
+        
+        These terms do not allow you to sublicense or transfer any of
+        your licenses to anyone else, or prevent the licensor from
+        granting licenses to anyone else.  These terms do not imply
+        any other licenses.
+        
+        ## Patent Defense
+        
+        If you make any written claim that the software infringes or
+        contributes to infringement of any patent, your patent license
+        for the software granted under these terms ends immediately. If
+        your company makes such a claim, your patent license ends
+        immediately for work on behalf of your company.
+        
+        ## Violations
+        
+        The first time you are notified in writing that you have
+        violated any of these terms, or done anything with the software
+        not covered by your licenses, your licenses can nonetheless
+        continue if you come into full compliance with these terms,
+        and take practical steps to correct past violations, within
+        32 days of receiving notice.  Otherwise, all your licenses
+        end immediately.
+        
+        ## No Liability
+        
+        ***As far as the law allows, the software comes as is, without
+        any warranty or condition, and the licensor will not be liable
+        to you for any damages arising out of these terms or the use
+        or nature of the software, under any kind of legal claim.***
+        
+        ## Definitions
+        
+        The **licensor** is the individual or entity offering these
+        terms, and the **software** is the software the licensor makes
+        available under these terms.
+        
+        **You** refers to the individual or entity agreeing to these
+        terms.
+        
+        **Your company** is any legal entity, sole proprietorship,
+        or other kind of organization that you work for, plus all
+        organizations that have control over, are under the control of,
+        or are under common control with that organization.  **Control**
+        means ownership of substantially all the assets of an entity,
+        or the power to direct its management and policies by vote,
+        contract, or otherwise.  Control can be direct or indirect.
+        
+        **Your licenses** are all the licenses granted to you for the
+        software under these terms.
+        
+        **Use** means anything you do with the software requiring one
+        of your licenses.
+        
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: numpy>=1.24
+Requires-Dist: pandas>=2.0
+Requires-Dist: torch>=2.0
+Provides-Extra: dev
+Requires-Dist: pytest>=7; extra == "dev"
+Requires-Dist: jupyter; extra == "dev"
+Requires-Dist: matplotlib; extra == "dev"
+Dynamic: license-file
+
+# SimPipelineExp
+
+This is a clone of SimPipeline. Experimental repo.
+
+**SimPipeline is a simulation environment for building and operating realistic machine-learning systems.**
+
+The project is being developed toward a **gamified ML systems learning platform** where users build ML systems from interchangeable production components, operate them under realistic conditions, diagnose failures and performance problems, and see the effects of their decisions through system and business metrics.
+
+The long-term goal is to simulate various ML systems. Thus SimPipeline is designed around reusable components that can support different ML systems, including recommendation, fraud detection, and other production ML workloads.
+
+## Current State
+
+Please run the DEMO notebook. You can simulate the world and the recommendation system ML pipeline receiving data from the world (clicks and views of the movies). The recommendations are also simulated at each time-step. This data will populate the datalake. Now you can run Spark to compute the offline features, and then train the Two-Tower model on them. Finally you can get the basic training quality metrics such as Recall@20. Now you have run the first simulation. After that you can keep running in for longer, re-training the model, etc, until the metric improves. Without the ranker and the re-ranker components implemented, a good result is about 60% Recall@20.
+
+The current implementation is a **basic end-to-end recommendation system simulation**.
+
+It already models the core production loop:
+
+- simulated users interacting with recommendations
+- recommendation and behavioral events
+- Kafka-style event ingestion
+- stream processing with Flink
+- online state/features through Redis
+- two-tower retrieval
+- HNSW approximate nearest-neighbor retrieval
+- model serving
+- event storage in a DataLake
+- periodic offline retraining
+- Spark-based offline computation
+- feature pipelines and feature storage
+- training dataset generation
+- two-tower model training
+- embedding generation
+- replacement of online retrieval artifacts after retraining
+
+## Architecture
+
+The current codebase of the system consists of an online serving loop and a periodic offline training loop.
+
+                         ┌──────────────────────────┐
+                         │        SIMULATOR         │
+                         │      clock / runtime     │
+                         └────────────┬─────────────┘
+                                      │
+                                      ▼
+                         ┌──────────────────────────┐
+                         │          WORLD           │
+                         │      UserSimulator       │
+                         └────────────┬─────────────┘
+                                      │
+                                      │ events
+                                      ▼
+                                   ┌───────┐
+                                   │ Kafka │
+                                   └───┬───┘
+                                       │
+                         ┌─────────────┴─────────────┐
+                         │                           │
+                         ▼                           ▼
+                     ┌───────┐                  ┌──────────┐
+                     │ Flink │                  │ DataLake │
+                     └───┬───┘                  └────┬─────┘
+                         │                            │
+                         │ online features            │ periodic
+                         ▼                            ▼
+                      ┌───────┐              ┌────────────────┐
+                      │ Redis │              │ Spark          │
+                      └───┬───┘              │ Offline       │
+                          │                  │ Pipeline      │
+                          │                  └───────┬────────┘
+                          │                          │
+                          │                          ├─ Feature Pipeline
+                          │                          ├─ Training Dataset
+                          │                          ├─ Two-Tower Training
+                          │                          └─ Embedding Generation
+                          │                          │
+                          │                          ▼
+                          │                    ┌──────────────┐
+                          │                    │ HNSW Index   │
+                          │                    └──────┬───────┘
+                          │                           │
+                          │       new towers + index  │
+                          │              ┌────────────┘
+                          │              │
+                          ▼              ▼
+                    ┌─────────────────────────┐
+                    │   TwoTowerRetrieval     │
+                    │                         │
+                    │ User Tower              │
+                    │ Item Tower              │
+                    │ HNSW Index              │
+                    └────────────┬────────────┘
+                                 │
+                                 │ recommendations
+                                 ▼
+                         ┌────────────────┐
+                         │  ModelServer   │
+                         └───────┬────────┘
+                                 │
+                                 │ recommendation
+                                 │ events
+                                 ▼
+                              WORLD
+                                 │
+                                 └───────────────► next interaction
+
+### The core loop
+
+The central simulation loop is:
+
+**World → Kafka → Flink → Redis → Retrieval → ModelServer → World**
+
+Users interact with recommendations. Those interactions produce events. Events enter the streaming system, update online state/features, and become inputs to subsequent recommendation requests.
+
+Recommendations themselves are represented as events, so the system forms a closed feedback loop rather than a one-way prediction pipeline.
+
+### Retraining loop
+
+Historical events are periodically used to retrain the retrieval system:
+
+**Kafka → DataLake → Spark → Offline ML pipeline → new towers + HNSW → Retrieval**
+
+The retraining process replaces the user tower, item tower, and ANN index used by the online retriever.
+
+The current recommendation pipeline implements **candidate retrieval with a two-tower model**. The subsequent **ranking** and **re-ranking** stages are not yet implemented. They are planned components of the production-style recommendation architecture.
+
+The current simulation also uses a **small MovieLens-based dataset**. This keeps the system manageable while the core architecture is being developed; increasing dataset scale and realism is part of the planned development.
+
+## System Components
+
+### Simulation
+
+**Simulator**
+
+Provides the simulation runtime, clock, service lifecycle, configuration, scenarios, and seeded random number generation.
+
+**World**
+
+Represents the simulated environment and users. It drives user activity and connects simulated behavior to the ML system.
+
+**UserSimulator**
+
+Models user reactions to recommendations, currently including:
+
+- recommendation exposure
+- clicks
+- watches
+- ratings
+
+The behavior model is intentionally replaceable and will become more sophisticated as SimPipeline evolves.
+
+### Online System
+
+**Kafka**
+
+Acts as the event transport layer for recommendation and behavioral events.
+
+**Flink**
+
+Processes the event stream and represents the streaming/online feature-processing layer.
+
+**Redis**
+
+Provides online storage used by the retrieval system.
+
+**TwoTowerRetrieval**
+
+Performs candidate retrieval using:
+
+- a user tower
+- an item tower
+- an HNSW ANN index
+- online feature/state access
+
+**ModelServer**
+
+Serves recommendations through the retrieval system.
+
+### Offline System
+
+**DataLake**
+
+Stores historical events used for offline processing and retraining.
+
+**Spark**
+
+Represents the offline computation layer.
+
+**Offline Feature Pipeline**
+
+Builds offline features used by training.
+
+**Offline Feature Store**
+
+Stores offline feature data.
+
+**Training Dataset Generator**
+
+Produces training data from the available historical/features data.
+
+**Two-Tower Trainer**
+
+Trains the user and item towers.
+
+**Embedding Generator**
+
+Produces embeddings used by the retrieval system.
+
+**HNSW Index**
+
+Builds the approximate nearest-neighbor index over item embeddings.
+
+## Retraining
+
+The system periodically runs the offline pipeline over accumulated DataLake events.
+
+The resulting artifacts include new model towers and item embeddings. A new HNSW index is constructed from the item embeddings, after which the online retriever is updated:
+
+    new User Tower
+           │
+           ▼
+    TwoTowerRetrieval
+
+    new Item Tower
+           │
+           ▼
+    TwoTowerRetrieval
+
+    new Item Embeddings
+           │
+           ▼
+       HNSW Index
+           │
+           ▼
+    TwoTowerRetrieval
+
+This models an important production property of ML systems: **the model serving the online system changes over time as new data is collected and new models are trained.**
+
+## Why SimPipeline
+
+Most ML education focuses on models and algorithms.
+
+Production ML systems are larger than the model.
+
+A recommendation system depends on data collection, event transport, stream processing, feature computation, storage, retrieval, serving, training, model updates, and the interaction between all of them.
+
+SimPipeline is designed to let users build, run, break, diagnose, and improve simulated ML systems.
+
+The eventual learning experience will turn the system into a game:
+
+1. Build an ML system from components.
+2. Run it.
+3. Observe its behavior and metrics.
+4. Encounter realistic production problem scenarios.
+5. Diagnose the underlying system issue.
+6. Change the architecture, configuration, data, features, model, or infrastructure.
+7. Run the system again.
+8. Observe the technical and business consequences.
+
+The same component model can then be used to construct different ML systems rather than creating a separate simulator for every scenario.
+
+## Roadmap
+
+The current recommendation system is the foundation for a much broader simulation environment.
+
+Planned development includes:
+
+- more realistic feature computation and serving
+- realistic data distributions and drift
+- stale features
+- latency and throughput constraints
+- failures and degraded services
+- backpressure and resource constraints
+- model and data quality problems
+- training/serving skew
+- more realistic retrieval and ranking
+- monitoring and observability
+- experiment and deployment workflows
+- richer production incidents
+- interchangeable ML infrastructure components
+- additional ML system types such as fraud detection
+- reusable scenarios and system configurations
+- a game layer built on top of the simulation
+
+## Project Status
+
+SimPipeline is under active development.
+
+The current system already runs an end-to-end simulated recommendation workload with online interaction, event collection, retrieval, and periodic offline retraining. The current implementation is intentionally simpler than a real production platform; the next stage is increasing the fidelity of each component and the interactions between them.
+
+## License
+
+SimPipeline is licensed under the **PolyForm Noncommercial License 1.0.0**.
+
+The source is publicly available for permitted noncommercial use, subject to the terms of the license. Commercial use requires separate permission.
+
+Copyright © 2026 Primoz Ravbar.
