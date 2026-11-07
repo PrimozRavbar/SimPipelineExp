@@ -59,6 +59,10 @@ metrics, game scoring) uses that module. Don't redefine it elsewhere.
   Recall/Precision/NDCG-style metrics against ground truth.
 - **World-side only.** It is computed from the World's `user_states`, which the ML system
   must never read directly. It is deterministic and uses no RNG.
+- **Slate.** `ModelServer` retrieves `num_candidates = 100` items and shows the user only
+  the top `slate_size = 10`. Both are set via `build_recommendation_system(...)`. Only the
+  shown slate is logged in `RecommendationShownEvent`, so training negatives
+  (`TrainingDatasetGenerator`) are always items the user saw and skipped.
 - **Click model (cascade with position bias).** The user scans the slate in rank order and
   examines rank *i* (0-based) with probability `1 / log2(i + 2)`, looking at the first
   `max_examined = 10` items at most. An examined item is clicked with probability

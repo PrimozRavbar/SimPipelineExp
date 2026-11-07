@@ -34,7 +34,9 @@ def build_recommendation_system(
     user_objects,
     user_states,
     movie_states,
-    seed=42
+    seed=42,
+    num_candidates=100,
+    slate_size=10
 ):
 
     # One seed controls every source of randomness, so two builds with the
@@ -82,7 +84,9 @@ def build_recommendation_system(
     )
 
     model_server = ModelServer(
-        retriever=retriever
+        retriever=retriever,
+        num_candidates=num_candidates,
+        slate_size=slate_size
     )
 
     # Simulator

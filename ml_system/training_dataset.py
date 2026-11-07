@@ -38,6 +38,8 @@ class TrainingDatasetGenerator:
             if shown is None:
                 return
 
+            # Negatives come only from the slate the user was shown (and
+            # skipped), never from retrieved-but-unshown candidates.
             candidates = [
                 movie_id
                 for movie_id in shown.movie_ids
