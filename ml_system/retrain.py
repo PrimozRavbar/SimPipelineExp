@@ -7,7 +7,7 @@ def retrain(system):
         system["datalake"].events
     )
 
-    hnsw_index = HNSWIndex()
+    hnsw_index = HNSWIndex(seed=system.get("seed", 0))
     hnsw_index.build(
         artifacts["item_embeddings"]
     )

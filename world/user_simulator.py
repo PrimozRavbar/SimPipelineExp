@@ -8,8 +8,11 @@ from simulation.events import (
 
 class UserSimulator:
 
-    def __init__(self, world):
+    def __init__(self, world, rng=None):
         self.world = world
+
+        # Seeded RNG so a simulation run is reproducible.
+        self.rng = rng if rng is not None else random.Random(0)
         #self.click_model = RandomClickModel()
         #self.watch_model = RandomWatchModel()
         #self.rating_model = RandomRatingModel()
@@ -85,7 +88,7 @@ class UserSimulator:
 
 
     #def should_click(self):
-        #return random.random() < 0.2
+        #return self.rng.random() < 0.2
 
     def should_click(self, user, movie_ids):
 
@@ -99,9 +102,9 @@ class UserSimulator:
                 genre in user_state.genre_preferences
                 for genre in movie.genres
             ):
-                return random.random() < 0.6
+                return self.rng.random() < 0.6
 
-        return random.random() < 0.1
+        return self.rng.random() < 0.1
 
 
     def click(
@@ -140,7 +143,7 @@ class UserSimulator:
                 for _ in movie_ids
             ]
 
-        selected_movie = random.choices(
+        selected_movie = self.rng.choices(
             movie_ids,
             weights=probabilities,
             k=1
@@ -155,7 +158,7 @@ class UserSimulator:
 
 
     def should_watch(self):
-        return random.random() < 0.8
+        return self.rng.random() < 0.8
 
 
     def watch(
@@ -169,13 +172,13 @@ class UserSimulator:
             timestamp=sim.clock.now,
             user_id=user.user_id,
             movie_id=movie_id,
-            watch_time=random.uniform(5, 120),
-            completion=random.uniform(0.1, 1.0)
+            watch_time=self.rng.uniform(5, 120),
+            completion=self.rng.uniform(0.1, 1.0)
         )
 
 
     def should_rate(self):
-        return random.random() < 0.1
+        return self.rng.random() < 0.1
 
 
     def rate(
@@ -189,5 +192,5 @@ class UserSimulator:
             timestamp=sim.clock.now,
             user_id=user.user_id,
             movie_id=movie_id,
-            rating=random.randint(1, 5)
+            rating=self.rng.randint(1, 5)
         )

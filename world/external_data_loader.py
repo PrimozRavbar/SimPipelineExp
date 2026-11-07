@@ -1,5 +1,4 @@
 from pathlib import Path
-from pathlib import Path
 from collections import defaultdict
 
 import pandas as pd
@@ -13,6 +12,10 @@ from world.entities import (
 )
 
 
+# The MovieLens 100k folder that ships with the repo.
+DEFAULT_DATA_PATH = Path(__file__).resolve().parent.parent / "ml-100k"
+
+
 GENRE_NAMES = [
     "unknown", "Action", "Adventure", "Animation", "Children's",
     "Comedy", "Crime", "Documentary", "Drama", "Fantasy",
@@ -21,12 +24,14 @@ GENRE_NAMES = [
 ]
 
 
-def load_movielens(base_path="ml-100k"):
-    base_path = Path(base_path)
+def load_movielens(base_path=None):
+    """Load MovieLens 100k. Defaults to the ml-100k folder in the repo,
+    so it works from any working directory (local, Colab, cloud)."""
+    base_path = Path(base_path) if base_path is not None else DEFAULT_DATA_PATH
 
     ratings = pd.read_csv(
         base_path / "u.data",
-        sep="\\t",
+        sep="\t",
         names=["user_id", "movie_id", "rating", "timestamp"],
     )
 

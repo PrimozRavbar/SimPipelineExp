@@ -1,3 +1,7 @@
+import random
+
+import torch
+
 from simulation.simulator import Simulator
 from world.world import World
 
@@ -29,8 +33,17 @@ def build_recommendation_system(
     movie_objects,
     user_objects,
     user_states,
-    movie_states
+    movie_states,
+    seed=42
 ):
+
+    # One seed controls every source of randomness, so two builds with the
+    # same seed produce the same simulation and the same trained model.
+    torch.manual_seed(seed)
+    seeds = random.Random(seed)
+
+    def child_rng():
+        return random.Random(seeds.getrandbits(64))
 
     # Feature store
     feature_store = OfflineFeatureStore()
@@ -77,10 +90,11 @@ def build_recommendation_system(
         user_objects=user_objects,
         movie_objects=movie_objects,
         user_states=user_states,
-        movie_states=movie_states
+        movie_states=movie_states,
+        rng=child_rng()
     )
 
-    sim = Simulator()
+    sim = Simulator(seed=seeds.getrandbits(64))
 
     sim.register(world)
     sim.register(Kafka())
@@ -101,7 +115,8 @@ def build_recommendation_system(
     )
 
     training_dataset_generator = TrainingDatasetGenerator(
-        feature_store
+        feature_store,
+        rng=child_rng()
     )
 
     embedding_generator = EmbeddingGenerator(
@@ -133,5 +148,6 @@ def build_recommendation_system(
         "model_server": model_server,
         "offline_pipeline": offline_pipeline,
         "feature_store": feature_store,
-        "spark": sim.get_service("Spark")
+        "spark": sim.get_service("Spark"),
+        "seed": seed
     }
