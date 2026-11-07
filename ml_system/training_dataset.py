@@ -11,9 +11,11 @@ class TrainingDatasetGenerator:
     def __init__(
         self,
         feature_store,
-        negative_samples=5
+        negative_samples=5,
+        rng=None
     ):
         self.feature_store = feature_store
+        self.rng = rng if rng is not None else random.Random(0)
         self.interactions = []
         self.shown_recommendations = {}
         self.negative_samples = negative_samples
@@ -42,7 +44,7 @@ class TrainingDatasetGenerator:
                 if movie_id != event.movie_id
             ]
 
-            sampled_negatives = random.sample(
+            sampled_negatives = self.rng.sample(
                 candidates,
                 min(
                     self.negative_samples,
@@ -61,7 +63,7 @@ class TrainingDatasetGenerator:
 
     def build(self):
 
-        random.shuffle(self.interactions)
+        self.rng.shuffle(self.interactions)
 
         dataset = []
 

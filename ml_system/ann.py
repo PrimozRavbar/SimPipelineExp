@@ -45,8 +45,12 @@ class HNSWIndex(ANNIndex):
         self,
         M=16,
         ef_construction=200,
-        ef_search=200
+        ef_search=200,
+        seed=0
     ):
+
+        # Seeded so the same embeddings always build the same graph.
+        self.rng = random.Random(seed)
 
         self.M = M
         self.ef_construction = ef_construction
@@ -67,7 +71,7 @@ class HNSWIndex(ANNIndex):
 
     def assign_level(self):
         return int(
-            -math.log(random.random()) * self.level_mult
+            -math.log(1.0 - self.rng.random()) * self.level_mult
         )
 
     def insert(self, item_id, embedding):

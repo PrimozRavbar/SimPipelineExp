@@ -5,7 +5,7 @@ from .service import Service
 
 class Simulator:
 
-    def __init__(self):
+    def __init__(self, seed=42):
         self.clock = Clock()
 
         # All services running in the simulation
@@ -24,7 +24,7 @@ class Simulator:
         self.metrics = {}
 
         # Randomness
-        self.random = random.Random(42)
+        self.random = random.Random(seed)
 
         self.running = False
         self.event_count = 0
@@ -71,7 +71,7 @@ class Simulator:
         for service in self.services.values():
             service.tick(self)
 
-    def run(self, ticks=None):
+    def run(self, ticks=None, verbose=True):
 
         self.running = True
         steps = 0
@@ -81,7 +81,7 @@ class Simulator:
             self.tick()
             steps += 1
 
-            if steps % 100 == 0:
+            if verbose and steps % 100 == 0:
                 counts = " | ".join(
                     f"{name}: {count}"
                     for name, count in self.event_counts.items()
@@ -97,7 +97,8 @@ class Simulator:
                 if ticks == 0:
                     break
 
-        print()
+        if verbose:
+            print()
 
     def stop(self):
         self.running = False

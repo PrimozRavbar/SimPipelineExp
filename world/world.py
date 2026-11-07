@@ -12,7 +12,8 @@ class World(Service):
         user_objects,
         movie_objects,
         user_states,
-        movie_states
+        movie_states,
+        rng=None
     ):
         super().__init__()
 
@@ -24,7 +25,7 @@ class World(Service):
 
         self.active_sessions = {}
 
-        self.user_simulator = UserSimulator(self)
+        self.user_simulator = UserSimulator(self, rng=rng)
 
 
     def process(self, sim):
