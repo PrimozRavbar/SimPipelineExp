@@ -78,6 +78,13 @@ metrics, game scoring) uses that module. Don't redefine it elsewhere.
   earns more clicks, and putting relevant items near the top matters.
 - Watch completion and ratings are still random (see known issues).
 
+## Online metrics
+
+`system["ctr_tracker"]` (`ml_system/metrics.py:CTRTracker`) consumes shown and clicked events
+from Kafka and buckets them by event tick. Use `per_tick()`, `rolling_ctr(window=100)`,
+`ctr_between(start, end)` (for example, before and after a retrain) and `overall_ctr()`. Only
+one user is active per tick, so raw per-tick CTR is 0 or 1. Plot the rolling series instead.
+
 ## Known issues (next phases)
 
 - Recall@K in the notebooks is scored on training data. Use

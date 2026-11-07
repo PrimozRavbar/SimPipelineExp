@@ -11,6 +11,7 @@ from ml_system.flink import Flink
 from ml_system.datalake import DataLake
 from ml_system.spark import Spark
 from ml_system.model_server import ModelServer
+from ml_system.metrics import CTRTracker
 from ml_system.two_tower import (
     TwoTowerRetrieval,
     SimpleUserTower,
@@ -112,6 +113,9 @@ def build_recommendation_system(
     sim.register(datalake)
     sim.register(model_server)
 
+    ctr_tracker = CTRTracker()
+    sim.register(ctr_tracker)
+
     # Offline pipeline
     offline_feature_pipeline = OfflineFeaturePipeline(
         movie_objects,
@@ -153,5 +157,6 @@ def build_recommendation_system(
         "offline_pipeline": offline_pipeline,
         "feature_store": feature_store,
         "spark": sim.get_service("Spark"),
+        "ctr_tracker": ctr_tracker,
         "seed": seed
     }
