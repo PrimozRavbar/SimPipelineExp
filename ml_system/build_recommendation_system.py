@@ -11,6 +11,7 @@ from ml_system.flink import Flink
 from ml_system.datalake import DataLake
 from ml_system.spark import Spark
 from ml_system.model_server import ModelServer
+from ml_system.metrics import CTRTracker
 from ml_system.two_tower import (
     TwoTowerRetrieval,
     SimpleUserTower,
@@ -34,7 +35,9 @@ def build_recommendation_system(
     user_objects,
     user_states,
     movie_states,
-    seed=42
+    seed=42,
+    num_candidates=100,
+    slate_size=10
 ):
 
     # One seed controls every source of randomness, so two builds with the
@@ -82,7 +85,9 @@ def build_recommendation_system(
     )
 
     model_server = ModelServer(
-        retriever=retriever
+        retriever=retriever,
+        num_candidates=num_candidates,
+        slate_size=slate_size
     )
 
     # Simulator
@@ -107,6 +112,9 @@ def build_recommendation_system(
 
     sim.register(datalake)
     sim.register(model_server)
+
+    ctr_tracker = CTRTracker()
+    sim.register(ctr_tracker)
 
     # Offline pipeline
     offline_feature_pipeline = OfflineFeaturePipeline(
@@ -149,5 +157,6 @@ def build_recommendation_system(
         "offline_pipeline": offline_pipeline,
         "feature_store": feature_store,
         "spark": sim.get_service("Spark"),
+        "ctr_tracker": ctr_tracker,
         "seed": seed
     }

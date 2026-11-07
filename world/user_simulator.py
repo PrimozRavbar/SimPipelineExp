@@ -1,4 +1,7 @@
+import math
 import random
+
+from world.relevance import genre_share, relevance_above_threshold
 from simulation.events import (
     RecommendationShownEvent,
     RecommendationClickedEvent,
@@ -8,14 +11,23 @@ from simulation.events import (
 
 class UserSimulator:
 
-    def __init__(self, world, rng=None):
+    def __init__(
+        self,
+        world,
+        rng=None,
+        max_examined=10,
+        p_noise=0.02,
+        p_max=0.5
+    ):
         self.world = world
 
         # Seeded RNG so a simulation run is reproducible.
         self.rng = rng if rng is not None else random.Random(0)
-        #self.click_model = RandomClickModel()
-        #self.watch_model = RandomWatchModel()
-        #self.rating_model = RandomRatingModel()
+
+        # Cascade click model (see CLAUDE.md, "Relevance").
+        self.max_examined = max_examined
+        self.p_noise = p_noise
+        self.p_max = p_max
 
     def react(
         self,
@@ -36,14 +48,15 @@ class UserSimulator:
             )
         )
 
-        #if self.should_click():
-        if self.should_click(user, movie_ids):
+        clicked_movie_id = self.choose_click(user, movie_ids)
+
+        if clicked_movie_id is not None:
 
             clicked = self.click(
                 sim,
                 user,
                 recommendation_id,
-                movie_ids
+                clicked_movie_id
             )
 
             events.append(clicked)
@@ -87,24 +100,38 @@ class UserSimulator:
         )
 
 
-    #def should_click(self):
-        #return self.rng.random() < 0.2
+    def examine_probability(self, rank):
+        # Position bias: rank 0 is always examined, later ranks less often.
+        return 1.0 / math.log2(rank + 2)
 
-    def should_click(self, user, movie_ids):
+
+    def click_probability(self, user_state, movie, share):
+        # Non-relevant movies get only p_noise; above the relevance
+        # threshold the click probability rises linearly to p_max.
+        lift = relevance_above_threshold(user_state, movie, share=share)
+        return self.p_noise + (self.p_max - self.p_noise) * lift
+
+
+    def choose_click(self, user, movie_ids):
+        """Cascade model: scan the slate in order, stop at the first click.
+        Returns the clicked movie_id, or None if nothing was clicked."""
 
         user_state = self.world.user_states[user.user_id]
+        share = genre_share(user_state)
 
-        for movie_id in movie_ids:
+        for rank, movie_id in enumerate(list(movie_ids)[:self.max_examined]):
+
+            if self.rng.random() >= self.examine_probability(rank):
+                continue
 
             movie = self.world.movie_objects[movie_id]
 
-            if any(
-                genre in user_state.genre_preferences
-                for genre in movie.genres
+            if self.rng.random() < self.click_probability(
+                user_state, movie, share
             ):
-                return self.rng.random() < 0.6
+                return movie_id
 
-        return self.rng.random() < 0.1
+        return None
 
 
     def click(
@@ -112,48 +139,14 @@ class UserSimulator:
         sim,
         user,
         recommendation_id,
-        movie_ids
+        movie_id
     ):
-
-        user_state = self.world.user_states[user.user_id]
-
-        scores = []
-
-        for movie_id in movie_ids:
-
-            movie = self.world.movie_objects[movie_id]
-
-            score = sum(
-                user_state.genre_preferences.get(genre, 0)
-                for genre in movie.genres
-            )
-
-            scores.append(max(score, 0))
-
-        total_score = sum(scores)
-
-        if total_score > 0:
-            probabilities = [
-                score / total_score
-                for score in scores
-            ]
-        else:
-            probabilities = [
-                1.0 / len(movie_ids)
-                for _ in movie_ids
-            ]
-
-        selected_movie = self.rng.choices(
-            movie_ids,
-            weights=probabilities,
-            k=1
-        )[0]
 
         return RecommendationClickedEvent(
             timestamp=sim.clock.now,
             user_id=user.user_id,
             recommendation_id=recommendation_id,
-            movie_id=selected_movie
+            movie_id=movie_id
         )
 
 
