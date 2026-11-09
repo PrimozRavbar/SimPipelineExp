@@ -16,4 +16,12 @@ def retrain(system):
     system["retriever"].item_tower = artifacts["item_tower"]
     system["retriever"].ann_index = hnsw_index
 
+    # The new model serves from the next tick on: log retrain + deploy.
+    logger = system.get("metrics_logger")
+    if logger is not None:
+        logger.log_retrain(
+            system["sim"].clock.now,
+            training_examples=artifacts.get("training_examples")
+        )
+
     return artifacts

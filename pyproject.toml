@@ -24,7 +24,7 @@ dev = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["simulation*", "world*", "ml_system*"]
+include = ["simulation*", "world*", "ml_system*", "dashboard*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

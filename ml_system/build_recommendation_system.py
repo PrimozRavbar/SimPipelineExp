@@ -11,7 +11,10 @@ from ml_system.flink import Flink
 from ml_system.datalake import DataLake
 from ml_system.spark import Spark
 from ml_system.model_server import ModelServer
-from ml_system.metrics import CTRTracker
+import time
+from pathlib import Path
+
+from ml_system.metrics import CTRTracker, MetricsLogger, reference_ctrs
 from ml_system.two_tower import (
     TwoTowerRetrieval,
     SimpleUserTower,
@@ -43,7 +46,10 @@ def build_recommendation_system(
     user_tower_kwargs=None,
     item_tower_kwargs=None,
     users_per_tick=1,
-    outcome_model="relevance"
+    outcome_model="relevance",
+    log_metrics=True,
+    runs_dir="runs",
+    run_id=None
 ):
     """Wire up World, streaming, serving and the offline retraining loop.
 
@@ -53,6 +59,8 @@ def build_recommendation_system(
     `users_per_tick` is how many distinct users the World serves per tick.
     `outcome_model` is "relevance" (watch/completion/rating depend on
     rel(u, m)) or "random" (the old uniform outcomes).
+    With `log_metrics` the run appends to <runs_dir>/<run_id>/metrics.jsonl
+    (see MetricsLogger); `run_id` defaults to "seed<seed>-<timestamp>".
     """
 
     user_tower_kwargs = dict(
@@ -145,6 +153,41 @@ def build_recommendation_system(
     ctr_tracker = CTRTracker()
     sim.register(ctr_tracker)
 
+    metrics_logger = None
+    run_dir = None
+
+    if log_metrics:
+        if run_id is None:
+            # Default ids never reuse a directory; an explicit run_id does
+            # (the log is restarted).
+            base = f"seed{seed}-{time.strftime('%Y%m%d-%H%M%S')}"
+            run_id, n = base, 1
+            while (Path(runs_dir) / run_id).exists():
+                n += 1
+                run_id = f"{base}-{n}"
+
+        run_dir = Path(runs_dir) / run_id
+
+        # Registered after the CTRTracker, so each tick's row is complete.
+        metrics_logger = MetricsLogger(
+            run_dir,
+            ctr_tracker,
+            run_info={
+                "run_id": run_id,
+                "seed": seed,
+                "config": {
+                    "users_per_tick": users_per_tick,
+                    "outcome_model": outcome_model,
+                    "num_candidates": num_candidates,
+                    "slate_size": slate_size,
+                    "num_users": len(user_objects),
+                    "num_movies": len(movie_objects),
+                },
+                "reference": reference_ctrs(world, slate_size=slate_size, seed=seed),
+            },
+        )
+        sim.register(metrics_logger)
+
     # Offline pipeline
     offline_feature_pipeline = OfflineFeaturePipeline(
         movie_objects,
@@ -189,6 +232,8 @@ def build_recommendation_system(
         "feature_store": feature_store,
         "spark": sim.get_service("Spark"),
         "ctr_tracker": ctr_tracker,
+        "metrics_logger": metrics_logger,
+        "run_dir": run_dir,
         "seed": seed,
         "users_per_tick": users_per_tick,
         "outcome_model": outcome_model,

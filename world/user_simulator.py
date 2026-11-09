@@ -130,6 +130,22 @@ class UserSimulator:
         return self.p_noise + (self.p_max - self.p_noise) * lift
 
 
+    def expected_click_rate(self, user_id, movie_ids):
+        """Probability that this user clicks anything on the slate under
+        the cascade model (exact, no sampling). Uses no RNG."""
+
+        user_state = self.world.user_states[user_id]
+        share = genre_share(user_state)
+        p_no_click = 1.0
+
+        for rank, movie_id in enumerate(list(movie_ids)[:self.max_examined]):
+            p_no_click *= 1.0 - self.examine_probability(rank) * self.click_probability(
+                user_state, self.world.movie_objects[movie_id], share
+            )
+
+        return 1.0 - p_no_click
+
+
     def choose_click(self, user, movie_ids):
         """Cascade model: scan the slate in order, stop at the first click.
         Returns the clicked movie_id, or None if nothing was clicked."""
