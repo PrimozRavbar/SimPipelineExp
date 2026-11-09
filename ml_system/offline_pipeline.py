@@ -54,7 +54,8 @@ class OfflinePipeline:
         return {
             "user_tower": user_tower,
             "item_tower": item_tower,
-            "item_embeddings": item_embeddings
+            "item_embeddings": item_embeddings,
+            "training_examples": len(training_data)
         }
 
 

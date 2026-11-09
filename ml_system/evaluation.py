@@ -8,7 +8,12 @@ from ml_system.offline_feature_store import OfflineFeatureStore
 from ml_system.offline_pipeline import OfflineFeaturePipeline
 from ml_system.training_dataset import TrainingDatasetGenerator
 from ml_system.training import TwoTowerTrainer
-from ml_system.two_tower import SimpleUserTower, SimpleItemTower
+from ml_system.two_tower import (
+    SimpleUserTower,
+    SimpleItemTower,
+    DEFAULT_USER_TOWER_KWARGS,
+    DEFAULT_ITEM_TOWER_KWARGS,
+)
 
 
 class RetrievalEvaluator:
@@ -27,7 +32,9 @@ class RetrievalEvaluator:
         split_ratio=0.8,
         k=20,
         seed=0,
-        epochs=5
+        epochs=5,
+        user_tower_kwargs=None,
+        item_tower_kwargs=None
     ):
         self.movie_objects = movie_objects
         self.num_users = num_users
@@ -35,6 +42,16 @@ class RetrievalEvaluator:
         self.k = k
         self.seed = seed
         self.epochs = epochs
+
+        # Same tower feature switches as the live model (pass
+        # system["user_tower_kwargs"] / ["item_tower_kwargs"] to match a
+        # non-default build).
+        self.user_tower_kwargs = dict(
+            DEFAULT_USER_TOWER_KWARGS if user_tower_kwargs is None else user_tower_kwargs
+        )
+        self.item_tower_kwargs = dict(
+            DEFAULT_ITEM_TOWER_KWARGS if item_tower_kwargs is None else item_tower_kwargs
+        )
 
 
     def evaluate(self, events):
@@ -95,11 +112,13 @@ class RetrievalEvaluator:
         # ---------------------------------------------
 
         user_tower = SimpleUserTower(
-            num_users=self.num_users
+            num_users=self.num_users,
+            **self.user_tower_kwargs
         )
 
         item_tower = SimpleItemTower(
-            num_movies=len(self.movie_objects)
+            num_movies=len(self.movie_objects),
+            **self.item_tower_kwargs
         )
 
         trainer = TwoTowerTrainer(
@@ -239,8 +258,16 @@ def evaluate_popularity(
     events,
     validation_population,
     split_ratio=0.8,
-    k=20
+    k=20,
+    movie_objects=None
 ):
+    """Recall@K of a global most-popular list built from training events.
+
+    If fewer than k movies were ever clicked/watched, the list is padded
+    with catalog movies in id order (`movie_objects`), or left short if no
+    catalog is given. It used to be padded with the held-out movies
+    themselves, which leaked the answers into the baseline.
+    """
     split_index = int(len(events) * split_ratio)
     train_events = events[:split_index]
 
@@ -265,19 +292,18 @@ def evaluate_popularity(
         movie_id
         for movie_id, _ in sorted(
             popularity.items(),
-            key=lambda x: x[1],
-            reverse=True
+            # Most popular first; ties broken by movie id.
+            key=lambda x: (-x[1], x[0])
         )
     ]
 
-    # Include unseen training-period movies after the known popular
-    # movies so the recommendation list can still contain k items.
-    for movie_id in sorted(
-        set(interaction["movie_id"] for interaction in validation_population)
-        | set(popularity.keys())
-    ):
-        if movie_id not in recommendations:
-            recommendations.append(movie_id)
+    # Pad from the catalog only: never from validation_population.
+    if movie_objects is not None:
+        for movie_id in sorted(movie_objects):
+            if len(recommendations) >= k:
+                break
+            if movie_id not in popularity:
+                recommendations.append(movie_id)
 
     recommendations = recommendations[:k]
 

@@ -81,6 +81,14 @@ class Flink(Service):
             "value": self.state["activity_level"][user_id]
         })
 
+        # Offline, `interactions` counts the same events as activity_level
+        # (clicks, watches, ratings); publish it so serving sees it too.
+        redis.receive({
+            "feature": "interactions",
+            "user_id": user_id,
+            "value": self.state["activity_level"][user_id]
+        })
+
 
     def update_item_popularity(self, sim, movie_id):
 

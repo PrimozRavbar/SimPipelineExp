@@ -52,3 +52,38 @@ def relevance_above_threshold(user_state, movie, threshold=RELEVANCE_THRESHOLD, 
     0 for every non-relevant movie, 1 for a perfect genre match."""
     rel = relevance(user_state, movie, share=share)
     return max(0.0, (rel - threshold) / (1.0 - threshold))
+
+
+def relevance_matrix(user_states, movies):
+    """rel(u, m) for many users and movies at once, as a numpy array of
+    shape (len(user_states), len(movies)). Same definition as relevance()
+    (tests check they agree); used to find oracle slates for reference
+    metrics without 1.6M Python calls.
+
+    `user_states` and `movies` are sequences (rows/columns in that order).
+    """
+    import numpy as np
+
+    from world.external_data_loader import GENRE_NAMES
+
+    index = {genre: i for i, genre in enumerate(GENRE_NAMES)}
+
+    users = np.zeros((len(user_states), len(GENRE_NAMES)))
+    for row, state in enumerate(user_states):
+        for genre, value in genre_share(state).items():
+            if genre in index:
+                users[row, index[genre]] = value
+
+    items = np.zeros((len(movies), len(GENRE_NAMES)))
+    for row, movie in enumerate(movies):
+        for genre in set(movie.genres):
+            if genre in index:
+                items[row, index[genre]] = 1.0
+
+    user_norm = np.linalg.norm(users, axis=1, keepdims=True)
+    item_norm = np.linalg.norm(items, axis=1, keepdims=True)
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        rel = (users / user_norm) @ (items / item_norm).T
+
+    return np.clip(np.nan_to_num(rel), 0.0, 1.0)

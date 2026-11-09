@@ -11,11 +11,16 @@ from ml_system.flink import Flink
 from ml_system.datalake import DataLake
 from ml_system.spark import Spark
 from ml_system.model_server import ModelServer
-from ml_system.metrics import CTRTracker
+import time
+from pathlib import Path
+
+from ml_system.metrics import CTRTracker, MetricsLogger, reference_ctrs
 from ml_system.two_tower import (
     TwoTowerRetrieval,
     SimpleUserTower,
     SimpleItemTower,
+    DEFAULT_USER_TOWER_KWARGS,
+    DEFAULT_ITEM_TOWER_KWARGS,
 )
 from ml_system.offline_feature_store import OfflineFeatureStore
 from ml_system.offline_pipeline import (
@@ -37,8 +42,33 @@ def build_recommendation_system(
     movie_states,
     seed=42,
     num_candidates=100,
-    slate_size=10
+    slate_size=10,
+    user_tower_kwargs=None,
+    item_tower_kwargs=None,
+    users_per_tick=1,
+    outcome_model="relevance",
+    log_metrics=True,
+    runs_dir="runs",
+    run_id=None
 ):
+    """Wire up World, streaming, serving and the offline retraining loop.
+
+    `user_tower_kwargs` / `item_tower_kwargs` are passed to
+    SimpleUserTower / SimpleItemTower (feature switches such as
+    `use_activity_features`); the defaults are DEFAULT_*_TOWER_KWARGS.
+    `users_per_tick` is how many distinct users the World serves per tick.
+    `outcome_model` is "relevance" (watch/completion/rating depend on
+    rel(u, m)) or "random" (the old uniform outcomes).
+    With `log_metrics` the run appends to <runs_dir>/<run_id>/metrics.jsonl
+    (see MetricsLogger); `run_id` defaults to "seed<seed>-<timestamp>".
+    """
+
+    user_tower_kwargs = dict(
+        DEFAULT_USER_TOWER_KWARGS if user_tower_kwargs is None else user_tower_kwargs
+    )
+    item_tower_kwargs = dict(
+        DEFAULT_ITEM_TOWER_KWARGS if item_tower_kwargs is None else item_tower_kwargs
+    )
 
     # One seed controls every source of randomness, so two builds with the
     # same seed produce the same simulation and the same trained model.
@@ -63,6 +93,11 @@ def build_recommendation_system(
         )
     )
 
+    # The bootstrap towers are untrained, so they act as an exploration
+    # policy. They keep the full input set (ID embeddings included): random
+    # ID embeddings give each user a different slate. Without them every
+    # cold-start user gets the same embedding, everyone is shown the same
+    # 10 movies, and the first retrain has nothing to learn from.
     bootstrap_item_tower = SimpleItemTower(
         num_movies=len(movie_objects)
     )
@@ -96,7 +131,9 @@ def build_recommendation_system(
         movie_objects=movie_objects,
         user_states=user_states,
         movie_states=movie_states,
-        rng=child_rng()
+        rng=child_rng(),
+        users_per_tick=users_per_tick,
+        outcome_model=outcome_model
     )
 
     sim = Simulator(seed=seeds.getrandbits(64))
@@ -116,6 +153,41 @@ def build_recommendation_system(
     ctr_tracker = CTRTracker()
     sim.register(ctr_tracker)
 
+    metrics_logger = None
+    run_dir = None
+
+    if log_metrics:
+        if run_id is None:
+            # Default ids never reuse a directory; an explicit run_id does
+            # (the log is restarted).
+            base = f"seed{seed}-{time.strftime('%Y%m%d-%H%M%S')}"
+            run_id, n = base, 1
+            while (Path(runs_dir) / run_id).exists():
+                n += 1
+                run_id = f"{base}-{n}"
+
+        run_dir = Path(runs_dir) / run_id
+
+        # Registered after the CTRTracker, so each tick's row is complete.
+        metrics_logger = MetricsLogger(
+            run_dir,
+            ctr_tracker,
+            run_info={
+                "run_id": run_id,
+                "seed": seed,
+                "config": {
+                    "users_per_tick": users_per_tick,
+                    "outcome_model": outcome_model,
+                    "num_candidates": num_candidates,
+                    "slate_size": slate_size,
+                    "num_users": len(user_objects),
+                    "num_movies": len(movie_objects),
+                },
+                "reference": reference_ctrs(world, slate_size=slate_size, seed=seed),
+            },
+        )
+        sim.register(metrics_logger)
+
     # Offline pipeline
     offline_feature_pipeline = OfflineFeaturePipeline(
         movie_objects,
@@ -133,10 +205,12 @@ def build_recommendation_system(
 
     two_tower_trainer = TwoTowerTrainer(
         user_tower=SimpleUserTower(
-            num_users=len(user_objects)
+            num_users=len(user_objects),
+            **user_tower_kwargs
         ),
         item_tower=SimpleItemTower(
-            num_movies=len(movie_objects)
+            num_movies=len(movie_objects),
+            **item_tower_kwargs
         )
     )
 
@@ -158,5 +232,11 @@ def build_recommendation_system(
         "feature_store": feature_store,
         "spark": sim.get_service("Spark"),
         "ctr_tracker": ctr_tracker,
-        "seed": seed
+        "metrics_logger": metrics_logger,
+        "run_dir": run_dir,
+        "seed": seed,
+        "users_per_tick": users_per_tick,
+        "outcome_model": outcome_model,
+        "user_tower_kwargs": user_tower_kwargs,
+        "item_tower_kwargs": item_tower_kwargs
     }

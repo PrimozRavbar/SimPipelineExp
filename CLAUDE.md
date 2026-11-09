@@ -9,8 +9,8 @@ build, break, diagnose and fix ML systems.
 
 ```bash
 pip install -e ".[dev]"          # torch, pandas, numpy, pytest, jupyter
-pytest -q                        # all tests (~1 min; smoke test needs torch)
-pytest -q tests/test_determinism.py   # fast checks, no torch needed
+python -m pytest -q              # all tests (~2.5 min; several need torch)
+python -m pytest -q tests/test_determinism.py   # fast checks, no torch needed
 ```
 
 Run notebooks from the repo root. `SimPipExp_quickstart.ipynb` is the reference demo.
@@ -37,7 +37,7 @@ Run notebooks from the repo root. `SimPipExp_quickstart.ipynb` is the reference 
 | Agent       | Owns                                                        |
 |-------------|-------------------------------------------------------------|
 | World       | `world/*`                                                   |
-| Metrics     | `ml_system/evaluation.py`, new `ml_system/metrics.py`       |
+| Metrics     | `ml_system/evaluation.py`, `ml_system/metrics.py`, `dashboard/` |
 | Features    | `ml_system/flink.py`, `ml_system/offline_*`, `ml_system/features.py`, `TwoTowerRetrieval.retrieve` |
 | Performance | `ml_system/ann.py`, `ml_system/training.py`                 |
 | Orchestrator| `pyproject.toml`, `tests/`, notebooks, this file; merges branches |
@@ -73,30 +73,106 @@ metrics, game scoring) uses that module. Don't redefine it elsewhere.
   and `p_max = 0.5`. A non-relevant movie is clicked only at the noise rate. The first click
   ends the scan. No click means no watch and no rating. These are `UserSimulator`
   constructor arguments.
-- **Expected CTR** over all 943 users: an oracle slate (sorted by `rel`) gets about 68%, a
-  random slate about 18%, and the least-relevant slate under 10%. A better model therefore
+- **Expected CTR** over all 943 users: an oracle slate (sorted by `rel`) gets about 69%, a
+  random slate about 17% (`ml_system.metrics.reference_ctrs(world)` computes both exactly), and the least-relevant slate under 10%. A better model therefore
   earns more clicks, and putting relevant items near the top matters.
-- Watch completion and ratings are still random (see known issues).
+- **Outcomes after a click** (`outcome_model="relevance"`, the default): watch probability
+  `0.4 + 0.55·rel`, completion `0.15 + 0.8·rel + N(0, 0.15)` clipped to [0.05, 1],
+  `watch_time = 120 · completion`, rating `round(1 + 4·rel + N(0, 0.75))` clipped to 1..5,
+  rating probability 0.1. `outcome_model="random"` keeps the old uniform outcomes with
+  the same RNG calls.
+- `world.relevance.relevance_matrix(user_states, movies)` is the same score vectorised
+  (numpy), for evaluation code that needs every (user, movie) pair.
+
+## Configuration switches (`build_recommendation_system`)
+
+| Argument | Default | Meaning |
+|---|---|---|
+| `seed` | 42 | Every RNG and torch init derives from it |
+| `num_candidates`, `slate_size` | 100, 10 | Retrieved vs shown items |
+| `users_per_tick` | 1 | Distinct users served per tick (seeded sample) |
+| `outcome_model` | `"relevance"` | `"relevance"` or `"random"` watch/completion/rating |
+| `user_tower_kwargs` | `{"use_id_embedding": False, "use_activity_features": False}` | Trained user tower inputs |
+| `item_tower_kwargs` | `{"use_id_embedding": False, "use_rating_feature": False}` | Trained item tower inputs |
+| `log_metrics`, `runs_dir`, `run_id` | `True`, `"runs"`, auto | Metrics log at `runs_dir/run_id/metrics.jsonl` |
+
+The tower classes themselves default to every input on (so old checkpoints load); the
+defaults above are `two_tower.DEFAULT_USER_TOWER_KWARGS` / `DEFAULT_ITEM_TOWER_KWARGS`,
+also used by `RetrievalEvaluator`. The untrained bootstrap towers always keep ID
+embeddings: they are the exploration policy (see "Why CTR was flat").
+`recommendation_id` is a per-World counter, unique per shown slate.
 
 ## Online metrics
 
 `system["ctr_tracker"]` (`ml_system/metrics.py:CTRTracker`) consumes shown and clicked events
 from Kafka and buckets them by event tick. Use `per_tick()`, `rolling_ctr(window=100)`,
-`ctr_between(start, end)` (for example, before and after a retrain) and `overall_ctr()`. Only
-one user is active per tick, so raw per-tick CTR is 0 or 1. Plot the rolling series instead.
+`ctr_between(start, end)` (for example, before and after a retrain) and `overall_ctr()`.
+With the default `users_per_tick=1`, raw per-tick CTR is 0 or 1, so plot the rolling series;
+with more users per tick (the quickstart uses 10) it is a real rate. `per_tick()` rows also
+carry `active_users`.
+
+## Metrics log and dashboard
+
+Every built system (unless `log_metrics=False`) has `system["metrics_logger"]`
+(`ml_system/metrics.py:MetricsLogger`) and `system["run_dir"]`. It writes one JSON object per
+line to `<run_dir>/metrics.jsonl`; every record has `type` and `tick`:
+
+| type | fields |
+|---|---|
+| `run_start` | `run_id`, `seed`, `created_at` (wall clock), `config` (users_per_tick, outcome_model, num_candidates, slate_size, num_users, num_movies), `reference` (`random_ctr`, `oracle_ctr`), `model_version` (0) |
+| `tick` | `shown`, `clicks`, `ctr` (null if nothing shown), `active_users`, `model_version` |
+| `retrain` | `training_examples`, `model_version` (the new one) |
+| `deploy` | `model_version` (serves from the next tick) |
+| `evaluation` | free-form; the quickstart logs `k`, `recall_at_k`, `random_recall_at_k`, `popularity_recall_at_k` |
+
+`retrain(system)` logs retrain + deploy. Log anything else with
+`system["metrics_logger"].log_event(type, tick, **fields)`. `read_metrics(run_dir)` loads it.
+An explicit `run_id` restarts that directory's log; default ids never collide. `runs/` is
+git-ignored, and tests run from a temp working directory (`tests/conftest.py`).
+
+`dashboard.render_dashboard(run_dir) -> Path` reads only the log and writes one
+self-contained `<run_dir>/dashboard.html` (HTML + CSS + inline SVG, no JavaScript, no
+external files): header (run id, seed, simulated ticks, model version), four tiles (CTR
+since the last deploy vs before, Recall@20 vs random, active users per tick, retrains),
+rolling-CTR chart with retrain markers and random/oracle reference lines, and an event log.
+`dashboard.display_dashboard(run_dir)` also shows it inline in Jupyter/Colab. The rolling
+window defaults to about 250 slates (`window=` ticks to override).
+
+## Why CTR was flat (fixed)
+
+Main used to go 18.3% → 18.7% after a retrain. Expected-CTR analysis per user showed the
+retrained top-100 contained good items (oracle rerank of it: 47%) but the learned scores did
+not rank them. Causes, all fixed:
+1. HNSW linked each node to its M nearest only, so clusters were islands (recall@10 ≈ 0.5).
+   It now uses the neighbour-selection heuristic and 2·M links on layer 0 (≈ 0.96).
+2. Train/serve skew: serving invented a uniform cold-start profile (wrong genre names) and a
+   3.5 rating, and never updated `interactions`. Serving now uses the training defaults.
+3. Monotonic activity counts (always out of the training range at serving time), per-ID
+   embeddings (about 1 click per user) and the noisy item rating swamped the genre signal.
+   They are switched off in the trained towers.
+4. The untrained bootstrap towers need ID embeddings to explore. Without them every user
+   sees the same 10 movies and the first retrain has nothing to learn from.
+
+Quickstart now (seed 42, 10 users/tick, 1000 ticks, retrain 5 epochs, 300 ticks): CTR
+**17.2% → 29.7%** (seed 1: 13.2% → 30.1%). With only ~5000 sessions before the retrain the
+result is unstable: the model collapses to a few dozen near-global slates.
 
 ## Known issues (next phases)
 
 - `SimPip_DEMO_1p2.ipynb` (legacy Colab notebook) still scores Recall@K on training data
   and uses `/content/...` paths. The quickstart uses the held-out
   `RetrievalEvaluator(movie_objects, num_users=..., seed=...)`.
-- **Retraining doesn't raise CTR yet.** In the quickstart (seed 42, 5000 ticks, then retrain),
-  CTR goes from 18.3% to 18.7%, about the same as a random slate. Held-out Recall@20 is 7.9%
-  vs 1.75% for random. The model ranks better than random offline, but that doesn't show up
-  in the top 10 users actually see.
-- Ratings and watch completion are random. They should depend on `rel(u, m)`.
-- `evaluate_popularity` pads its top-K list with movies drawn from the validation
-  population. That leaks the answers, so its recall is inflated on small runs.
-- Online and offline features disagree (cold-start genre list, `interactions`,
-  default average rating, popularity definition).
+- **Offline Recall@K mostly measures exposure.** Held-out clicks come from the bootstrap
+  policy, which shows a narrow set of items, so a global popularity list scores ~83%
+  Recall@20 in the quickstart (no leak: it pads from the catalog) while the two-tower model
+  scores ~7% yet lifts online CTR from 17% to 30%. Trust online CTR (or expected CTR from
+  `UserSimulator.expected_click_rate`) over offline recall here.
+- CTR after a retrain (~30%) is still far from the oracle (~69%): most users have 0–3
+  watched movies when the model is trained, and users without history all get one global
+  slate. A shared genre projection across both towers gave about 2 more points in an
+  experiment (not merged: it couples the towers).
+- Online and offline features still disagree on popularity (Flink: watches per item in
+  Redis `item_popularity`, unused by serving; offline: watches in the feature store).
 - `retrain()` recomputes offline features that the Spark job already computed.
+- With `users_per_tick > 1`, every active user in a tick is served from the same model
+  state; nothing models concurrency or latency yet.
