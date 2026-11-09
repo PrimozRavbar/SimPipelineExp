@@ -34,6 +34,7 @@ from world.external_data_loader import load_movielens
 # Ticks per second at speed 1x (the mockup advanced 1 tick every 500 ms).
 BASE_TICKS_PER_SECOND = 2
 SPEEDS = (1, 10, 100)
+MIN_YIELD_SECONDS = 0.003
 
 # Compute budget: a simple game resource, not a measurement.
 BUDGET_TOTAL = 1000
@@ -175,6 +176,7 @@ class SimSession:
         self._stop = threading.Event()
         self._thread = None
         self.waiting_for_training = False
+        self.clock_error = None
 
         # Actions queued for the next tick boundary.
         self._pending = []
@@ -278,17 +280,25 @@ class SimSession:
                 continue
             self.waiting_for_training = False
 
-            with self.lock:
-                self._step_locked()
+            try:
+                with self.lock:
+                    self._step_locked()
+            except Exception as error:  # keep the server alive; show the error
+                self.playing = False
+                self.clock_error = repr(error)
+                with self.lock:
+                    self._log("system", "Clock stopped by an error: %r" % (error,), cls="s-crit")
+                continue
 
             next_time += 1.0 / (BASE_TICKS_PER_SECOND * self.speed)
             delay = next_time - time.monotonic()
-            if delay > 0:
-                self._stop.wait(delay)
-            else:
+            if delay <= 0:
                 # Running behind (ticks are slower than the speed asks):
                 # don't build up a backlog.
                 next_time = time.monotonic()
+            # Always let go for a moment: locks are not fair, and without a
+            # pause API requests waiting for the lock would starve.
+            self._stop.wait(max(delay, MIN_YIELD_SECONDS))
 
     def _training_blocks_next_tick(self):
         r = self.retrain
@@ -700,6 +710,7 @@ class SimSession:
                 "speeds": list(SPEEDS),
                 "ticks_per_second": BASE_TICKS_PER_SECOND * self.speed,
                 "waiting_for_training": self.waiting_for_training,
+                "clock_error": self.clock_error,
                 "seed": self.seed,
                 "users_per_tick": self.users_per_tick,
                 "num_users": len(self.system["world"].user_objects),

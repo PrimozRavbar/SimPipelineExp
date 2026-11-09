@@ -112,7 +112,13 @@ def create_app(session):
 
 
 def serve(host="127.0.0.1", port=8000, seed=42, users_per_tick=10, runs_dir="runs"):
+    import faulthandler
+    import signal
+
     import uvicorn
+
+    if hasattr(signal, "SIGUSR1"):
+        faulthandler.register(signal.SIGUSR1)   # kill -USR1 <pid> dumps every thread's stack
 
     print("Building the simulation (seed %d)..." % seed, flush=True)
     session = SimSession(seed=seed, users_per_tick=users_per_tick, runs_dir=runs_dir)
