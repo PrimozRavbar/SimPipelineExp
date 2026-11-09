@@ -16,6 +16,8 @@ from ml_system.two_tower import (
     TwoTowerRetrieval,
     SimpleUserTower,
     SimpleItemTower,
+    DEFAULT_USER_TOWER_KWARGS,
+    DEFAULT_ITEM_TOWER_KWARGS,
 )
 from ml_system.offline_feature_store import OfflineFeatureStore
 from ml_system.offline_pipeline import (
@@ -37,8 +39,23 @@ def build_recommendation_system(
     movie_states,
     seed=42,
     num_candidates=100,
-    slate_size=10
+    slate_size=10,
+    user_tower_kwargs=None,
+    item_tower_kwargs=None
 ):
+    """Wire up World, streaming, serving and the offline retraining loop.
+
+    `user_tower_kwargs` / `item_tower_kwargs` are passed to
+    SimpleUserTower / SimpleItemTower (feature switches such as
+    `use_activity_features`); the defaults are DEFAULT_*_TOWER_KWARGS.
+    """
+
+    user_tower_kwargs = dict(
+        DEFAULT_USER_TOWER_KWARGS if user_tower_kwargs is None else user_tower_kwargs
+    )
+    item_tower_kwargs = dict(
+        DEFAULT_ITEM_TOWER_KWARGS if item_tower_kwargs is None else item_tower_kwargs
+    )
 
     # One seed controls every source of randomness, so two builds with the
     # same seed produce the same simulation and the same trained model.
@@ -63,6 +80,11 @@ def build_recommendation_system(
         )
     )
 
+    # The bootstrap towers are untrained, so they act as an exploration
+    # policy. They keep the full input set (ID embeddings included): random
+    # ID embeddings give each user a different slate. Without them every
+    # cold-start user gets the same embedding, everyone is shown the same
+    # 10 movies, and the first retrain has nothing to learn from.
     bootstrap_item_tower = SimpleItemTower(
         num_movies=len(movie_objects)
     )
@@ -133,10 +155,12 @@ def build_recommendation_system(
 
     two_tower_trainer = TwoTowerTrainer(
         user_tower=SimpleUserTower(
-            num_users=len(user_objects)
+            num_users=len(user_objects),
+            **user_tower_kwargs
         ),
         item_tower=SimpleItemTower(
-            num_movies=len(movie_objects)
+            num_movies=len(movie_objects),
+            **item_tower_kwargs
         )
     )
 
@@ -158,5 +182,7 @@ def build_recommendation_system(
         "feature_store": feature_store,
         "spark": sim.get_service("Spark"),
         "ctr_tracker": ctr_tracker,
-        "seed": seed
+        "seed": seed,
+        "user_tower_kwargs": user_tower_kwargs,
+        "item_tower_kwargs": item_tower_kwargs
     }

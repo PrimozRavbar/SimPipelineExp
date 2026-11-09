@@ -8,7 +8,12 @@ from ml_system.offline_feature_store import OfflineFeatureStore
 from ml_system.offline_pipeline import OfflineFeaturePipeline
 from ml_system.training_dataset import TrainingDatasetGenerator
 from ml_system.training import TwoTowerTrainer
-from ml_system.two_tower import SimpleUserTower, SimpleItemTower
+from ml_system.two_tower import (
+    SimpleUserTower,
+    SimpleItemTower,
+    DEFAULT_USER_TOWER_KWARGS,
+    DEFAULT_ITEM_TOWER_KWARGS,
+)
 
 
 class RetrievalEvaluator:
@@ -27,7 +32,9 @@ class RetrievalEvaluator:
         split_ratio=0.8,
         k=20,
         seed=0,
-        epochs=5
+        epochs=5,
+        user_tower_kwargs=None,
+        item_tower_kwargs=None
     ):
         self.movie_objects = movie_objects
         self.num_users = num_users
@@ -35,6 +42,16 @@ class RetrievalEvaluator:
         self.k = k
         self.seed = seed
         self.epochs = epochs
+
+        # Same tower feature switches as the live model (pass
+        # system["user_tower_kwargs"] / ["item_tower_kwargs"] to match a
+        # non-default build).
+        self.user_tower_kwargs = dict(
+            DEFAULT_USER_TOWER_KWARGS if user_tower_kwargs is None else user_tower_kwargs
+        )
+        self.item_tower_kwargs = dict(
+            DEFAULT_ITEM_TOWER_KWARGS if item_tower_kwargs is None else item_tower_kwargs
+        )
 
 
     def evaluate(self, events):
@@ -95,11 +112,13 @@ class RetrievalEvaluator:
         # ---------------------------------------------
 
         user_tower = SimpleUserTower(
-            num_users=self.num_users
+            num_users=self.num_users,
+            **self.user_tower_kwargs
         )
 
         item_tower = SimpleItemTower(
-            num_movies=len(self.movie_objects)
+            num_movies=len(self.movie_objects),
+            **self.item_tower_kwargs
         )
 
         trainer = TwoTowerTrainer(
