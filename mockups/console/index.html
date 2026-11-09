@@ -1,0 +1,556 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>SimPipeline Console</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+/* Layout: ops console. Sticky top bar (clock, mission, prod model, budget), left nav, one screen at a time. Single dark look, like real on-call tooling. */
+:root {
+  --bg: #0C0F14; --surface: #131821; --surface-2: #1A202B; --line: #262E3B; --line-soft: #1D2430;
+  --fg: #E6EBF2; --muted: #9AA5B5; --accent: #7AA7FF; --accent-strong: #3D74E0;
+  --ok: #40D39C; --warn: #F2A93B; --crit: #FF7A7A; --info: #9AA5B5;
+  --sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--fg); font-family: var(--sans); font-size: 14px; line-height: 1.45; }
+body::before { content: ""; position: fixed; inset: 0 0 auto; height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--surface); }
+button { font: inherit; color: inherit; }
+button:focus-visible, input:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+h1 { font-size: 22px; font-weight: 600; margin: 0; text-wrap: balance; letter-spacing: -0.01em; }
+h2 { font-size: 15px; font-weight: 600; margin: 0; }
+h3 { font-size: 13px; font-weight: 600; margin: 0; }
+p { margin: 0; }
+.label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; font-weight: 500; }
+.muted { color: var(--muted); }
+
+/* top bar */
+.top { position: sticky; top: env(safe-area-inset-top, 0px); z-index: 5; background: var(--surface); border-bottom: 1px solid var(--line);
+  padding-block: 10px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  display: flex; flex-wrap: wrap; align-items: center; gap: 12px 24px; }
+.brand { display: flex; align-items: center; gap: 10px; font-weight: 600; }
+.env { font-family: var(--mono); font-size: 11px; color: var(--muted); border: 1px solid var(--line); border-radius: 4px; padding: 1px 6px; }
+.group { display: flex; align-items: center; gap: 10px; }
+.clock { font-family: var(--mono); font-size: 15px; min-width: 92px; }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+.seg button { background: transparent; border: 0; padding: 0 10px; min-height: 32px; cursor: pointer; color: var(--muted); font-family: var(--mono); font-size: 12px; }
+.seg button + button { border-left: 1px solid var(--line); }
+.seg button[aria-pressed="true"] { background: var(--surface-2); color: var(--fg); }
+.iconbtn { width: 36px; height: 36px; display: inline-grid; place-items: center; border-radius: 6px; border: 1px solid var(--line); background: var(--surface-2); cursor: pointer; }
+.iconbtn:hover { border-color: var(--accent); }
+.budget { width: 120px; height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; }
+.budget > span { display: block; height: 100%; background: var(--accent); }
+.spacer { flex: 1 1 0; }
+
+/* shell */
+.shell { display: flex; flex-wrap: wrap; align-items: flex-start;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); padding-block: 20px 40px; gap: 24px; }
+nav.side { flex: 1 1 200px; max-width: 100%; }
+.navlist { display: flex; flex-wrap: wrap; gap: 4px; }
+.navbtn { flex: 1 1 180px; display: flex; align-items: center; gap: 10px; min-height: 40px; padding: 0 12px; border-radius: 6px; border: 1px solid transparent; background: transparent; cursor: pointer; color: var(--muted); text-align: left; }
+.navbtn:hover { color: var(--fg); background: var(--surface); }
+.navbtn[aria-current="page"] { color: var(--fg); background: var(--surface-2); border-color: var(--line); }
+.navbtn .count { margin-left: auto; font-family: var(--mono); font-size: 11px; background: var(--crit); color: #1A0C0C; border-radius: 9px; padding: 0 7px; font-weight: 600; }
+.side .note { margin-top: 16px; padding: 12px; border: 1px dashed var(--line); border-radius: 8px; font-size: 12px; color: var(--muted); }
+main { flex: 999 1 560px; min-width: 0; display: flex; flex-direction: column; gap: 20px; }
+.head { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 12px; }
+.head p { color: var(--muted); max-width: 70ch; margin-top: 4px; }
+
+.panel { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 16px; min-width: 0; }
+.row { display: flex; flex-wrap: wrap; gap: 16px; }
+.row > * { min-width: 0; }
+.btn { display: inline-flex; align-items: center; gap: 8px; min-height: 40px; padding: 0 14px; border-radius: 6px; border: 1px solid var(--line); background: var(--surface-2); cursor: pointer; font-weight: 500; }
+.btn:hover { border-color: var(--accent); }
+.btn.primary { background: var(--accent-strong); border-color: var(--accent-strong); color: #fff; }
+.btn.primary:hover { background: #4A82EE; }
+.btn:disabled { opacity: .45; cursor: not-allowed; }
+.pill { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 500; border-radius: 999px; padding: 2px 10px; border: 1px solid currentColor; white-space: nowrap; }
+.dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex: none; }
+.s-ok { color: var(--ok); } .s-warn { color: var(--warn); } .s-crit { color: var(--crit); } .s-info { color: var(--info); } .s-accent { color: var(--accent); }
+.bg-ok { background: var(--ok); } .bg-warn { background: var(--warn); } .bg-crit { background: var(--crit); } .bg-info { background: var(--info); }
+.toast { border: 1px solid var(--accent-strong); background: #15213A; border-radius: 8px; padding: 10px 14px; display: flex; gap: 10px; align-items: center; }
+
+/* tiles */
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; }
+.tile { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; display: flex; flex-direction: column; gap: 6px; }
+.tile .big { font-family: var(--mono); font-size: 26px; font-weight: 500; font-variant-numeric: tabular-nums; }
+.tile .sub { font-size: 12px; color: var(--muted); }
+
+/* charts */
+.chart { position: relative; }
+.chart svg { display: block; width: 100%; height: auto; overflow: visible; }
+.legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 12px; color: var(--muted); margin-top: 8px; }
+.legend i { display: inline-block; width: 14px; height: 2px; vertical-align: middle; margin-right: 6px; }
+.seriesline { fill: none; stroke-width: 2; vector-effect: non-scaling-stroke; }
+
+/* tables */
+.tablewrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th { text-align: left; font-weight: 500; color: var(--muted); padding: 8px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; font-size: 12px; }
+td { padding: 10px 12px; border-bottom: 1px solid var(--line-soft); white-space: nowrap; font-variant-numeric: tabular-nums; }
+tr.sel td { background: var(--surface-2); }
+tr.click { cursor: pointer; }
+tr.click:hover td { background: var(--surface-2); }
+
+/* pipeline */
+.lane { display: flex; flex-direction: column; gap: 10px; }
+.lanerow { display: flex; flex-wrap: wrap; align-items: stretch; gap: 8px; }
+.node { flex: 1 1 140px; max-width: 200px; text-align: left; cursor: pointer; background: var(--surface-2); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; display: flex; flex-direction: column; gap: 4px; min-height: 92px; }
+.node:hover { border-color: var(--muted); }
+.node[aria-pressed="true"] { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
+.node .nm { font-weight: 600; font-size: 13px; display: flex; align-items: center; gap: 8px; }
+.node .tool { font-size: 11px; color: var(--muted); font-family: var(--mono); }
+.node .st { font-size: 12px; margin-top: auto; }
+.arrow { align-self: center; color: var(--muted); flex: none; }
+.field { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 8px 0; border-bottom: 1px solid var(--line-soft); }
+.field label { color: var(--fg); }
+.field small { display: block; color: var(--muted); font-size: 12px; }
+.field input[type=number] { width: 96px; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; color: var(--fg); padding: 6px 8px; font-family: var(--mono); font-size: 13px; text-align: right; }
+.switch { position: relative; width: 44px; height: 24px; border-radius: 12px; border: 1px solid var(--line); background: var(--bg); cursor: pointer; flex: none; }
+.switch::after { content: ""; position: absolute; top: 3px; left: 3px; width: 16px; height: 16px; border-radius: 50%; background: var(--muted); transition: left .15s; }
+.switch[aria-checked="true"] { background: var(--accent-strong); border-color: var(--accent-strong); }
+.switch[aria-checked="true"]::after { left: 23px; background: #fff; }
+
+/* missions & incidents */
+.objective { display: flex; gap: 10px; align-items: flex-start; padding: 8px 0; }
+.check { width: 20px; height: 20px; border-radius: 50%; border: 1.5px solid var(--line); display: grid; place-items: center; flex: none; margin-top: 1px; }
+.check.done { background: var(--ok); border-color: var(--ok); color: #08130E; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip { font-size: 12px; color: var(--muted); border: 1px solid var(--line); border-radius: 4px; padding: 1px 8px; }
+.mission { flex: 1 1 240px; display: flex; flex-direction: column; gap: 8px; }
+.alertlist { display: flex; flex-direction: column; }
+.alert { display: grid; grid-template-columns: 4px 1fr; gap: 12px; text-align: left; background: transparent; border: 0; border-bottom: 1px solid var(--line-soft); padding: 12px 8px 12px 0; cursor: pointer; }
+.alert:hover, .alert[aria-pressed="true"] { background: var(--surface-2); }
+.alert .stripe { border-radius: 2px; }
+.alert .meta { font-size: 12px; color: var(--muted); display: flex; gap: 10px; flex-wrap: wrap; margin-top: 2px; }
+.opt { display: block; width: 100%; text-align: left; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2); cursor: pointer; margin-top: 8px; }
+.opt:hover { border-color: var(--muted); }
+.opt.right { border-color: var(--ok); }
+.opt.wrong { border-color: var(--warn); }
+.feedback { margin-top: 10px; padding: 10px 12px; border-radius: 8px; background: var(--bg); border: 1px solid var(--line); }
+ol.runbook { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction: column; gap: 4px; }
+.log { display: flex; flex-direction: column; }
+.logitem { display: grid; grid-template-columns: 74px 84px 1fr; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--line-soft); font-size: 13px; align-items: baseline; }
+.logitem .k { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+@media (max-width: 520px) { .logitem { grid-template-columns: 64px 1fr; } .logitem .k { display: none; } .clock { min-width: 0; } }
+@media (prefers-reduced-motion: reduce) { .switch::after { transition: none; } }
+</style>
+</head><body>
+
+<header class="top" id="top"></header>
+<div class="shell">
+  <nav class="side" aria-label="Console sections">
+    <div class="navlist" id="nav"></div>
+    <p class="note">Mockup with simulated data. Nothing here is connected to the real simulation yet.</p>
+  </nav>
+  <main id="main"></main>
+</div>
+
+<script>
+(function () {
+  "use strict";
+  // ---------- state ----------
+  const SCREENS = ["missions", "pipeline", "models", "monitoring", "incidents"];
+  const CTR = { v1: 0.172, v2: 0.241, v3: 0.297, v4: 0.318 };
+  const MISMATCH_CTR = 0.205, RANDOM_CTR = 0.17, ORACLE_CTR = 0.69;
+  const S = {
+    screen: "missions", tick: 1480, playing: false, speed: 1, range: 600,
+    node: "registry", alert: "INC-14", answer: null, staging: null, toast: null,
+    events: [
+      { t: 0, type: "deploy", v: "v1", idx: true, by: "system", note: "bootstrap model (untrained, explores)" },
+      { t: 500, type: "deploy", v: "v2", idx: true, by: "auto-promote" },
+      { t: 1000, type: "deploy", v: "v3", idx: true, by: "auto-promote" },
+      { t: 1400, type: "deploy", v: "v4", idx: false, by: "auto-promote", note: "Recall@20 8.3% > 7.9%" }
+    ],
+    cfg: {
+      kafka_partitions: 3, kafka_retention: 5000, flink_window: 50, flink_lag: 2000, redis_ttl: 1000,
+      ms_candidates: 100, ms_slate: 10, ms_eps: 0.05, ann_m: 16, ann_ef: 64, ann_rebuild: false,
+      lake_retention: 20000, spark_every: 250, ofs_snapshots: 3,
+      train_every: 400, train_epochs: 5, train_neg: 5, reg_auto: true, reg_canary: 0
+    }
+  };
+  const STATIC_LOG = [
+    { t: 1412, k: "alert", c: "s-crit", text: "INC-14 opened: online CTR down 31% since the v4 deploy. Paged: you." },
+    { t: 1405, k: "alert", c: "s-warn", text: "ALR-88: distinct movies served down 42%." },
+    { t: 1390, k: "train", c: "s-accent", text: "Training run-07 finished: model v4, held-out Recall@20 8.3%." },
+    { t: 1371, k: "alert", c: "s-ok", text: "ALR-87 resolved: Flink consumer lag back under 2,000 events." },
+    { t: 1360, k: "alert", c: "s-warn", text: "ALR-87: Flink consumer lag above 2,000 events." },
+    { t: 1290, k: "job", c: "s-info", text: "Spark feature job finished 40 ticks late (scheduled at 1250)." },
+    { t: 1250, k: "job", c: "s-info", text: "Spark feature job started." }
+  ];
+
+  try { const h = location.hash.slice(1); if (SCREENS.includes(h)) S.screen = h; } catch (e) {}
+
+  // ---------- simulated world ----------
+  const lastAt = (t, pred) => { let v = "v1"; for (const e of S.events) if (e.t <= t && pred(e)) v = e.v; return v; };
+  const prodAt = (t) => lastAt(t, (e) => e.type === "deploy");
+  const idxAt = (t) => lastAt(t, (e) => e.idx);
+  const baseCtr = (t) => { const p = prodAt(t); return p === idxAt(t) ? CTR[p] : MISMATCH_CTR; };
+  const noise = (t) => { const x = Math.sin(t * 12.9898 + 78.233) * 43758.5453; return (x - Math.floor(x)) * 2 - 1; };
+  let memo = new Map();
+  function rolling(t) {
+    if (memo.has(t)) return memo.get(t);
+    let s = 0; for (let k = 0; k < 25; k++) { const u = Math.max(0, t - k); s += baseCtr(u) + 0.07 * noise(u); }
+    const v = s / 25; memo.set(t, v); return v;
+  }
+  const p50 = (t) => 17 + 2.2 * noise(t + 7);
+  const p99 = (t) => 58 + 9 * noise(t + 3) + (Math.abs(noise(t + 11)) > 0.97 ? 22 : 0);
+  const pct = (x, d = 1) => (x * 100).toFixed(d) + "%";
+  const fmt = (n) => n.toLocaleString("en-US");
+  const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+  function derived() {
+    const t = S.tick, prod = prodAt(t), idx = idxAt(t), mismatch = prod !== idx;
+    const ctr = rolling(t), ctrPrev = rolling(Math.max(0, t - 300));
+    const lastSpark = Math.floor(t / S.cfg.spark_every) * S.cfg.spark_every;
+    const used = Math.min(1000, 540 + Math.floor((t - 1480) / 5) + S.events.filter((e) => e.by === "you").length * 15);
+    const incStatus = mismatch ? "Open" : (S.answer === "b" ? "Resolved" : "Mitigated");
+    const alerts = [
+      { id: "INC-14", sev: "SEV2", sc: "crit", t: 1412, title: "Online CTR down 31% since the model v4 deploy", status: incStatus, quiz: true,
+        desc: "Rolling CTR fell from 29.7% to about 20.5% within 15 ticks of the v4 deploy. Offline metrics for v4 looked better than v3. You are on call.",
+        runbook: ["Check whether the drop lines up with a deploy (Monitoring, CTR chart).", "If it does, roll back first and investigate after (Models, Roll back).", "Compare model versions across every serving component (Pipeline: Model server and ANN index).", "Confirm features are fresh (Monitoring, Feature freshness)."] },
+      { id: "ALR-88", sev: "WARN", sc: "warn", t: 1405, title: "Distinct movies served down 42%", status: mismatch ? "Firing" : "Resolved",
+        desc: "The model server is recommending a narrower, almost random-looking set of movies than before tick 1400.",
+        runbook: ["Look for a recent change to the model or the index.", "Check retrieved candidates and slate size in Pipeline, Model server."] },
+      { id: "ALR-87", sev: "WARN", sc: "warn", t: 1360, title: "Flink consumer lag above 2,000 events", status: "Resolved",
+        desc: "A traffic burst delayed online feature updates for 11 ticks. Lag recovered on its own at tick 1371.",
+        runbook: ["If lag stays high for more than 50 ticks, add Kafka partitions or Flink parallelism."] },
+      { id: "ALR-81", sev: "INFO", sc: "info", t: 1290, title: "Spark feature job finished 40 ticks late", status: "Resolved",
+        desc: "The run scheduled at tick 1250 took longer than usual. Offline features were still fresh enough for training.",
+        runbook: [] }
+    ];
+    const open = alerts.filter((a) => a.status !== "Resolved").length;
+    const objectives = [
+      { text: "Stop the bleeding: get online CTR back above 25%", done: !mismatch && ctr > 0.25 },
+      { text: "Find the root cause of INC-14", done: S.answer === "b" },
+      { text: "Ship v4 safely: v4 in production with a matching index", done: prod === "v4" && !mismatch }
+    ];
+    return { t, prod, idx, mismatch, ctr, ctrPrev, lastSpark, used, alerts, open, objectives };
+  }
+
+  // ---------- icons ----------
+  const I = {
+    missions: '<path d="M4 21V4h11l-1 4h6v9H10l1-4H4"/>',
+    pipeline: '<circle cx="5" cy="6" r="2"/><circle cx="19" cy="6" r="2"/><circle cx="12" cy="18" r="2"/><path d="M7 6h10M6 8l5 8M18 8l-5 8"/>',
+    models: '<path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5"/>',
+    monitoring: '<path d="M3 3v18h18"/><path d="M7 14l4-4 3 3 5-6"/>',
+    incidents: '<path d="M12 3l9 16H3z"/><path d="M12 10v4M12 17v.5"/>',
+    play: '<path d="M8 5v14l11-7z"/>', pause: '<path d="M8 5v14M16 5v14"/>',
+    arrow: '<path d="M4 12h14M13 6l6 6-6 6"/>', check: '<path d="M5 12l5 5 9-10"/>',
+    logo: '<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="8.5" y="14" width="7" height="7" rx="1.5"/><path d="M6.5 10v2h11v-2M12 12v2"/>'
+  };
+  const icon = (n, size = 18) => `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${I[n]}</svg>`;
+
+  // ---------- pieces ----------
+  function renderTop(d) {
+    document.getElementById("top").innerHTML = `
+      <div class="brand">${icon("logo", 20)}<span>SimPipeline Console</span><span class="env">sim-prod</span></div>
+      <div class="group">
+        <button class="iconbtn" data-act="play" aria-label="${S.playing ? "Pause simulation" : "Run simulation"}">${icon(S.playing ? "pause" : "play", 16)}</button>
+        <div><div class="label">Sim clock</div><div class="clock">tick ${fmt(d.t)}</div></div>
+        <div class="seg" role="group" aria-label="Simulation speed">${[1, 10, 100].map((x) => `<button data-act="speed" data-v="${x}" aria-pressed="${S.speed === x}">${x}×</button>`).join("")}</div>
+      </div>
+      <div><div class="label">Mission</div><div>2 · Bad deploy</div></div>
+      <div><div class="label">Production model</div><div class="mono">${d.prod} <span class="${d.mismatch ? "s-warn" : "s-ok"}">${d.mismatch ? "· index v" + d.idx.slice(1) : "· healthy"}</span></div></div>
+      <div class="spacer"></div>
+      <div><div class="label">Compute budget</div><div class="group"><div class="budget" role="meter" aria-valuemin="0" aria-valuemax="1000" aria-valuenow="${d.used}" aria-label="Compute credits used"><span style="width:${d.used / 10}%"></span></div><span class="mono muted">${d.used}/1000</span></div></div>`;
+  }
+
+  function renderNav(d) {
+    const labels = { missions: "Missions", pipeline: "Pipeline", models: "Models", monitoring: "Monitoring", incidents: "Incidents" };
+    document.getElementById("nav").innerHTML = SCREENS.map((s) => `
+      <button class="navbtn" data-act="go" data-v="${s}" ${S.screen === s ? 'aria-current="page"' : ""}>${icon(s)}<span>${labels[s]}</span>${s === "incidents" && d.open ? `<span class="count">${d.open}</span>` : ""}</button>`).join("");
+  }
+
+  function toastHtml() { return S.toast ? `<div class="toast" role="status">${icon("check", 16)}<span>${esc(S.toast)}</span></div>` : ""; }
+
+  function ctrChart(d, small) {
+    const R = S.range, start = Math.max(0, d.t - R), span = Math.max(1, d.t - start), N = 160, H = 200, W = 1000, top = 0.8;
+    const y = (v) => (H - Math.min(top, Math.max(0, v)) / top * H).toFixed(1);
+    const pts = []; for (let i = 0; i <= N; i++) { const t = Math.round(start + span * i / N); pts.push(`${(i / N * W).toFixed(1)},${y(rolling(t))}`); }
+    const marks = S.events.filter((e) => e.t > start && e.t <= d.t && e.t > 0).map((e) => {
+      const x = ((e.t - start) / span * W).toFixed(1);
+      const lab = e.type === "deploy" ? `deploy ${e.v}` : `index ${e.v}`;
+      return `<line x1="${x}" x2="${x}" y1="0" y2="${H}" stroke="var(--muted)" stroke-dasharray="3 3" vector-effect="non-scaling-stroke"/><text x="${x}" y="-6" fill="var(--muted)" font-size="11" text-anchor="middle" font-family="var(--mono)">${lab}</text>`;
+    }).join("");
+    const grid = [0, 0.2, 0.4, 0.6, 0.8].map((v) => `<line x1="0" x2="${W}" y1="${y(v)}" y2="${y(v)}" stroke="var(--line-soft)" vector-effect="non-scaling-stroke"/><text x="-8" y="${+y(v) + 4}" fill="var(--muted)" font-size="11" text-anchor="end" font-family="var(--mono)">${v * 100}%</text>`).join("");
+    const last = pts[pts.length - 1].split(",");
+    return `<div class="chart ${small ? "small" : ""}"><svg viewBox="-40 -20 ${W + 48} ${H + 36}" role="img" aria-label="Rolling CTR over the last ${R} ticks, now ${pct(d.ctr)}">
+        ${grid}
+        <line x1="0" x2="${W}" y1="${y(RANDOM_CTR)}" y2="${y(RANDOM_CTR)}" stroke="var(--muted)" stroke-dasharray="1 4" vector-effect="non-scaling-stroke"/>
+        <line x1="0" x2="${W}" y1="${y(ORACLE_CTR)}" y2="${y(ORACLE_CTR)}" stroke="var(--ok)" stroke-dasharray="1 4" vector-effect="non-scaling-stroke"/>
+        ${marks}
+        <polygon points="0,${H} ${pts.join(" ")} ${W},${H}" fill="var(--accent)" fill-opacity="0.08"/>
+        <polyline class="seriesline" points="${pts.join(" ")}" stroke="var(--accent)"/>
+        <circle cx="${last[0]}" cy="${last[1]}" r="3.5" fill="var(--accent)"/>
+        <text x="0" y="${H + 16}" fill="var(--muted)" font-size="11" font-family="var(--mono)">tick ${fmt(start)}</text>
+        <text x="${W}" y="${H + 16}" fill="var(--muted)" font-size="11" text-anchor="end" font-family="var(--mono)">tick ${fmt(d.t)}</text>
+      </svg>
+      <div class="legend"><span><i style="background:var(--accent)"></i>Rolling CTR (25 ticks)</span><span><i style="background:var(--ok)"></i>Perfect list ${pct(ORACLE_CTR, 0)}</span><span><i style="background:var(--muted)"></i>Random list ${pct(RANDOM_CTR, 0)}</span><span>Dashed: deploys and index rebuilds</span></div></div>`;
+  }
+
+  function latencyChart(d) {
+    const R = S.range, start = Math.max(0, d.t - R), span = Math.max(1, d.t - start), N = 160, H = 110, W = 1000;
+    const y = (v) => (H - Math.min(100, v) / 100 * H).toFixed(1);
+    const line = (f) => { const p = []; for (let i = 0; i <= N; i++) { const t = Math.round(start + span * i / N); p.push(`${(i / N * W).toFixed(1)},${y(f(t))}`); } return p.join(" "); };
+    const grid = [0, 50, 100].map((v) => `<line x1="0" x2="${W}" y1="${y(v)}" y2="${y(v)}" stroke="var(--line-soft)" vector-effect="non-scaling-stroke"/><text x="-8" y="${+y(v) + 4}" fill="var(--muted)" font-size="11" text-anchor="end" font-family="var(--mono)">${v}</text>`).join("");
+    return `<div class="chart small"><svg viewBox="-40 -10 ${W + 48} ${H + 20}" role="img" aria-label="Serving latency p50 and p99 in milliseconds">
+      ${grid}<polyline class="seriesline" points="${line(p99)}" stroke="var(--warn)"/><polyline class="seriesline" points="${line(p50)}" stroke="var(--accent)"/></svg>
+      <div class="legend"><span><i style="background:var(--accent)"></i>p50 ${p50(d.t).toFixed(0)} ms</span><span><i style="background:var(--warn)"></i>p99 ${p99(d.t).toFixed(0)} ms</span><span>SLO: p99 under 80 ms</span></div></div>`;
+  }
+
+  function logHtml(limit) {
+    const dyn = S.events.filter((e) => e.t > 0).map((e) => ({
+      t: e.t, k: e.type === "deploy" ? "deploy" : "index", c: e.by === "you" ? "s-accent" : "s-info",
+      text: e.type === "deploy"
+        ? `Model ${e.v} deployed to production by ${e.by}${e.note ? " (" + e.note + ")" : ""}${e.idx ? ", ANN index rebuilt." : ". ANN index not rebuilt."}`
+        : `ANN index rebuilt with ${e.v} item embeddings by ${e.by}.`
+    }));
+    const all = dyn.concat(STATIC_LOG).sort((a, b) => b.t - a.t).slice(0, limit);
+    return `<div class="log">${all.map((x) => `<div class="logitem"><span class="mono muted">t ${fmt(x.t)}</span><span class="k ${x.c}">${x.k}</span><span>${esc(x.text)}</span></div>`).join("")}</div>`;
+  }
+
+  // ---------- screens ----------
+  function missions(d) {
+    const done = d.objectives.filter((o) => o.done).length;
+    return `${toastHtml()}
+      <div class="head"><div><div class="label">Mission 2 of 3 · active</div><h1>Bad deploy</h1>
+        <p>It is tick 1,480. Overnight the training pipeline produced model v4 and auto-promoted it to production because its offline Recall@20 beat v3. Since then online CTR has fallen from about 30% to about 21%. Stop the damage, find out why, and ship v4 properly.</p></div></div>
+      <div class="row">
+        <section class="panel" style="flex: 999 1 420px" aria-labelledby="obj-h">
+          <div class="head"><h2 id="obj-h">Objectives</h2><span class="mono muted">${done}/3</span></div>
+          ${d.objectives.map((o) => `<div class="objective"><span class="check ${o.done ? "done" : ""}">${o.done ? icon("check", 12) : ""}</span><span ${o.done ? 'class="muted"' : ""}>${esc(o.text)}</span></div>`).join("")}
+          <div class="row" style="margin-top:12px; gap:8px">
+            <button class="btn primary" data-act="go" data-v="incidents">Open INC-14</button>
+            <button class="btn" data-act="go" data-v="monitoring">Open monitoring</button>
+          </div>
+        </section>
+        <section class="panel" style="flex: 1 1 260px" aria-labelledby="learn-h">
+          <h2 id="learn-h">What this mission teaches</h2>
+          <div class="chips" style="margin-top:10px"><span class="chip">Safe deploys</span><span class="chip">Rollback first</span><span class="chip">Offline vs online metrics</span><span class="chip">Train/serve consistency</span></div>
+          <p class="muted" style="margin-top:12px">In production, a model that wins offline can still lose online. Real teams guard deploys with canaries and automatic rollback for exactly this reason.</p>
+        </section>
+      </div>
+      <h2>Campaign</h2>
+      <div class="row">
+        <div class="panel mission"><div class="label s-ok">Completed</div><h3>1 · Launch</h3><p class="muted">Get the recommender live and lift CTR above 25%.</p><p class="mono">Best CTR 29.7%</p></div>
+        <div class="panel mission" style="border-color:var(--accent)"><div class="label s-accent">Active</div><h3>2 · Bad deploy</h3><p class="muted">CTR dropped 31% after the last deploy. Find out why.</p><p class="mono">${done}/3 objectives</p></div>
+        <div class="panel mission"><div class="label">Locked</div><h3>3 · Cold start</h3><p class="muted">New users all get the same 10 movies. Fix their first session.</p><p class="mono muted">Finish mission 2</p></div>
+      </div>`;
+  }
+
+  const NODES = {
+    kafka: { name: "Event bus", tool: "Kafka", lane: "online", real: "Apache Kafka", desc: "Every recommendation shown and every click is published here as an event. Everything downstream reads from it.",
+      fields: [["kafka_partitions", "Partitions", "More partitions, more parallel consumers"], ["kafka_retention", "Retention (ticks)", "How long events stay replayable"]] },
+    flink: { name: "Stream features", tool: "Flink", lane: "online", real: "Apache Flink", desc: "Updates online user features (recent genres, interaction counts) a few ticks after each event.",
+      fields: [["flink_window", "Window (ticks)", "Aggregation window for recent activity"], ["flink_lag", "Lag alert at (events)", "Fires ALR when consumers fall behind"]] },
+    redis: { name: "Online features", tool: "Redis", lane: "online", real: "Redis behind a Feast or Tecton feature store", desc: "Fast feature lookups at serving time. Must hold the same features the model was trained on.",
+      fields: [["redis_ttl", "Feature TTL (ticks)", "Older features are treated as missing"]] },
+    server: { name: "Model server", tool: "ModelServer", lane: "online", real: "KServe, Triton or TorchServe", desc: "Embeds the user with the user tower, retrieves candidates from the ANN index and shows the top of the list.",
+      fields: [["ms_candidates", "Retrieved candidates", "Pulled from the ANN index per request"], ["ms_slate", "Slate size", "Movies the user actually sees"], ["ms_eps", "Exploration rate", "Share of slots given to random movies", 0.01]] },
+    ann: { name: "ANN index", tool: "HNSW", lane: "online", real: "FAISS, ScaNN or a vector database", desc: "Holds one embedding per movie, produced by the item tower. It must come from the same model version as the user tower, or user and movie vectors stop being comparable.",
+      fields: [["ann_m", "M (links per node)", "Higher: better recall, more memory"], ["ann_ef", "efSearch", "Higher: better recall, slower queries"]], toggles: [["ann_rebuild", "Rebuild on every deploy", "Re-embed all movies when a model is promoted"]] },
+    lake: { name: "Data lake", tool: "DataLake", lane: "offline", real: "S3 with Parquet or Delta Lake", desc: "Long-term store of every event. Training data comes from here.",
+      fields: [["lake_retention", "Retention (ticks)", "Older events are dropped"]] },
+    spark: { name: "Batch features", tool: "Spark", lane: "offline", real: "Apache Spark on a schedule (Airflow)", desc: "Recomputes offline features from the data lake on a schedule.",
+      fields: [["spark_every", "Run every (ticks)", "Feature freshness depends on this"]] },
+    ofs: { name: "Offline features", tool: "Feature store", lane: "offline", real: "Feast or Tecton offline store", desc: "Point-in-time snapshots, so training sees each feature as it was when the event happened.",
+      fields: [["ofs_snapshots", "Snapshots kept per user", "Bounded history keeps lookups fast"]] },
+    train: { name: "Training", tool: "Two-tower", lane: "offline", real: "PyTorch jobs on a GPU cluster", desc: "Builds training data from shown slates (clicks are positives, unclicked shown movies are negatives) and trains the two-tower model.",
+      fields: [["train_every", "Retrain every (ticks)", "Each retrain costs 40 compute credits"], ["train_epochs", "Epochs", ""], ["train_neg", "Negatives per positive", ""]] },
+    registry: { name: "Model registry", tool: "Registry", lane: "offline", real: "MLflow Model Registry", desc: "Versioned models with stages. Decides when a candidate goes to production.",
+      fields: [["reg_canary", "Canary share (%)", "0 = deploy to everyone at once"]], toggles: [["reg_auto", "Auto-promote when Recall@20 improves", "Promotes on offline metrics alone"]] }
+  };
+
+  function nodeStatus(id, d) {
+    switch (id) {
+      case "kafka": return ["ok", "≈ 13 events / tick"];
+      case "flink": return ["ok", "lag 14 events"];
+      case "redis": return ["ok", "943 users, fresh"];
+      case "server": return d.mismatch ? ["warn", `serving ${d.prod}, items look random`] : ["ok", `serving ${d.prod}`];
+      case "ann": return d.mismatch ? ["crit", `embeddings ${d.idx}, model ${d.prod}`] : ["ok", `embeddings ${d.idx}`];
+      case "lake": return ["ok", `${fmt(d.t * 13)} events`];
+      case "spark": return ["ok", `last run t ${fmt(d.lastSpark)}`];
+      case "ofs": return ["ok", "point-in-time"];
+      case "train": return ["ok", "run-07 done, t 1,390"];
+      case "registry": return S.cfg.reg_auto ? ["warn", "auto-promote on"] : ["ok", "manual promotion"];
+    }
+  }
+
+  function diagram(d) {
+    const lane = (ids) => `<div class="lanerow">${ids.map((id, i) => {
+      const n = NODES[id], [st, txt] = nodeStatus(id, d);
+      return `${i ? `<span class="arrow">${icon("arrow", 16)}</span>` : ""}<button class="node" data-act="node" data-v="${id}" aria-pressed="${S.node === id}">
+        <span class="nm"><span class="dot bg-${st}" aria-hidden="true"></span>${n.name}</span><span class="tool">${n.tool}</span><span class="st s-${st}">${txt}</span></button>`;
+    }).join("")}</div>`;
+    return `<div class="lane"><div class="label">Serving path · online, every request</div>${lane(["kafka", "flink", "redis", "server", "ann"])}</div>
+      <div class="lane" style="margin-top:20px"><div class="label">Training path · offline, on a schedule</div>${lane(["lake", "spark", "ofs", "train", "registry"])}</div>
+      <p class="muted" style="margin-top:14px; font-size:12px">Kafka also writes every event into the data lake. The registry deploys models to the model server and, if configured, rebuilds the ANN index.</p>`;
+  }
+
+  function pipeline(d) {
+    const n = NODES[S.node], [st, txt] = nodeStatus(S.node, d);
+    const fields = n.fields.map(([k, lab, help, step]) => `<div class="field"><div><label for="f-${k}">${lab}</label>${help ? `<small>${help}</small>` : ""}</div><input id="f-${k}" type="number" data-cfg="${k}" step="${step || 1}" value="${S.cfg[k]}"></div>`).join("");
+    const toggles = (n.toggles || []).map(([k, lab, help]) => `<div class="field"><div><span id="l-${k}">${lab}</span><small>${help}</small></div><button class="switch" role="switch" aria-checked="${!!S.cfg[k]}" aria-labelledby="l-${k}" data-act="toggle" data-v="${k}"></button></div>`).join("");
+    const actions = S.node === "ann" ? `<button class="btn ${d.mismatch ? "primary" : ""}" data-act="rebuild" style="margin-top:14px">Rebuild index with ${d.prod} embeddings</button>`
+      : S.node === "spark" ? `<button class="btn" data-act="noop" style="margin-top:14px">Run feature job now</button>`
+      : S.node === "train" ? `<button class="btn" data-act="noop" style="margin-top:14px">Start a training run (40 credits)</button>` : "";
+    return `${toastHtml()}
+      <div class="head"><div><h1>Pipeline</h1><p>Every component of the recommender. Select one to see its status and change its settings.</p></div></div>
+      <div class="row" style="align-items:flex-start">
+        <section class="panel" style="flex: 999 1 520px" aria-label="Pipeline diagram"><div id="diagram">${diagram(d)}</div></section>
+        <section class="panel" style="flex: 1 1 300px" aria-labelledby="node-h">
+          <div class="label">${n.lane === "online" ? "Serving path" : "Training path"}</div>
+          <h2 id="node-h" style="margin-top:2px">${n.name}</h2>
+          <p class="pill s-${st}" style="margin-top:8px" id="node-status"><span class="dot bg-${st}"></span>${txt}</p>
+          <p style="margin-top:12px">${n.desc}</p>
+          <p class="muted" style="margin-top:8px; font-size:12px">In a real company: ${n.real}</p>
+          <div style="margin-top:12px">${fields}${toggles}</div>
+          ${actions}
+        </section>
+      </div>`;
+  }
+
+  function models(d) {
+    const runs = [
+      ["run-07", "v4", "1,390", "13,900", "5 / 5", "8.3%", "0.412", d.prod === "v4" ? "Production" : (S.staging === "v4" ? "Staging" : "Archived")],
+      ["run-06", "v3", "1,000", "10,000", "5 / 5", "7.9%", "0.428", d.prod === "v3" ? "Production" : "Archived"],
+      ["run-05", "v2", "500", "5,000", "5 / 5", "5.1%", "0.497", "Archived"],
+      ["bootstrap", "v1", "0", "0", "–", "1.8%", "–", "Archived"]
+    ];
+    const pillFor = (s) => s === "Production" ? "s-ok" : s === "Staging" ? "s-accent" : "s-info";
+    return `${toastHtml()}
+      <div class="head"><div><h1>Models</h1><p>Training runs and the model registry. Promoting a model sends it to the model server; rolling back restores the previous version and its index.</p></div></div>
+      <div class="row">
+        <section class="panel" style="flex:1 1 220px"><div class="label">Production</div><p class="mono" style="font-size:26px; margin-top:4px">${d.prod}</p>
+          <p class="${d.mismatch ? "s-warn" : "muted"}" style="font-size:12px">${d.mismatch ? `ANN index still holds ${d.idx} embeddings` : `index matches (${d.idx})`}</p>
+          <div style="margin-top:12px">${d.prod === "v4" ? `<button class="btn primary" data-act="rollback">Roll back to v3</button>` : `<button class="btn" disabled>Roll back</button>`}</div></section>
+        <section class="panel" style="flex:1 1 220px"><div class="label">Staging</div><p class="mono" style="font-size:26px; margin-top:4px">${S.staging || "–"}</p>
+          <p class="muted" style="font-size:12px">${S.staging ? `ANN rebuild on deploy: ${S.cfg.ann_rebuild ? "on" : "off"}` : "Empty"}</p>
+          <div style="margin-top:12px">${S.staging ? `<button class="btn primary" data-act="promote">Promote ${S.staging} to production</button>` : `<button class="btn" disabled>Promote</button>`}</div></section>
+        <section class="panel" style="flex:1 1 220px"><div class="label">Promotion policy</div><p style="margin-top:4px">${S.cfg.reg_auto ? "Automatic when offline Recall@20 improves" : "Manual"}</p>
+          <p class="muted" style="font-size:12px; margin-top:4px">Canary: ${S.cfg.reg_canary ? S.cfg.reg_canary + "% of users first" : "off"}</p>
+          <div style="margin-top:12px"><button class="btn" data-act="gonode" data-v="registry">Change in Pipeline</button></div></section>
+      </div>
+      <section class="panel" aria-labelledby="runs-h"><div class="head"><h2 id="runs-h">Training runs</h2><span class="muted" style="font-size:12px">Recall@20 on held-out events · random list scores 1.75%</span></div>
+        <div class="tablewrap" style="margin-top:8px"><table><thead><tr><th>Run</th><th>Model</th><th>Finished (tick)</th><th>Training sessions</th><th>Epochs / negatives</th><th>Recall@20</th><th>Val. loss</th><th>Stage</th></tr></thead>
+        <tbody>${runs.map((r) => `<tr><td class="mono">${r[0]}</td><td class="mono">${r[1]}</td><td class="mono">${r[2]}</td><td class="mono">${r[3]}</td><td class="mono">${r[4]}</td><td class="mono">${r[5]}</td><td class="mono">${r[6]}</td><td><span class="pill ${pillFor(r[7])}">${r[7]}</span></td></tr>`).join("")}</tbody></table></div>
+        <p class="muted" style="margin-top:12px; font-size:12px">v4 beat v3 offline (8.3% vs 7.9%) and still lost online. Offline evaluation scores each model with its own embeddings, so it cannot see a serving bug like a stale index.</p>
+      </section>`;
+  }
+
+  function monitoring(d) {
+    const delta = (d.ctr - d.ctrPrev) * 100, fresh = d.t - d.lastSpark;
+    return `${toastHtml()}
+      <div class="head"><div><h1>Monitoring</h1><p>Live health of the recommender: business metric first, then the system underneath it.</p></div>
+        <div class="seg" role="group" aria-label="Time range">${[300, 600, 1500].map((r) => `<button data-act="range" data-v="${r}" aria-pressed="${S.range === r}">${r} ticks</button>`).join("")}</div></div>
+      <div class="tiles">
+        <div class="tile"><span class="label">Online CTR</span><span class="big ${d.ctr < 0.25 ? "s-crit" : ""}">${pct(d.ctr)}</span><span class="sub">${delta >= 0 ? "+" : ""}${delta.toFixed(1)} pts vs 300 ticks ago</span></div>
+        <div class="tile"><span class="label">Active users</span><span class="big">10<span class="muted" style="font-size:14px"> / tick</span></span><span class="sub">943 users in the world</span></div>
+        <div class="tile"><span class="label">Latency p99</span><span class="big">${p99(d.t).toFixed(0)} ms</span><span class="sub">SLO 80 ms · p50 ${p50(d.t).toFixed(0)} ms</span></div>
+        <div class="tile"><span class="label">Feature freshness</span><span class="big ${fresh > 300 ? "s-warn" : ""}">${fresh}<span class="muted" style="font-size:14px"> ticks</span></span><span class="sub">since last Spark run · alert at 300</span></div>
+      </div>
+      <section class="panel" aria-labelledby="ctr-h"><div class="head"><h2 id="ctr-h">Click-through rate</h2><span class="muted" style="font-size:12px">Share of shown 10-movie lists that got a click</span></div><div style="margin-top:20px">${ctrChart(d)}</div></section>
+      <div class="row">
+        <section class="panel" style="flex: 2 1 340px" aria-labelledby="lat-h"><h2 id="lat-h">Serving latency (ms)</h2><div style="margin-top:12px">${latencyChart(d)}</div></section>
+        <section class="panel" style="flex: 1 1 240px" aria-labelledby="drift-h"><h2 id="drift-h">Data drift</h2>
+          <p class="mono" style="font-size:26px; margin-top:8px">0.04 <span class="pill s-ok" style="font-size:12px">stable</span></p>
+          <p class="muted" style="font-size:12px; margin-top:4px">Population stability index of user features, live vs training data. Alert at 0.2.</p></section>
+      </div>
+      <section class="panel" aria-labelledby="log-h"><h2 id="log-h">Event log</h2><div style="margin-top:8px">${logHtml(9)}</div></section>`;
+  }
+
+  const OPTIONS = [
+    ["a", "User tastes drifted (data drift)", "The drift score is 0.04, far below the 0.2 alert line, and the drop starts exactly at the deploy. Look at what the deploy changed."],
+    ["b", "The ANN index still holds v3 movie embeddings while the user tower is v4", "Correct. Auto-promote deployed the v4 user tower without rebuilding the index, so user and movie vectors come from different models and retrieval is close to random. Offline Recall could not catch it: the evaluator scores v4 against v4's own embeddings."],
+    ["c", "Flink consumer lag delayed online features", "That alert fired at tick 1,360 and cleared at 1,371, before the deploy. It is unrelated."],
+    ["d", "v4 overfit the training data", "v4 scored better than v3 on held-out data (8.3% vs 7.9%). Overfitting would have shown up there first."]
+  ];
+
+  function incidents(d) {
+    const a = d.alerts.find((x) => x.id === S.alert) || d.alerts[0];
+    const stc = (s) => s === "Resolved" ? "s-ok" : s === "Mitigated" ? "s-accent" : "s-crit";
+    const quiz = a.quiz ? `<section style="margin-top:18px" aria-labelledby="rc-h"><h3 id="rc-h">Root cause</h3><p class="muted" style="font-size:12px">Pick the explanation the evidence supports.</p>
+      ${OPTIONS.map(([k, txt]) => `<button class="opt ${S.answer === k ? (k === "b" ? "right" : "wrong") : ""}" data-act="answer" data-v="${k}" aria-pressed="${S.answer === k}">${esc(txt)}</button>`).join("")}
+      ${S.answer ? `<div class="feedback" role="status"><strong class="${S.answer === "b" ? "s-ok" : "s-warn"}">${S.answer === "b" ? "Root cause confirmed." : "Not this one."}</strong> ${esc(OPTIONS.find((o) => o[0] === S.answer)[2])}</div>` : ""}</section>` : "";
+    const timeline = a.id === "INC-14" ? `<section style="margin-top:18px"><h3>Timeline</h3><div class="log" style="margin-top:4px">
+      ${[[1390, "Training run-07 finished: v4, Recall@20 8.3%"], [1400, "v4 auto-promoted to production. ANN index not rebuilt"], [1405, "ALR-88: distinct movies served down 42%"], [1412, "INC-14 opened, you were paged"]].map(([t, x]) => `<div class="logitem" style="grid-template-columns:74px 1fr"><span class="mono muted">t ${fmt(t)}</span><span>${x}</span></div>`).join("")}</div></section>
+      <section style="margin-top:18px"><h3>CTR around the deploy</h3><div style="margin-top:16px">${ctrChart(d, true)}</div></section>` : "";
+    return `${toastHtml()}
+      <div class="head"><div><h1>Incidents</h1><p>Alerts from monitoring. Each one links to a runbook: the first steps the on-call engineer should take.</p></div></div>
+      <div class="row" style="align-items:flex-start">
+        <section class="panel" style="flex: 1 1 300px; padding: 8px 0 0 8px" aria-label="Alert inbox"><div class="alertlist">
+          ${d.alerts.map((x) => `<button class="alert" data-act="alert" data-v="${x.id}" aria-pressed="${x.id === a.id}"><span class="stripe bg-${x.sc}"></span>
+            <span><span style="font-weight:600">${esc(x.title)}</span><span class="meta"><span class="mono">${x.id}</span><span>${x.sev}</span><span class="mono">t ${fmt(x.t)}</span><span class="${stc(x.status)}">${x.status}</span></span></span></button>`).join("")}
+        </div></section>
+        <section class="panel" style="flex: 999 1 440px" aria-labelledby="inc-h">
+          <div class="row" style="gap:8px; align-items:center"><span class="mono muted">${a.id}</span><span class="pill s-${a.sc}">${a.sev}</span><span class="pill ${stc(a.status)}">${a.status}</span></div>
+          <h2 id="inc-h" style="margin-top:8px; font-size:18px">${esc(a.title)}</h2>
+          <p style="margin-top:8px">${esc(a.desc)}</p>
+          ${a.runbook.length ? `<section style="margin-top:18px"><h3>Runbook</h3><ol class="runbook">${a.runbook.map((r) => `<li>${esc(r)}</li>`).join("")}</ol></section>` : ""}
+          ${timeline}${quiz}
+          ${a.id === "INC-14" && d.mismatch ? `<div class="row" style="gap:8px; margin-top:18px"><button class="btn primary" data-act="rollback">Roll back to v3</button><button class="btn" data-act="gonode" data-v="ann">Inspect ANN index</button></div>` : ""}
+        </section>
+      </div>`;
+  }
+
+  // ---------- render ----------
+  const VIEWS = { missions, pipeline, models, monitoring, incidents };
+  function render(full) {
+    memo = new Map();
+    const d = derived();
+    renderTop(d); renderNav(d);
+    if (full || S.screen !== "pipeline") document.getElementById("main").innerHTML = VIEWS[S.screen](d);
+    else {
+      const dg = document.getElementById("diagram"); if (dg) dg.innerHTML = diagram(d);
+      const ns = document.getElementById("node-status"); if (ns) { const [st, txt] = nodeStatus(S.node, d); ns.className = `pill s-${st}`; ns.innerHTML = `<span class="dot bg-${st}"></span>${txt}`; }
+    }
+  }
+
+  function act(name, v) {
+    const now = S.tick;
+    switch (name) {
+      case "go": S.screen = v; S.toast = null; try { history.replaceState(null, "", "#" + v); } catch (e) {} window.scrollTo(0, 0); break;
+      case "gonode": S.screen = "pipeline"; S.node = v; S.toast = null; try { history.replaceState(null, "", "#pipeline"); } catch (e) {} break;
+      case "play": S.playing = !S.playing; break;
+      case "speed": S.speed = +v; break;
+      case "range": S.range = +v; break;
+      case "node": S.node = v; break;
+      case "alert": S.alert = v; break;
+      case "answer": S.answer = v; break;
+      case "toggle": S.cfg[v] = !S.cfg[v]; break;
+      case "noop": S.toast = "Not wired up in this mockup yet."; break;
+      case "rollback": {
+        if (prodAt(now) !== "v4") break;
+        S.events.push({ t: now, type: "deploy", v: "v3", idx: true, by: "you", note: "rollback" });
+        S.staging = "v4"; S.playing = true;
+        S.toast = "Rolled back to v3. The clock is running so you can watch CTR recover on Monitoring.";
+        break;
+      }
+      case "promote": {
+        const v2 = S.staging; if (!v2) break;
+        S.events.push({ t: now, type: "deploy", v: v2, idx: !!S.cfg.ann_rebuild, by: "you" });
+        S.staging = null; S.playing = true;
+        S.toast = S.cfg.ann_rebuild ? `Promoted ${v2} with a fresh index. Watch CTR on Monitoring.` : `Promoted ${v2}, but the index was not rebuilt. Watch what CTR does.`;
+        break;
+      }
+      case "rebuild": {
+        const p = prodAt(now);
+        S.events.push({ t: now, type: "rebuild", v: p, idx: true, by: "you" }); S.playing = true;
+        S.toast = `ANN index rebuilt with ${p} movie embeddings.`;
+        break;
+      }
+    }
+    render(true);
+  }
+
+  document.addEventListener("click", (e) => { const b = e.target.closest("[data-act]"); if (b && !b.disabled) act(b.dataset.act, b.dataset.v); });
+  document.addEventListener("input", (e) => { const k = e.target.dataset && e.target.dataset.cfg; if (k) { const n = parseFloat(e.target.value); if (!Number.isNaN(n)) S.cfg[k] = n; } });
+  window.addEventListener("hashchange", () => { const h = location.hash.slice(1); if (SCREENS.includes(h) && h !== S.screen) { S.screen = h; render(true); } });
+  setInterval(() => { if (S.playing) { S.tick += S.speed; render(false); } }, 500);
+  render(true);
+})();
+</script>
+</body></html>
