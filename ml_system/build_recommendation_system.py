@@ -41,13 +41,18 @@ def build_recommendation_system(
     num_candidates=100,
     slate_size=10,
     user_tower_kwargs=None,
-    item_tower_kwargs=None
+    item_tower_kwargs=None,
+    users_per_tick=1,
+    outcome_model="relevance"
 ):
     """Wire up World, streaming, serving and the offline retraining loop.
 
     `user_tower_kwargs` / `item_tower_kwargs` are passed to
     SimpleUserTower / SimpleItemTower (feature switches such as
     `use_activity_features`); the defaults are DEFAULT_*_TOWER_KWARGS.
+    `users_per_tick` is how many distinct users the World serves per tick.
+    `outcome_model` is "relevance" (watch/completion/rating depend on
+    rel(u, m)) or "random" (the old uniform outcomes).
     """
 
     user_tower_kwargs = dict(
@@ -118,7 +123,9 @@ def build_recommendation_system(
         movie_objects=movie_objects,
         user_states=user_states,
         movie_states=movie_states,
-        rng=child_rng()
+        rng=child_rng(),
+        users_per_tick=users_per_tick,
+        outcome_model=outcome_model
     )
 
     sim = Simulator(seed=seeds.getrandbits(64))
@@ -183,6 +190,8 @@ def build_recommendation_system(
         "spark": sim.get_service("Spark"),
         "ctr_tracker": ctr_tracker,
         "seed": seed,
+        "users_per_tick": users_per_tick,
+        "outcome_model": outcome_model,
         "user_tower_kwargs": user_tower_kwargs,
         "item_tower_kwargs": item_tower_kwargs
     }

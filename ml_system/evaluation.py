@@ -258,8 +258,16 @@ def evaluate_popularity(
     events,
     validation_population,
     split_ratio=0.8,
-    k=20
+    k=20,
+    movie_objects=None
 ):
+    """Recall@K of a global most-popular list built from training events.
+
+    If fewer than k movies were ever clicked/watched, the list is padded
+    with catalog movies in id order (`movie_objects`), or left short if no
+    catalog is given. It used to be padded with the held-out movies
+    themselves, which leaked the answers into the baseline.
+    """
     split_index = int(len(events) * split_ratio)
     train_events = events[:split_index]
 
@@ -284,19 +292,18 @@ def evaluate_popularity(
         movie_id
         for movie_id, _ in sorted(
             popularity.items(),
-            key=lambda x: x[1],
-            reverse=True
+            # Most popular first; ties broken by movie id.
+            key=lambda x: (-x[1], x[0])
         )
     ]
 
-    # Include unseen training-period movies after the known popular
-    # movies so the recommendation list can still contain k items.
-    for movie_id in sorted(
-        set(interaction["movie_id"] for interaction in validation_population)
-        | set(popularity.keys())
-    ):
-        if movie_id not in recommendations:
-            recommendations.append(movie_id)
+    # Pad from the catalog only: never from validation_population.
+    if movie_objects is not None:
+        for movie_id in sorted(movie_objects):
+            if len(recommendations) >= k:
+                break
+            if movie_id not in popularity:
+                recommendations.append(movie_id)
 
     recommendations = recommendations[:k]
 

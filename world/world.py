@@ -13,7 +13,9 @@ class World(Service):
         movie_objects,
         user_states,
         movie_states,
-        rng=None
+        rng=None,
+        users_per_tick=1,
+        outcome_model="relevance"
     ):
         super().__init__()
 
@@ -25,7 +27,22 @@ class World(Service):
 
         self.active_sessions = {}
 
-        self.user_simulator = UserSimulator(self, rng=rng)
+        if users_per_tick < 1:
+            raise ValueError("users_per_tick must be >= 1")
+
+        # Distinct users served per tick. With 1 (the old behaviour) the
+        # per-tick CTR is 0 or 1; with more it is a real rate.
+        self.users_per_tick = users_per_tick
+
+        # Unique id per shown slate. It used to be the tick, which collides
+        # once several users are active in the same tick.
+        self.recommendation_count = 0
+
+        self.user_simulator = UserSimulator(
+            self,
+            rng=rng,
+            outcome_model=outcome_model
+        )
 
 
     def process(self, sim):
@@ -37,10 +54,16 @@ class World(Service):
 
 
     def sample_active_users(self, sim):
-        # Decide which users are active this tick.
-        # For now, activate one random user.
+        """Users active this tick: `users_per_tick` distinct users drawn
+        uniformly with the simulator's seeded RNG."""
 
-        return [sim.random.choice(list(self.user_objects.values()))]
+        users = list(self.user_objects.values())
+
+        if self.users_per_tick == 1:
+            # Same RNG call as before, so 1-user runs are unchanged.
+            return [sim.random.choice(users)]
+
+        return sim.random.sample(users, min(self.users_per_tick, len(users)))
 
 
     def simulate_user(self, user, sim):
@@ -49,10 +72,12 @@ class World(Service):
 
         movie_ids = model_server.recommend(user)
 
+        self.recommendation_count += 1
+
         events = self.user_simulator.react(
             sim=sim,
             user=user,
-            recommendation_id=sim.clock.now,
+            recommendation_id=self.recommendation_count,
             movie_ids=movie_ids
         )
 
