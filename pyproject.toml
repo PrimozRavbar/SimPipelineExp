@@ -22,9 +22,17 @@ dev = [
     "jupyter",
     "matplotlib",
 ]
+console = [
+    "fastapi>=0.100",
+    "uvicorn>=0.23",
+    "httpx",          # fastapi.testclient, for tests/test_console_api.py
+]
 
 [tool.setuptools.packages.find]
-include = ["simulation*", "world*", "ml_system*", "dashboard*"]
+include = ["simulation*", "world*", "ml_system*", "dashboard*", "console*"]
+
+[tool.setuptools.package-data]
+console = ["static/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
