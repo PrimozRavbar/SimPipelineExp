@@ -33,6 +33,17 @@ class Flink(Service):
         self.rating_features = RatingFeatureComputer()
         self.item_rating_features = ItemRatingFeatureComputer()
 
+        # Operations knobs (defaults = the original behaviour):
+        # - paused: process nothing; events wait in Kafka (outage).
+        # - max_events_per_tick: processing capacity; the rest waits, so
+        #   consumer lag builds up under load. None = unlimited.
+        # - track_watched: also publish each user's watched movies to Redis
+        #   ("watched_movies"), for filtering already-watched items.
+        self.paused = False
+        self.max_events_per_tick = None
+        self.track_watched = False
+        self.processed_last_tick = 0
+
     def start(self, sim):
         super().start(sim)
 
@@ -47,13 +58,34 @@ class Flink(Service):
     def process(self, sim):
 
         kafka = sim.get_service("Kafka")
+        self.processed_last_tick = 0
 
-        for topic in self.topics:
+        if self.paused:
+            return
+
+        budget = self.max_events_per_tick
+        topics = self.topics
+
+        if budget is not None:
+            # Rotate the starting topic so no topic starves under load.
+            start = sim.clock.now % len(topics)
+            topics = topics[start:] + topics[:start]
+
+        for topic in topics:
+
+            if budget is not None and budget <= 0:
+                break
 
             events = kafka.poll(
                 self.consumer_name,
-                topic
+                topic,
+                max_records=budget
             )
+
+            if budget is not None:
+                budget -= len(events)
+
+            self.processed_last_tick += len(events)
 
             for event in events:
 
@@ -209,6 +241,11 @@ class Flink(Service):
             "user_id": user_id,
             "value": self.state["watch_count"][user_id]
         })
+
+
+        if self.track_watched:
+            watched = redis.store.setdefault(("watched_movies", user_id), set())
+            watched.add(movie_id)
 
 
         # -------------------------
