@@ -31,6 +31,9 @@ class Spark(Service):
         self.next_stage_id = 1
         self.next_task_id = 1
 
+        # Fault injection: while set, feature jobs fail (lost executors).
+        self.failing = False
+
     def start(self, sim):
 
         super().start(sim)
@@ -42,6 +45,9 @@ class Spark(Service):
         events,
         feature_pipeline
     ):
+
+        if self.failing:
+            raise RuntimeError("Spark job failed: lost all executors")
 
         self.scheduler = Scheduler(
             scheduler_id=self.next_scheduler_id

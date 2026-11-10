@@ -72,6 +72,11 @@ class OfflineFeaturePipeline:
 
     def process(self, events):
 
+        # History is recomputed from the full event log below; start clean
+        # so repeated runs (Spark schedule, retrains) don't stack duplicate
+        # snapshots (memory, and slower point-in-time lookups).
+        self.feature_store.clear_history()
+
         self.rating_features = RatingFeatureComputer()
         self.item_rating_features = ItemRatingFeatureComputer()
 

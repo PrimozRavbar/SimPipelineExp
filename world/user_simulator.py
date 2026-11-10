@@ -20,9 +20,25 @@ class UserSimulator:
         p_max=0.5,
         outcome_model="relevance",
         rating_noise=0.75,
-        completion_noise=0.15
+        completion_noise=0.15,
+        fatigue=0.0,
+        rewatch=1.0
     ):
         self.world = world
+
+        # Exposure effects (defaults = none, the original behaviour):
+        # - fatigue: each earlier impression of the same movie to the same
+        #   user multiplies its click probability by (1 - fatigue).
+        # - rewatch: click-probability multiplier for a movie the user
+        #   already watched during the simulation (0 = never rewatch).
+        if not 0.0 <= fatigue < 1.0:
+            raise ValueError("fatigue must be in [0, 1)")
+        if not 0.0 <= rewatch <= 1.0:
+            raise ValueError("rewatch must be in [0, 1]")
+        self.fatigue = fatigue
+        self.rewatch = rewatch
+        self.impressions = {}       # (user_id, movie_id) -> times shown
+        self.watched = set()        # (user_id, movie_id) watched in the simulation
 
         # Seeded RNG so a simulation run is reproducible.
         self.rng = rng if rng is not None else random.Random(0)
@@ -63,6 +79,11 @@ class UserSimulator:
         )
 
         clicked_movie_id = self.choose_click(user, movie_ids)
+
+        if self.fatigue > 0:
+            for movie_id in movie_ids:
+                key = (user.user_id, movie_id)
+                self.impressions[key] = self.impressions.get(key, 0) + 1
 
         if clicked_movie_id is not None:
 
@@ -130,6 +151,21 @@ class UserSimulator:
         return self.p_noise + (self.p_max - self.p_noise) * lift
 
 
+    def exposure_factor(self, user_id, movie_id):
+        """Click-probability multiplier from fatigue and rewatching (1.0
+        with the defaults). Uses no RNG."""
+        factor = 1.0
+        if self.fatigue > 0:
+            factor *= (1.0 - self.fatigue) ** self.impressions.get((user_id, movie_id), 0)
+        if self.rewatch < 1.0 and (user_id, movie_id) in self.watched:
+            factor *= self.rewatch
+        return factor
+
+
+    def _exposure_active(self):
+        return self.fatigue > 0 or self.rewatch < 1.0
+
+
     def expected_click_rate(self, user_id, movie_ids):
         """Probability that this user clicks anything on the slate under
         the cascade model (exact, no sampling). Uses no RNG."""
@@ -138,10 +174,15 @@ class UserSimulator:
         share = genre_share(user_state)
         p_no_click = 1.0
 
+        exposure = self._exposure_active()
+
         for rank, movie_id in enumerate(list(movie_ids)[:self.max_examined]):
-            p_no_click *= 1.0 - self.examine_probability(rank) * self.click_probability(
+            p_click = self.click_probability(
                 user_state, self.world.movie_objects[movie_id], share
             )
+            if exposure:
+                p_click *= self.exposure_factor(user_id, movie_id)
+            p_no_click *= 1.0 - self.examine_probability(rank) * p_click
 
         return 1.0 - p_no_click
 
@@ -152,6 +193,7 @@ class UserSimulator:
 
         user_state = self.world.user_states[user.user_id]
         share = genre_share(user_state)
+        exposure = self._exposure_active()
 
         for rank, movie_id in enumerate(list(movie_ids)[:self.max_examined]):
 
@@ -160,9 +202,11 @@ class UserSimulator:
 
             movie = self.world.movie_objects[movie_id]
 
-            if self.rng.random() < self.click_probability(
-                user_state, movie, share
-            ):
+            p_click = self.click_probability(user_state, movie, share)
+            if exposure:
+                p_click *= self.exposure_factor(user.user_id, movie_id)
+
+            if self.rng.random() < p_click:
                 return movie_id
 
         return None
@@ -207,6 +251,9 @@ class UserSimulator:
         movie_id,
         rel=0.0
     ):
+
+        if self.rewatch < 1.0:
+            self.watched.add((user.user_id, movie_id))
 
         if self.outcome_model == "random":
             watch_time = self.rng.uniform(5, 120)

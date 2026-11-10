@@ -159,3 +159,44 @@ def test_background_clock_runs_and_pauses():
     time.sleep(0.3)
     assert paused_at >= 5 and s.tick == paused_at
     s.close()
+
+
+def test_ranker_setting_trains_and_serves_a_ranker():
+    s = make(ranker=True, filter_watched=True)
+    s.step(30)
+    s.submit("retrain")
+    s.step(12)
+    assert s.serving_version == 1
+    assert s.model_server.ranker is s.versions[1].ranker is not None
+    assert s.models()["versions"][0]["ranker_info"]["training_rows"] > 0
+    assert s.model_server.reranker is not None
+    s.submit("settings", ranker=False)
+    s.step(1)
+    assert s.model_server.ranker is None
+    s.close()
+
+
+def test_slow_spark_job_delays_training_and_failures_abort_it():
+    s = make(spark_throughput=50)
+    s.step(30)
+    s.submit("retrain")
+    s.step(1)
+    job = s.spark_job
+    assert job is not None and s.retrain["stage"] == "features"
+    events = len(job["events"])
+    assert job["done_tick"] == 30 + -(-events // 50)
+    s.step(job["done_tick"] - s.tick + 1)
+    assert s.spark_job is None and s.retrain["stage"] == "training"
+    assert s.last_spark_tick == job["done_tick"]
+    s.step(s.retrain["deploy_tick"] - s.tick + 1)
+    assert s.serving_version == 1
+    s.close()
+
+    s = make(spark_throughput=50)
+    s.step(30)
+    s.submit("fault", kind="spark_failure", duration=200)
+    s.submit("retrain")
+    s.step(40)
+    assert s.retrain is None and s.serving_version == 0 and s.last_spark_tick is None
+    assert any("FAILED" in e["text"] for e in s.events())
+    s.close()

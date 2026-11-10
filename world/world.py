@@ -15,7 +15,8 @@ class World(Service):
         movie_states,
         rng=None,
         users_per_tick=1,
-        outcome_model="relevance"
+        outcome_model="relevance",
+        user_simulator_kwargs=None
     ):
         super().__init__()
 
@@ -38,10 +39,15 @@ class World(Service):
         # once several users are active in the same tick.
         self.recommendation_count = 0
 
+        # Users who can be active. None = everyone (the original behaviour);
+        # WorldDynamics sets it when users join over time.
+        self.active_user_ids = None
+
         self.user_simulator = UserSimulator(
             self,
             rng=rng,
-            outcome_model=outcome_model
+            outcome_model=outcome_model,
+            **(user_simulator_kwargs or {})
         )
 
 
@@ -57,7 +63,10 @@ class World(Service):
         """Users active this tick: `users_per_tick` distinct users drawn
         uniformly with the simulator's seeded RNG."""
 
-        users = list(self.user_objects.values())
+        if self.active_user_ids is None:
+            users = list(self.user_objects.values())
+        else:
+            users = [self.user_objects[user_id] for user_id in self.active_user_ids]
 
         if self.users_per_tick == 1:
             # Same RNG call as before, so 1-user runs are unchanged.

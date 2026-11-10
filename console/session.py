@@ -21,13 +21,22 @@ consistent state.
 """
 
 import copy
+import random
+from pathlib import Path
 import statistics
 import threading
 import time
 
 from ml_system.ann import HNSWIndex
+from console import health
 from ml_system.build_recommendation_system import build_recommendation_system
+from ml_system.faults import FAULT_KINDS, FIXES, FaultInjector
 from ml_system.metrics import reference_ctrs
+from ml_system.experiments import Experiment
+from ml_system.ranking import LogisticRanker, WatchedFilter
+from ml_system.model_registry import export_bundle
+from ml_system.two_tower import USER_FEATURE_DEFAULTS, TwoTowerRetrieval
+from world.dynamics import DYNAMIC_WORLD
 from world.external_data_loader import load_movielens
 
 
@@ -53,11 +62,36 @@ DEFAULT_SETTINGS = {
     "slate_size": 10,
     "num_candidates": 100,
     "rebuild_index": True,     # rebuild the ANN index with the new item tower on deploy
+    "ranker": False,           # train and serve a ranking stage after retrieval
+    "filter_watched": False,   # drop movies the user already watched (re-ranker)
+    # Canary: a new model first serves canary_share % of users for
+    # canary_ticks ticks, then is promoted unless it is significantly worse.
+    "canary_share": 0,
+    "canary_ticks": 150,
+    # Offline evaluation gate: hold out the newest holdout_pct % of events,
+    # score Recall@20 of the new and the production model on their clicks,
+    # and refuse to deploy a model more than gate_tolerance_pct % worse.
+    "eval_gate": False,
+    "holdout_pct": 10,
+    "gate_tolerance_pct": 10,
     # Alert rule: open an incident when rolling CTR drops more than
     # alert_drop_pct % within alert_ticks ticks after a deploy.
     "alert_drop_pct": 20,
     "alert_ticks": 100,
     "alert_window": 50,
+    # Operations
+    "flink_capacity": 0,       # Flink events processed per tick (0 = unlimited)
+    "lag_alert": 150,          # incident when Flink's Kafka lag exceeds this
+    "skew_alert_pct": 60,      # incident when online/offline feature skew exceeds this %
+    "chaos_every": 0,          # a hidden random fault about every N ticks (0 = off)
+    "spark_throughput": 0,     # events a Spark job processes per tick (0 = instant)
+    "freshness_alert": 400,    # incident when offline features are older than this (ticks)
+    # World (simulated users)
+    "taste_drift_every": 0,    # every N ticks some users' taste drifts (0 = off)
+    "taste_drift_share_pct": 5,
+    "fatigue_pct": 0,          # click probability lost per repeat impression
+    "rewatch_pct": 100,        # click probability kept for an already-watched movie
+    "users_joining_per_100_ticks": 0,
 }
 
 # (min, max) for numeric settings; bools are listed in BOOL_SETTINGS.
@@ -72,8 +106,86 @@ SETTING_LIMITS = {
     "alert_drop_pct": (1, 100),
     "alert_ticks": (10, 10000),
     "alert_window": (5, 1000),
+    "canary_share": (0, 100),
+    "holdout_pct": (1, 50),
+    "gate_tolerance_pct": (0, 100),
+    "canary_ticks": (10, 10000),
+    "flink_capacity": (0, 100000),
+    "lag_alert": (10, 1000000),
+    "skew_alert_pct": (1, 100),
+    "chaos_every": (0, 100000),
+    "spark_throughput": (0, 10000000),
+    "freshness_alert": (10, 100000),
+    "taste_drift_every": (0, 100000),
+    "taste_drift_share_pct": (1, 100),
+    "fatigue_pct": (0, 90),
+    "rewatch_pct": (0, 100),
+    "users_joining_per_100_ticks": (0, 10000),
 }
-BOOL_SETTINGS = {"rebuild_index"}
+BOOL_SETTINGS = {"rebuild_index", "ranker", "filter_watched", "eval_gate"}
+
+WORLDS = ("static", "dynamic")
+
+# Settings that the dynamic world preset starts from.
+DYNAMIC_SETTINGS = {
+    "taste_drift_every": DYNAMIC_WORLD["taste_drift_every"],
+    "taste_drift_share_pct": round(DYNAMIC_WORLD["taste_drift_share"] * 100),
+    "fatigue_pct": round(DYNAMIC_WORLD["fatigue"] * 100),
+    "rewatch_pct": round(DYNAMIC_WORLD["rewatch"] * 100),
+    "users_joining_per_100_ticks": round(DYNAMIC_WORLD["users_joining_per_tick"] * 100),
+}
+
+# Chaos: how long each kind of random fault lasts (None = until fixed).
+CHAOS_DURATIONS = {
+    "flink_outage": 150,
+    "feature_corruption": None,
+    "index_id_mismatch": None,
+    "model_server_outage": 120,
+    "traffic_spike": 80,
+    "spark_failure": 300,
+}
+
+RUNBOOKS = {
+    "ctr_drop": [
+        "Check whether the drop lines up with a deploy (Monitoring, CTR chart). If it does, roll back first.",
+        "Otherwise check the health tiles on Monitoring: Flink lag, fallback share, index self-test, feature skew.",
+        "Fix the component that is unhealthy (Pipeline: Restart Flink, Rebuild index, Restart model server).",
+        "If everything is healthy, look for drift: the world may have changed since the model was trained. Retrain.",
+    ],
+    "flink_lag": [
+        "Open Pipeline, Stream features (Flink): is it processing anything?",
+        "If it processes nothing, restart Flink. If it is up but behind, raise its capacity.",
+        "While Flink is behind, online features are stale: expect CTR to sag for active users.",
+    ],
+    "fallback": [
+        "The model server cannot reach two-tower retrieval and serves its popularity fallback.",
+        "Restart the model server (Pipeline, Model server).",
+    ],
+    "index_health": [
+        "The ANN index self-test fails: its results don't match an exact search over the same vectors.",
+        "The index's id mapping is broken. Rebuild the index (Pipeline, ANN index) or deploy a model with a fresh index.",
+    ],
+    "feature_skew": [
+        "Online user features (Redis, used by serving) disagree with offline ones (feature store).",
+        "A bad feature-job deploy is the usual cause: restart Flink (Pipeline, Stream features) to redeploy it.",
+        "Then run the Spark feature job so both sides are recomputed.",
+    ],
+    "canary": [
+        "The canary served the new model to a share of users and lost to the current model with 95% confidence.",
+        "It was rolled back automatically: only the canary users were affected.",
+        "Compare the two versions on Models (training data, epochs, ranker) before trying again.",
+    ],
+    "freshness": [
+        "Offline features have not been recomputed for a long time: training and serving fallbacks use old data.",
+        "Check the Spark job on Pipeline (Batch features): is it scheduled, and do its runs fail?",
+        "If runs fail, wait for the cluster to recover, then run the job by hand.",
+    ],
+    "drift": [
+        "What users click has shifted away from what the model was trained on.",
+        "Retrain on recent data (Models, Retrain now) and compare online CTR before and after.",
+    ],
+}
+
 
 RUNBOOK_CTR_DROP = [
     "Check whether the drop lines up with a deploy (Monitoring, CTR chart).",
@@ -90,8 +202,9 @@ class ActionError(ValueError):
 class ModelVersion:
     """One deployable model: user tower + item tower + ANN index."""
 
-    def __init__(self, version, user_tower, item_tower, index, **info):
+    def __init__(self, version, user_tower, item_tower, index, ranker=None, **info):
         self.version = version
+        self.ranker = ranker
         self.user_tower = user_tower
         self.item_tower = item_tower
         self.index = index
@@ -129,10 +242,16 @@ class SimSession:
         runs_dir="runs",
         run_id=None,
         training_wait_timeout=None,
+        world="static",
     ):
+        if world not in WORLDS:
+            raise ActionError("world must be one of %s" % (WORLDS,))
         self.seed = seed
+        self.world_kind = world
         self.users_per_tick = users_per_tick
         self.settings = dict(DEFAULT_SETTINGS)
+        if world == "dynamic":
+            self.settings.update(DYNAMIC_SETTINGS)
         if settings:
             self._check_settings(settings)
             self.settings.update(settings)
@@ -151,9 +270,25 @@ class SimSession:
             log_metrics=log_metrics,
             runs_dir=runs_dir,
             run_id=run_id,
+            # Always register WorldDynamics so world settings are live; a
+            # static world gets a neutral one (no RNG use outside its own).
+            world_dynamics=(dict(DYNAMIC_WORLD) if world == "dynamic"
+                            else {"taste_drift_every": 0}),
         )
 
         self.sim = self.system["sim"]
+        self.dynamics = self.system["world_dynamics"]
+        self.simulator = self.system["world"].user_simulator
+        self.flink = self.sim.get_service("Flink")
+        self.flink.track_watched = True      # for the watched-movies filter
+        self.kafka = self.sim.get_service("Kafka")
+
+        # Fault injection, registered last (after the metrics logger).
+        self.faults = FaultInjector(self.system)
+        self.sim.register(self.faults)
+        self.chaos_rng = random.Random("chaos-%d" % seed)
+        self.next_chaos_tick = None
+        self.drills = set()
         self.logger = self.system["metrics_logger"]
         self.tracker = self.system["ctr_tracker"]
         self.retriever = self.system["retriever"]
@@ -203,10 +338,12 @@ class SimSession:
         self.index_version = 0
         self.deploy_history = [(0, 0)]   # (tick, version)
         self.retrain = None              # the in-flight retrain, if any
+        self.canary = None               # {"experiment", "rebuild_index", "by"} while a canary runs
         self.tick_versions = {}          # tick -> model version that served it
 
         # Offline jobs
         self.last_spark_tick = None
+        self.spark_job = None
         self.spark_runs = 0
 
         # Budget, event log, incidents
@@ -218,6 +355,14 @@ class SimSession:
         # Serving latency: wall-clock ms of ModelServer.recommend per request.
         self.latency = {}                # tick -> list of ms
         self._wrap_recommend()
+
+        # Monitoring: latest health readings, open incident per rule.
+        self.health = {"index_self_test": None, "feature_skew": None, "flink_lag": 0,
+                       "fallback_share": 0.0, "coverage": None, "drift_psi": None, "feature_age": 0}
+        self.fallback_ticks = {}         # tick -> (requests, fallback requests)
+        self.open_rules = {}             # rule -> incident
+        self.drift_reference = None      # genre mix of clicks just after the last deploy
+        self._apply_live_settings()
 
         self._log("system", "Simulation built: seed %d, %d users per tick." % (seed, users_per_tick))
         self._log("deploy", "Model v0 (bootstrap, untrained) serving.")
@@ -304,6 +449,7 @@ class SimSession:
         r = self.retrain
         return (
             r is not None
+            and r["thread"] is not None
             and self.tick >= r["deploy_tick"]
             and not r["done"].is_set()
         )
@@ -320,14 +466,25 @@ class SimSession:
         then run one tick."""
         self._boundary()
         self.tick_versions[self.tick + 1] = self.serving_version
+        before = (self.model_server.requests, self.model_server.fallback_requests)
         self.sim.tick()
+        self.fallback_ticks[self.tick] = (self.model_server.requests - before[0],
+                                          self.model_server.fallback_requests - before[1])
         self._check_alert()
+        if self.canary is not None:
+            self._canary_tick()
+        self._monitor()
 
     def _boundary(self):
         now = self.tick
 
         # 1. A due deploy goes first, so actions at this boundary see it.
-        if self.retrain is not None and now >= self.retrain["deploy_tick"]:
+        # 0. A Spark job that is due finishes first (a retrain may be waiting).
+        if self.spark_job is not None and now >= self.spark_job["done_tick"]:
+            self._finish_spark()
+
+        if self.retrain is not None and self.retrain["thread"] is not None \
+                and now >= self.retrain["deploy_tick"]:
             self._finish_retrain()
 
         # 2. Player actions, in the order they were submitted.
@@ -342,8 +499,12 @@ class SimSession:
 
         # 3. Schedules from the settings.
         s = self.settings
+        self._chaos(now)
         if now > 0 and s["spark_every"] and now % s["spark_every"] == 0:
-            self._run_spark(by="schedule")
+            try:
+                self._run_spark(by="schedule")
+            except ActionError as error:
+                self._log("job", "Scheduled Spark run skipped: %s" % error, cls="s-warn")
         if now > 0 and s["retrain_every"] and now % s["retrain_every"] == 0:
             if self.retrain is not None:
                 self._log("train", "Scheduled retrain skipped: a training run is still in progress.", cls="s-warn")
@@ -357,7 +518,8 @@ class SimSession:
     # Player actions
     # ------------------------------------------------------------------
 
-    ACTIONS = ("retrain", "rollback", "spark", "settings")
+    ACTIONS = ("retrain", "rollback", "spark", "settings", "fault",
+               "promote_canary", "abort_canary", "export") + tuple(FIXES)
 
     def submit(self, name, **params):
         """Queue an action for the next tick boundary. Returns its record;
@@ -366,6 +528,8 @@ class SimSession:
             raise ActionError("unknown action %r" % name)
         if name == "settings":
             self._check_settings(params)
+        if name == "fault" and params.get("kind") not in FAULT_KINDS:
+            raise ActionError("fault kind must be one of %s" % sorted(FAULT_KINDS))
         with self.lock:
             action = {
                 "id": self._next_action_id,
@@ -387,6 +551,16 @@ class SimSession:
             return self._run_spark(by="you")
         if name == "settings":
             return self._apply_settings(params)
+        if name == "fault":
+            return self._drill(params["kind"], params.get("duration"))
+        if name in FIXES:
+            return self._fix(name)
+        if name == "export":
+            return self._export(params.get("version", self.serving_version))
+        if name == "promote_canary":
+            return self._end_canary(promote=True, by="you")
+        if name == "abort_canary":
+            return self._end_canary(promote=False, by="you")
         raise ActionError("unknown action %r" % name)
 
     # Settings ----------------------------------------------------------
@@ -415,8 +589,7 @@ class SimSession:
         changed = {k: v for k, v in values.items() if self.settings[k] != v}
         for key, value in changed.items():
             self.settings[key] = int(value) if key not in BOOL_SETTINGS else value
-        self.model_server.slate_size = self.settings["slate_size"]
-        self.model_server.num_candidates = self.settings["num_candidates"]
+        self._apply_live_settings()
         if changed:
             text = ", ".join("%s=%s" % (k, v) for k, v in sorted(changed.items()))
             self._log("config", "Settings changed: %s." % text, cls="s-accent")
@@ -426,21 +599,50 @@ class SimSession:
 
     # Spark -------------------------------------------------------------
 
-    def _run_spark(self, by, events=None, charge=True):
-        """Run the offline feature job (Spark) over the data lake. Every
-        retrain runs it too, as its first stage (charge=False: the retrain
-        cost covers it)."""
+    def _run_spark(self, by, events=None, charge=True, then=None):
+        """Start the offline feature job (Spark) over the data lake.
+
+        With spark_throughput 0 it finishes at once (the original
+        behaviour); otherwise it takes ceil(events / throughput) ticks and
+        its features land when it finishes. `then(ok)` runs at completion
+        (a retrain uses it to start training). Every retrain runs this as
+        its first stage (charge=False: the retrain cost covers it)."""
+        if self.spark_job is not None:
+            raise ActionError("a Spark job is already running (finishes at tick %d)" % self.spark_job["done_tick"])
         if events is None:
-            events = self.system["datalake"].events
-        self.system["spark"].run_offline_feature_job(events, self.offline.feature_pipeline)
-        self.last_spark_tick = self.tick
-        self.spark_runs += 1
+            events = list(self.system["datalake"].events)
+        throughput = self.settings["spark_throughput"]
+        duration = 0 if not throughput else max(1, -(-len(events) // throughput))
         if charge:
             self.budget_used += COST_SPARK
-        self._log("job", "Spark feature job ran over %d events (by %s)." % (len(events), by))
-        if self.logger is not None:
-            self.logger.log_event("spark", self.tick, events=len(events), by=by)
-        return "spark job finished"
+        self.spark_job = {"start": self.tick, "done_tick": self.tick + duration, "events": events,
+                          "by": by, "then": then}
+        if duration:
+            self._log("job", "Spark feature job started over %d events (by %s); finishes at tick %d."
+                      % (len(events), by, self.tick + duration))
+            return "spark job started, finishes at tick %d" % (self.tick + duration)
+        return self._finish_spark()
+
+    def _finish_spark(self):
+        job, self.spark_job = self.spark_job, None
+        events = job["events"]
+        try:
+            self.system["spark"].run_offline_feature_job(events, self.offline.feature_pipeline)
+            ok = True
+        except RuntimeError as error:
+            ok = False
+            self._log("job", "Spark feature job FAILED (by %s): %s" % (job["by"], error), cls="s-crit")
+            if self.logger is not None:
+                self.logger.log_event("spark_failed", self.tick, events=len(events), by=job["by"])
+        if ok:
+            self.last_spark_tick = self.tick
+            self.spark_runs += 1
+            self._log("job", "Spark feature job finished over %d events (by %s)." % (len(events), job["by"]))
+            if self.logger is not None:
+                self.logger.log_event("spark", self.tick, events=len(events), by=job["by"])
+        if job["then"] is not None:
+            job["then"](ok)
+        return "spark job finished" if ok else "spark job failed"
 
     # Retrain / deploy --------------------------------------------------
 
@@ -449,56 +651,110 @@ class SimSession:
             raise ActionError("a training run is already in progress (deploys at tick %d)" % self.retrain["deploy_tick"])
         if self.budget_used + COST_RETRAIN > BUDGET_TOTAL:
             raise ActionError("not enough compute budget left for a retrain")
+        if self.canary is not None:
+            raise ActionError("a canary is running; promote or abort it first")
+        if self.spark_job is not None:
+            raise ActionError("a Spark job is running; retrain when it finishes (tick %d)" % self.spark_job["done_tick"])
+        if not any(type(e).__name__ == "RecommendationClickedEvent" for e in self.system["datalake"].events):
+            raise ActionError("no clicks to learn from yet; let the simulation run first")
 
         now = self.tick
         version = max(self.versions) + 1
         events = list(self.system["datalake"].events)
 
-        # Everything that reads shared state or uses the session RNGs runs
-        # here, on the clock thread at a tick boundary: offline features
-        # (a Spark job, the first stage of the training pipeline), the
-        # training set (negative sampling, shuffle) and the item features
-        # the new item tower will embed.
-        self._run_spark(by="retrain v%d" % version, events=events, charge=False)
-        generator = self.offline.dataset_generator
-        generator.negative_samples = self.settings["negatives"]
-        for order, event in enumerate(events):
-            generator.add_event(event, order)
-        training_data = generator.build()
-        if not training_data:
-            raise ActionError("no clicks to learn from yet; let the simulation run first")
-        items = _ItemFeatureSnapshot(self.offline.feature_pipeline.feature_store)
-
         self.budget_used += COST_RETRAIN
-        deploy_tick = now + self.settings["deploy_delay"]
         record = {
             "version": version,
             "started_tick": now,
-            "deploy_tick": deploy_tick,
-            "training_examples": len(training_data),
+            "deploy_tick": now + self.settings["deploy_delay"],
+            "stage": "features",
+            "training_examples": None,
             "epochs": self.settings["epochs"],
             "negatives": self.settings["negatives"],
             "rebuild_index": self.settings["rebuild_index"],
+            "ranker": self.settings["ranker"],
+            "ranker_rows": None,
+            "eval_gate": self.settings["eval_gate"],
+            "holdout_pct": self.settings["holdout_pct"],
+            "gate_tolerance_pct": self.settings["gate_tolerance_pct"],
+            "holdout": None,
+            "production": None,
+            "recall": None,
             "by": by,
             "done": threading.Event(),
             "result": None,
             "error": None,
             "thread": None,
         }
+        self.retrain = record
+        if self.logger is not None:
+            self.logger.log_event("retrain_start", now, model_version=version,
+                                  deploy_tick=record["deploy_tick"])
+        # Stage 1: offline features (Spark). Training starts when it ends.
+        self._run_spark(by="retrain v%d" % version, events=events, charge=False,
+                        then=lambda ok: self._features_ready(record, events, ok))
+        if record["stage"] == "features":
+            return "retrain v%d: waiting for the Spark job" % version
+        return "training v%d, deploys at tick %d" % (version, record["deploy_tick"])
+
+    def _features_ready(self, record, events, ok):
+        """Stage 2, at a tick boundary: build the training set and start the
+        background training. Everything that reads shared state or uses the
+        session RNGs happens here: the training set (negative sampling,
+        shuffle), the item features the new item tower will embed and the
+        ranker's point-in-time rows."""
+        version = record["version"]
+        if not ok:
+            self.retrain = None
+            self._log("train", "Retrain v%d aborted: its Spark feature job failed." % version, cls="s-crit")
+            return
+        train_events = events
+        if record["eval_gate"]:
+            # Hold out the newest events: train on the rest, score both
+            # models on the held-out clicks (features as of each click).
+            split = int(len(events) * (1 - record["holdout_pct"] / 100.0))
+            train_events = events[:split]
+            store = self.system["feature_store"]
+            holdout = []
+            for order, event in enumerate(events[split:], start=split):
+                if type(event).__name__ != "RecommendationClickedEvent":
+                    continue
+                features = dict(store.get_user_features_as_of(event.user_id, event.timestamp, order)
+                                or USER_FEATURE_DEFAULTS)
+                features["user_id"] = event.user_id
+                holdout.append((features, event.movie_id))
+            record["holdout"] = holdout
+            record["production"] = self.versions[self.serving_version]
+
+        generator = self.offline.dataset_generator
+        generator.negative_samples = record["negatives"]
+        for order, event in enumerate(train_events):
+            generator.add_event(event, order)
+        training_data = generator.build()
+        if not training_data:
+            self.retrain = None
+            self._log("train", "Retrain v%d aborted: no usable training examples." % version, cls="s-warn")
+            return
+        items = _ItemFeatureSnapshot(self.offline.feature_pipeline.feature_store)
+        if record["ranker"]:
+            record["ranker_rows"] = LogisticRanker.training_rows_from(train_events, self.system["feature_store"])
+
+        # A slow Spark job pushes the deploy back (deterministically): the
+        # training stage always gets at least min(10, deploy_delay) ticks.
+        if self.tick > record["started_tick"]:
+            delay = record["deploy_tick"] - record["started_tick"]
+            record["deploy_tick"] = max(record["deploy_tick"], self.tick + min(10, delay))
+        record["training_examples"] = len(training_data)
+        record["stage"] = "training"
         thread = threading.Thread(
             target=self._train, args=(record, training_data, items),
             name="retrain-v%d" % version, daemon=True,
         )
         record["thread"] = thread
-        self.retrain = record
         thread.start()
-
         self._log("train", "Training v%d started on %d examples (%d epochs, %d negatives, by %s). Deploys at tick %d."
-                  % (version, len(training_data), record["epochs"], record["negatives"], by, deploy_tick), cls="s-accent")
-        if self.logger is not None:
-            self.logger.log_event("retrain_start", now, model_version=version,
-                                  training_examples=len(training_data), deploy_tick=deploy_tick)
-        return "training v%d, deploys at tick %d" % (version, deploy_tick)
+                  % (version, len(training_data), record["epochs"], record["negatives"], record["by"],
+                     record["deploy_tick"]), cls="s-accent")
 
     def _train(self, record, training_data, items):
         """Background thread: train, embed every movie, build the index.
@@ -519,7 +775,21 @@ class SimSession:
             index = HNSWIndex(seed=self.seed * 1000 + record["version"])
             index.build(embeddings)
 
-            record["result"] = (user_tower, item_tower, index)
+            ranker = None
+            if record["ranker_rows"] is not None:
+                rows, labels = record["ranker_rows"]
+                record["ranker_rows"] = None
+                ranker = LogisticRanker(self.retriever.user_features, self.system["feature_store"])
+                ranker.fit(rows, labels)
+
+            if record["holdout"]:
+                production = record["production"]
+                record["recall"] = (
+                    recall_at_k(user_tower, index, record["holdout"]),
+                    recall_at_k(production.user_tower, production.index, record["holdout"]),
+                )
+
+            record["result"] = (user_tower, item_tower, index, ranker)
             record["train_seconds"] = round(time.monotonic() - started, 2)
         except Exception as error:  # surfaced in the log at deploy time
             record["error"] = repr(error)
@@ -538,9 +808,16 @@ class SimSession:
             self._log("train", "Training v%d failed: %s" % (version, record["error"]), cls="s-crit")
             return
 
-        user_tower, item_tower, index = record["result"]
+        user_tower, item_tower, index, ranker = record["result"]
+        gate = None
+        if record["recall"] is not None:
+            new_recall, prod_recall = record["recall"]
+            passed = new_recall >= prod_recall * (1 - record["gate_tolerance_pct"] / 100.0)
+            gate = {"recall_at_20": new_recall, "production_version": record["production"].version,
+                    "production_recall_at_20": prod_recall, "holdout_clicks": len(record["holdout"]),
+                    "passed": passed}
         self.versions[version] = ModelVersion(
-            version, user_tower, item_tower, index,
+            version, user_tower, item_tower, index, ranker=ranker,
             started_tick=record["started_tick"],
             trained_tick=record["started_tick"],
             deployed_tick=None,
@@ -548,26 +825,51 @@ class SimSession:
             epochs=record["epochs"],
             negatives=record["negatives"],
             train_seconds=record.get("train_seconds"),
-            recall_at_20=None,
+            recall_at_20=None if gate is None else gate["recall_at_20"],
+            gate=gate,
             note="",
+            ranker_info=None if ranker is None else {
+                "training_rows": ranker.training_rows,
+                "click_rate": round(ranker.positive_rate, 4),
+                "weights": ranker.content_weights(),
+            },
         )
         if self.logger is not None:
             self.logger.log_event("retrain", now, model_version=version,
                                   training_examples=record["training_examples"])
         self._log("train", "Training v%d finished (%d examples, %.1f s wall time)."
                   % (version, record["training_examples"], record.get("train_seconds") or 0), cls="s-accent")
-        self._deploy(version, by="auto" if record["by"] == "schedule" else record["by"],
-                     rebuild_index=record["rebuild_index"])
+        by = "auto" if record["by"] == "schedule" else record["by"]
+        if gate is not None:
+            self._log("train", "Gate: v%d Recall@20 %.1f%% vs v%d %.1f%% on %d held-out clicks: %s."
+                      % (version, gate["recall_at_20"] * 100, gate["production_version"],
+                         gate["production_recall_at_20"] * 100, gate["holdout_clicks"],
+                         "passed" if gate["passed"] else "REJECTED, not deployed"),
+                      cls="s-ok" if gate["passed"] else "s-warn")
+            if self.logger is not None:
+                self.logger.log_event("evaluation", now, model_version=version, k=20,
+                                      recall_at_k=gate["recall_at_20"],
+                                      production_recall_at_k=gate["production_recall_at_20"],
+                                      passed=gate["passed"])
+            if not gate["passed"]:
+                self.versions[version].info["rejected"] = True
+                return
+        if self.settings["canary_share"] > 0:
+            self._start_canary(version, by, record["rebuild_index"])
+        else:
+            self._deploy(version, by=by, rebuild_index=record["rebuild_index"])
 
     def _deploy(self, version, by, rebuild_index=True, note=""):
         model = self.versions[version]
         self.retriever.user_tower = model.user_tower
         self.retriever.item_tower = model.item_tower
+        self.model_server.ranker = model.ranker if self.settings["ranker"] else None
         if rebuild_index:
             self.retriever.ann_index = model.index
             self.index_version = version
         previous = self.serving_version
         self.serving_version = version
+        self.drift_reference = None      # rebuilt from this model's first clicks
         if model.info.get("deployed_tick") is None:
             model.info["deployed_tick"] = self.tick
         self.deploy_history.append((self.tick, version))
@@ -583,15 +885,103 @@ class SimSession:
                   % (version, by, " (" + note + ")" if note else "", previous, index_text),
                   cls="s-accent" if by == "you" else "s-info")
 
-        # Incidents opened after the previous deploy are mitigated by a new one.
+        # Open CTR incidents are mitigated by a new deploy (component
+        # incidents stay open until their component is healthy again).
         for incident in self.incidents:
-            if incident["status"] == "Open":
+            if incident["status"] == "Open" and incident["rule"] in ("deploy_ctr", "ctr_drop"):
                 incident["status"] = "Mitigated"
                 incident["timeline"].append((self.tick, "Model v%d deployed (by %s)." % (version, by)))
+                self.open_rules.pop(incident["rule"], None)
+
+        # Swapping in a freshly built index also replaces a broken one.
+        if rebuild_index:
+            self.faults.fix("rebuild_index", self.tick)
 
         self._watch_deploy(previous)
 
+    def _export(self, version):
+        if version not in self.versions:
+            raise ActionError("no model version %r" % (version,))
+        if self.system["run_dir"] is None:
+            raise ActionError("this session has no run directory (metrics logging is off)")
+        model = self.versions[version]
+        directory = export_bundle(
+            Path(self.system["run_dir"]) / "models" / ("v%d" % version),
+            model.user_tower, model.item_tower, model.index, ranker=model.ranker,
+            metadata={"version": version, "seed": self.seed, "exported_tick": self.tick, **model.info},
+        )
+        self._log("registry", "Model v%d exported to %s." % (version, directory), cls="s-accent")
+        return str(directory)
+
+    # Canary ------------------------------------------------------------
+
+    def _start_canary(self, version, by, rebuild_index):
+        model = self.versions[version]
+        s = self.settings
+        retriever = TwoTowerRetrieval(
+            model.user_tower, model.item_tower,
+            model.index if rebuild_index else self.retriever.ann_index,
+            self.system["redis"], self.system["feature_store"],
+        )
+        experiment = Experiment(self.serving_version, version, s["canary_share"],
+                                self.tick + 1, self.tick + s["canary_ticks"], salt=version)
+
+        def router(user_id):
+            if experiment.arm(user_id) == "treatment":
+                return retriever, (model.ranker if self.settings["ranker"] else None)
+            return self.retriever, self.model_server.ranker
+
+        self.model_server.router = router
+        self.canary = {"experiment": experiment, "rebuild_index": rebuild_index, "by": by}
+        self._log("deploy", "Canary: v%d serves %d%% of users for %d ticks (v%d serves the rest)."
+                  % (version, s["canary_share"], s["canary_ticks"], self.serving_version), cls="s-accent")
+        if self.logger is not None:
+            self.logger.log_event("canary_start", self.tick, model_version=version,
+                                  share=s["canary_share"], until=experiment.end_tick)
+
+    def _canary_tick(self):
+        experiment = self.canary["experiment"]
+        # Oldest first: a click must come after the slate it belongs to.
+        for event in reversed(self._recent_events(1)):
+            experiment.observe(event)
+        if self.tick >= experiment.end_tick:
+            test = experiment.stats()["test"]
+            worse = test is not None and test["z"] < -1.96
+            self._end_canary(promote=not worse, by="canary check")
+
+    def _end_canary(self, promote, by):
+        if self.canary is None:
+            raise ActionError("no canary is running")
+        canary, self.canary = self.canary, None
+        experiment = canary["experiment"]
+        stats = experiment.stats()
+        self.model_server.router = None
+        version = experiment.treatment
+        self.versions[version].info["canary"] = {
+            "share": experiment.share_pct, "start": experiment.start_tick, "end": self.tick,
+            "control_ctr": stats["control"]["ctr"], "canary_ctr": stats["treatment"]["ctr"],
+            "result": "promoted" if promote else "rolled back",
+        }
+        if self.logger is not None:
+            self.logger.log_event("canary_end", self.tick, model_version=version, promoted=promote,
+                                  control_ctr=stats["control"]["ctr"], canary_ctr=stats["treatment"]["ctr"])
+        text = "Canary v%d %s (by %s): canary CTR %s vs %s on v%d." % (
+            version, "promoted" if promote else "rolled back", by,
+            _pct(stats["treatment"]["ctr"]), _pct(stats["control"]["ctr"]), experiment.control)
+        self._log("deploy", text, cls="s-ok" if promote else "s-warn")
+        if promote:
+            self._deploy(version, by="canary" if by == "canary check" else by,
+                         rebuild_index=canary["rebuild_index"])
+        elif by == "canary check":
+            incident = self._open("canary", "SEV2", "Canary v%d lost to v%d" % (version, experiment.control),
+                                  text + " Rolled back automatically.")
+            incident["status"] = "Mitigated"
+            self.open_rules.pop("canary", None)
+        return text
+
     def _rollback(self):
+        if self.canary is not None:
+            return self._end_canary(promote=False, by="you")
         if len(self.deploy_history) < 2:
             raise ActionError("nothing to roll back to")
         current = self.serving_version
@@ -657,6 +1047,7 @@ class SimSession:
                    watch["version"], watch["tick"], self.settings["alert_drop_pct"],
                    self.settings["alert_ticks"])
             ),
+            "rule": "deploy_ctr",
             "deploy_tick": watch["tick"],
             "version": watch["version"],
             "previous_version": watch["previous"],
@@ -670,11 +1061,244 @@ class SimSession:
             ],
         }
         self.incidents.append(incident)
+        self.open_rules["deploy_ctr"] = incident
         self._log("alert", "%s opened: %s." % (incident["id"], incident["title"]), cls="s-crit")
         if self.logger is not None:
             self.logger.log_event("incident", self.tick, incident_id=incident["id"],
                                   model_version=watch["version"], baseline_ctr=watch["baseline"],
                                   current_ctr=current)
+
+    # ------------------------------------------------------------------
+    # Live settings, faults and repairs
+    # ------------------------------------------------------------------
+
+    def _apply_live_settings(self):
+        s = self.settings
+        self.model_server.slate_size = s["slate_size"]
+        self.model_server.num_candidates = s["num_candidates"]
+        self.model_server.ranker = self.versions[self.serving_version].ranker if s["ranker"] else None
+        self.model_server.reranker = WatchedFilter(self.system["redis"]) if s["filter_watched"] else None
+        self.flink.max_events_per_tick = s["flink_capacity"] or None
+        d = self.dynamics
+        d.taste_drift_every = s["taste_drift_every"]
+        d.taste_drift_share = s["taste_drift_share_pct"] / 100.0
+        d.users_joining_per_tick = s["users_joining_per_100_ticks"] / 100.0
+        self.simulator.fatigue = s["fatigue_pct"] / 100.0
+        self.simulator.rewatch = s["rewatch_pct"] / 100.0
+        if s["chaos_every"] and self.next_chaos_tick is None:
+            self.next_chaos_tick = self.tick + self._chaos_gap()
+        if not s["chaos_every"]:
+            self.next_chaos_tick = None
+
+    def _chaos_gap(self):
+        every = self.settings["chaos_every"]
+        return max(10, int(every * self.chaos_rng.uniform(0.5, 1.5)))
+
+    def _chaos(self, now):
+        """Hidden random faults on a seeded schedule (deterministic)."""
+        if self.next_chaos_tick is None or now < self.next_chaos_tick:
+            return
+        kind = self.chaos_rng.choice(sorted(CHAOS_DURATIONS))
+        self.faults.schedule(kind, now + 1, CHAOS_DURATIONS[kind])
+        self.faults.apply_due(now)
+        self.next_chaos_tick = now + self._chaos_gap()
+
+    def _drill(self, kind, duration=None):
+        if duration is not None and (not isinstance(duration, int) or duration < 1):
+            raise ActionError("duration must be a positive whole number of ticks")
+        fault = self.faults.schedule(kind, self.tick + 1, duration)
+        self.faults.apply_due(self.tick)
+        self.drills.add(fault.id)
+        self._log("drill", "Drill: %s injected (%s)." % (FAULT_KINDS[kind],
+                  "until fixed" if duration is None else "%d ticks" % duration), cls="s-warn")
+        return "fault %s scheduled" % fault.id
+
+    def _fix(self, action):
+        if action == "rebuild_index":
+            # Re-point serving at the serving version's own index (what a
+            # rebuild with the serving item tower produces).
+            model = self.versions[self.serving_version]
+            self.retriever.ann_index = model.index
+            self.index_version = self.serving_version
+        ended = self.faults.fix(action, self.tick)
+        if action == "restart_flink":
+            self.flink.paused = False
+        if action == "restart_model_server":
+            self.model_server.retriever_down = False
+        label = {"restart_flink": "Flink restarted", "rebuild_index": "ANN index rebuilt with v%d embeddings"
+                 % self.serving_version, "restart_model_server": "Model server restarted"}[action]
+        self._log("ops", "%s by you." % label, cls="s-accent")
+        if self.logger is not None:
+            self.logger.log_event("repair", self.tick, action=action, faults_ended=[f.id for f in ended])
+        return label
+
+    # ------------------------------------------------------------------
+    # Monitoring rules (symptom-based, like a real on-call setup)
+    # ------------------------------------------------------------------
+
+    def _ctr_range(self, start, end):
+        shown = clicks = 0
+        for tick in range(max(1, start), end + 1):
+            c = self.tracker.counts.get(tick)
+            if c:
+                shown += c[0]
+                clicks += c[1]
+        return clicks / shown if shown else None
+
+    def _recent_events(self, ticks):
+        """Events of the last `ticks` ticks, newest first."""
+        events = self.system["datalake"].events
+        cutoff = self.tick - ticks
+        out = []
+        for event in reversed(events):
+            if event.timestamp <= cutoff:
+                break
+            out.append(event)
+        return out
+
+    def _monitor(self):
+        now = self.tick
+        s = self.settings
+        h = self.health
+
+        # Every tick: lag and fallback share.
+        h["flink_lag"] = self.kafka.lag("Flink")
+        recent = [self.fallback_ticks.get(t, (0, 0)) for t in range(now - 9, now + 1)]
+        requests = sum(r for r, _ in recent)
+        h["fallback_share"] = (sum(f for _, f in recent) / requests) if requests else 0.0
+
+        self._rule("flink_lag", h["flink_lag"] > s["lag_alert"], h["flink_lag"] < s["lag_alert"] / 4,
+                   "WARN", "Flink consumer lag at %d events" % h["flink_lag"],
+                   "Flink is %d events behind Kafka (alert at %d). Online features are going stale."
+                   % (h["flink_lag"], s["lag_alert"]))
+        self._rule("fallback", h["fallback_share"] > 0.5, h["fallback_share"] == 0,
+                   "SEV2", "Model server serving popularity fallback",
+                   "%.0f%% of requests in the last 10 ticks were served by the fallback, not the model."
+                   % (h["fallback_share"] * 100))
+
+        if now % 10 == 0:
+            self._ctr_rule(now)
+
+        if now % 25 == 0:
+            h["index_self_test"] = health.index_self_test(self.retriever.ann_index, self.system["world"].movie_objects)
+            ok = h["index_self_test"]
+            self._rule("index_health", ok is not None and ok < 0.7, ok is not None and ok >= 0.8,
+                       "SEV2", "ANN index self-test failing",
+                       "ANN recall against exact search is %.0f%% (healthy is 85-100%%, alert below 70%%)."
+                       % ((ok or 0) * 100))
+
+            events = self._recent_events(50)
+            users = sorted({e.user_id for e in events})
+            h["feature_skew"] = health.feature_skew(self.system["redis"], self.system["feature_store"], users)
+            skew, limit = h["feature_skew"], s["skew_alert_pct"] / 100.0
+            self._rule("feature_skew", skew is not None and skew > limit,
+                       skew is not None and skew < limit * 0.7,
+                       "WARN", "Online/offline feature skew %.0f%%" % ((skew or 0) * 100),
+                       "Online genre preferences of recently served users differ from the offline ones by "
+                       "%.0f%% on average (alert at %d%%)." % ((skew or 0) * 100, s["skew_alert_pct"]))
+
+            shown = [m for e in self._recent_events(100) if hasattr(e, "movie_ids") for m in e.movie_ids]
+            catalog = self.system["world"].movie_objects
+            h["coverage"] = len(set(shown)) / len(catalog) if shown else None
+
+            last = self.last_spark_tick if self.last_spark_tick is not None else 0
+            age = now - last
+            h["feature_age"] = age
+            self._rule("freshness", age > s["freshness_alert"], age <= s["freshness_alert"],
+                       "WARN", "Offline features %d ticks old" % age,
+                       "The last successful Spark feature job was at tick %d (alert after %d ticks)."
+                       % (last, s["freshness_alert"]))
+
+            self._update_drift(now, catalog)
+            psi = h["drift_psi"]
+            self._rule("drift", psi is not None and psi > 0.2, psi is not None and psi < 0.1,
+                       "WARN", "Data drift: click mix PSI %.2f" % (psi or 0),
+                       "The genre mix of recent clicks has shifted from the model's training data "
+                       "(PSI %.2f, alert at 0.2)." % (psi or 0))
+
+    DRIFT_WINDOW = 200
+
+    def _update_drift(self, now, catalog):
+        """PSI of the genre mix of clicks in the last DRIFT_WINDOW ticks vs
+        the first DRIFT_WINDOW ticks after the current model's deploy."""
+        deploy_tick = self.deploy_history[-1][0]
+        window = self.DRIFT_WINDOW
+        if now < deploy_tick + window:
+            self.health["drift_psi"] = None
+            return
+
+        def clicks(start, end):
+            return [e.movie_id for e in self.system["datalake"].events
+                    if start <= e.timestamp <= end and type(e).__name__ == "RecommendationClickedEvent"]
+
+        if self.drift_reference is None:
+            self.drift_reference = health.genre_distribution(clicks(deploy_tick + 1, deploy_tick + window), catalog)
+        if now < deploy_tick + 2 * window:
+            self.health["drift_psi"] = None
+            return
+        recent = [e.movie_id for e in self._recent_events(window)
+                  if type(e).__name__ == "RecommendationClickedEvent"]
+        self.health["drift_psi"] = health.genre_psi(self.drift_reference,
+                                                    health.genre_distribution(recent, catalog))
+
+    def _ctr_rule(self, now):
+        s = self.settings
+        window = s["alert_window"]
+        if now < 5 * window:
+            return
+        current = self._ctr_range(now - window + 1, now)
+        incident = self.open_rules.get("ctr_drop")
+        if incident is not None:
+            if current is not None and current >= incident["baseline_ctr"] * (1 - s["alert_drop_pct"] / 200.0):
+                self._resolve(incident, "CTR back to %.1f%%." % (current * 100))
+            return
+        if "deploy_ctr" in self.open_rules:
+            return
+        baseline = self._ctr_range(now - 5 * window + 1, now - window)
+        if ctr_drop_alert(baseline, current, s["alert_drop_pct"]):
+            drop = (1 - current / baseline) * 100
+            self._open("ctr_drop", "SEV2", "Online CTR down %.0f%%" % drop,
+                       "Rolling CTR over the last %d ticks is %.1f%%, down from %.1f%% over the %d ticks "
+                       "before (alert at a %d%% drop)." % (window, current * 100, baseline * 100,
+                                                          4 * window, s["alert_drop_pct"]),
+                       baseline_ctr=baseline, current_ctr=current)
+
+    def _rule(self, rule, firing, clear, severity, title, description):
+        incident = self.open_rules.get(rule)
+        if incident is None and firing:
+            self._open(rule, severity, title, description)
+        elif incident is not None and clear:
+            self._resolve(incident, "Condition cleared.")
+
+    def _open(self, rule, severity, title, description, **extra):
+        incident = {
+            "id": "INC-%d" % (len(self.incidents) + 1),
+            "rule": rule,
+            "severity": severity,
+            "tick": self.tick,
+            "status": "Open",
+            "title": title,
+            "description": description,
+            "deploy_tick": self.tick,
+            "version": None,
+            "previous_version": None,
+            "runbook": list(RUNBOOKS[rule]),
+            "timeline": [(self.tick, "Alert fired: %s." % title)],
+            **extra,
+        }
+        self.incidents.append(incident)
+        self.open_rules[rule] = incident
+        self._log("alert", "%s opened: %s." % (incident["id"], title),
+                  cls="s-crit" if severity == "SEV2" else "s-warn")
+        if self.logger is not None:
+            self.logger.log_event("incident", self.tick, incident_id=incident["id"], rule=rule)
+        return incident
+
+    def _resolve(self, incident, text):
+        incident["status"] = "Resolved"
+        incident["timeline"].append((self.tick, "Resolved: %s" % text))
+        self.open_rules.pop(incident["rule"], None)
+        self._log("alert", "%s resolved: %s" % (incident["id"], text), cls="s-ok")
 
     # ------------------------------------------------------------------
     # Latency
@@ -723,7 +1347,11 @@ class SimSession:
                 "num_movies": len(self.system["world"].movie_objects),
                 "model_version": self.serving_version,
                 "index_version": self.index_version,
+                "spark_job": None if self.spark_job is None else {
+                    "start": self.spark_job["start"], "done_tick": self.spark_job["done_tick"],
+                    "events": len(self.spark_job["events"]), "by": self.spark_job["by"]},
                 "training": None if r is None else {
+                    "stage": r["stage"],
                     "version": r["version"],
                     "started_tick": r["started_tick"],
                     "deploy_tick": r["deploy_tick"],
@@ -734,6 +1362,9 @@ class SimSession:
                 "reference": self.reference,
                 "run_dir": str(self.system["run_dir"]) if self.system["run_dir"] else None,
                 "open_incidents": sum(1 for i in self.incidents if i["status"] == "Open"),
+                "canary": self._canary_view(),
+                "world": self.world_kind,
+                "health": dict(self.health),
                 "pending_actions": len(self._pending),
             }
 
@@ -778,21 +1409,31 @@ class SimSession:
                     "deploys": deployed,
                     "ticks_served": len(served_ticks),
                     "online_ctr": ctr,
-                    "stage": "Production" if version == self.serving_version else "Archived",
+                    "stage": "Production" if version == self.serving_version else (
+                        "Canary" if self.canary and self.canary["experiment"].treatment == version else
+                        "Rejected" if model.info.get("rejected") else "Archived"),
                 })
             r = self.retrain
             training = None
             if r is not None:
-                training = {k: r[k] for k in ("version", "started_tick", "deploy_tick",
+                training = {k: r[k] for k in ("version", "stage", "started_tick", "deploy_tick",
                                               "training_examples", "epochs", "negatives", "by")}
                 training["done"] = r["done"].is_set()
             return {
+                "canary": self._canary_view(),
                 "serving_version": self.serving_version,
                 "index_version": self.index_version,
                 "rollback_target": self._rollback_target(),
                 "training": training,
                 "versions": out,
             }
+
+    def _canary_view(self):
+        if self.canary is None:
+            return None
+        e = self.canary["experiment"]
+        return {"version": e.treatment, "control": e.control, "share": e.share_pct,
+                "start_tick": e.start_tick, "end_tick": e.end_tick, **e.stats()}
 
     def _rollback_target(self):
         for _, version in reversed(self.deploy_history):
@@ -814,20 +1455,29 @@ class SimSession:
                 "tick": self.tick,
                 "kafka": {"events": sim.event_count, "events_per_tick": round(events_per_tick, 1),
                           "topics": {k: len(v) for k, v in kafka.topics.items()}},
-                "flink": {"users_with_features": sum(1 for (f, _) in redis.store if f == "activity_level")},
+                "flink": {"users_with_features": sum(1 for (f, _) in redis.store if f == "activity_level"),
+                          "lag": kafka.lag("Flink"), "processed_last_tick": self.flink.processed_last_tick,
+                          "capacity": self.flink.max_events_per_tick},
                 "redis": {"keys": len(redis.store)},
                 "server": {"model_version": self.serving_version, "slate_size": self.model_server.slate_size,
                            "num_candidates": self.model_server.num_candidates,
-                           "slates_last_50_ticks": sum(recent)},
+                           "slates_last_50_ticks": sum(recent),
+                           "fallback_share": self.health["fallback_share"]},
                 "ann": {"index_version": self.index_version, "model_version": self.serving_version,
+                        "self_test": self.health["index_self_test"],
                         "items": len(getattr(self.retriever.ann_index, "nodes", {}) or {})},
                 "lake": {"events": len(datalake.events)},
                 "spark": {"last_run_tick": self.last_spark_tick, "runs": self.spark_runs,
-                          "every": self.settings["spark_every"]},
+                          "every": self.settings["spark_every"],
+                          "running": None if self.spark_job is None else {
+                              "start": self.spark_job["start"], "done_tick": self.spark_job["done_tick"]}},
                 "ofs": {"users": len(store.user_features), "items": len(store.item_features)},
                 "train": None if r is None else {"version": r["version"], "started_tick": r["started_tick"],
-                                                 "deploy_tick": r["deploy_tick"], "done": r["done"].is_set()},
+                                                 "deploy_tick": r["deploy_tick"], "done": r["done"].is_set(),
+                                                 "stage": r["stage"]},
                 "registry": {"versions": len(self.versions), "serving_version": self.serving_version},
+                "redis_skew": self.health["feature_skew"],
+                "world": {"kind": self.world_kind, **self.dynamics.summary()},
                 "settings": dict(self.settings),
             }
 
@@ -835,6 +1485,22 @@ class SimSession:
         with self.lock:
             return [dict(i, timeline=[{"tick": t, "text": x} for t, x in i["timeline"]])
                     for i in reversed(self.incidents)]
+
+    def faults_view(self):
+        """Faults so far. Hidden chaos faults are only counted while active
+        (the player has to find them); drills and ended faults are shown."""
+        with self.lock:
+            shown, hidden_active = [], 0
+            for fault in self.faults.faults:
+                drill = fault.id in self.drills
+                if fault.status == "active" and not drill:
+                    hidden_active += 1
+                    continue
+                if fault.status == "scheduled" and not drill:
+                    continue
+                shown.append({**fault.summary(), "drill": drill})
+            return {"hidden_active": hidden_active, "faults": list(reversed(shown)),
+                    "kinds": FAULT_KINDS, "fixes": {k: list(v) for k, v in FIXES.items()}}
 
     def actions_pending(self):
         with self.lock:
@@ -847,3 +1513,15 @@ def ctr_drop_alert(baseline, current, drop_pct):
         return False
     return current < baseline * (1 - drop_pct / 100.0)
 
+
+
+def _pct(value):
+    return "–" if value is None else "%.1f%%" % (value * 100)
+
+
+def recall_at_k(user_tower, index, holdout, k=20):
+    """Share of held-out clicks whose movie is in the model's top k."""
+    if not holdout:
+        return None
+    hits = sum(movie_id in index.search(user_tower.embed(features), k) for features, movie_id in holdout)
+    return hits / len(holdout)
