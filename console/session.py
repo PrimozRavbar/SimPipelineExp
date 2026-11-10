@@ -941,7 +941,8 @@ class SimSession:
 
     def _canary_tick(self):
         experiment = self.canary["experiment"]
-        for event in self._recent_events(1):
+        # Oldest first: a click must come after the slate it belongs to.
+        for event in reversed(self._recent_events(1)):
             experiment.observe(event)
         if self.tick >= experiment.end_tick:
             test = experiment.stats()["test"]
@@ -1145,6 +1146,7 @@ class SimSession:
         return clicks / shown if shown else None
 
     def _recent_events(self, ticks):
+        """Events of the last `ticks` ticks, newest first."""
         events = self.system["datalake"].events
         cutoff = self.tick - ticks
         out = []

@@ -39,7 +39,13 @@ def test_canary_splits_traffic_then_promotes():
     s = canary_session()
     assert s.canary is not None and s.serving_version == 0
     assert s.model_server.router is not None
-    s.step(20)                                   # canary ends at tick 60
+    s.step(18)                                   # canary served ticks 41..59 so far
+    counts = s.canary["experiment"].counts
+    clicks = sum(1 for e in s.system["datalake"].events
+                 if type(e).__name__ == "RecommendationClickedEvent" and 41 <= e.timestamp <= 59)
+    assert counts["control"][0] + counts["treatment"][0] == 19 * 4
+    assert counts["control"][1] + counts["treatment"][1] == clicks > 0
+    s.step(1)                                    # ends after tick 60
     assert s.canary is None and s.model_server.router is None
     stats = s.versions[1].info["canary"]
     assert stats["result"] in ("promoted", "rolled back")

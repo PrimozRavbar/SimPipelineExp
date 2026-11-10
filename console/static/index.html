@@ -495,11 +495,11 @@ ol.runbook { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction:
     const t = c.test, ctr = (x) => pct(x.ctr), signif = t && (t.low > 0 || t.high < 0);
     return `<section class="panel" style="border-color:var(--accent)" aria-labelledby="canary-h"><div class="head"><h2 id="canary-h">Canary: v${c.version} on ${c.share}% of users</h2><span class="muted" style="font-size:12px">ticks ${fmt(c.start_tick)}–${fmt(c.end_tick)} · users split by a stable hash of their id</span></div>
       <div class="tiles" style="margin-top:12px">
-        <div class="tile"><span class="label">v${c.control} (control)</span><span class="big">${ctr(c.control)}</span><span class="sub">${fmt(c.control.shown)} slates · ${fmt(c.control.clicks)} clicks</span></div>
+        <div class="tile"><span class="label">v${c.control.version} (control)</span><span class="big">${ctr(c.control)}</span><span class="sub">${fmt(c.control.shown)} slates · ${fmt(c.control.clicks)} clicks</span></div>
         <div class="tile"><span class="label">v${c.version} (canary)</span><span class="big">${ctr(c.treatment)}</span><span class="sub">${fmt(c.treatment.shown)} slates · ${fmt(c.treatment.clicks)} clicks</span></div>
         <div class="tile"><span class="label">Difference (95% CI)</span><span class="big ${signif ? (t.diff > 0 ? "s-ok" : "s-crit") : ""}">${t ? (t.diff >= 0 ? "+" : "") + (t.diff * 100).toFixed(1) + " pts" : "–"}</span><span class="sub">${t ? `${(t.low * 100).toFixed(1)} to ${(t.high * 100).toFixed(1)} pts · ${signif ? "significant" : "not significant yet"}` : "waiting for traffic"}</span></div>
       </div>
-      <div class="row" style="gap:8px; margin-top:12px"><button class="btn primary" data-act="canary" data-v="promote">Promote v${c.version} now</button><button class="btn" data-act="canary" data-v="abort">Abort canary</button></div></section>`;
+      <div class="row" style="gap:8px; margin-top:12px"><button class="btn primary" data-act="canary" data-v="promote">Promote v${c.version} now</button><span class="muted" style="font-size:12px; align-self:center">Auto: promote at t ${fmt(c.end_tick)} unless v${c.version} is significantly worse than v${c.control.version}</span><button class="btn" data-act="canary" data-v="abort">Abort canary</button></div></section>`;
   }
 
   function monitoring(d) {
@@ -569,7 +569,7 @@ ol.runbook { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction:
           <section style="margin-top:18px"><h3>Runbook</h3><ol class="runbook">${a.runbook.map((r) => `<li>${esc(r)}</li>`).join("")}</ol></section>
           <section style="margin-top:18px"><h3>Timeline</h3><div class="log" style="margin-top:4px">
             ${a.timeline.map((x) => `<div class="logitem" style="grid-template-columns:74px 1fr"><span class="mono muted">t ${fmt(x.tick)}</span><span>${esc(x.text)}</span></div>`).join("")}</div></section>
-          <section style="margin-top:18px"><h3>CTR around the deploy</h3><div style="margin-top:16px">${chart}</div></section>
+          <section style="margin-top:18px"><h3>${a.rule === "deploy_ctr" ? "CTR around the deploy" : "CTR around the alert"}</h3><div style="margin-top:16px">${chart}</div></section>
           ${a.status === "Open" && a.version != null && st && st.model_version === a.version && S.models && S.models.rollback_target != null ? `<div class="row" style="gap:8px; margin-top:18px"><button class="btn primary" data-act="rollback">Roll back to v${S.models.rollback_target}</button><button class="btn" data-act="gonode" data-v="ann">Inspect ANN index</button></div>` : ""}
         </section>
       </div>${faultsHtml()}`;
