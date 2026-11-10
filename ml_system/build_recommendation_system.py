@@ -49,7 +49,8 @@ def build_recommendation_system(
     outcome_model="relevance",
     log_metrics=True,
     runs_dir="runs",
-    run_id=None
+    run_id=None,
+    world_dynamics=None
 ):
     """Wire up World, streaming, serving and the offline retraining loop.
 
@@ -61,7 +62,16 @@ def build_recommendation_system(
     rel(u, m)) or "random" (the old uniform outcomes).
     With `log_metrics` the run appends to <runs_dir>/<run_id>/metrics.jsonl
     (see MetricsLogger); `run_id` defaults to "seed<seed>-<timestamp>".
+    `world_dynamics` (dict, default None = a static world) switches on
+    taste drift, users joining over time, fatigue and no-rewatching; see
+    world.dynamics (DYNAMIC_WORLD is a preset with everything on).
     """
+    from world.dynamics import DYNAMICS_KEYS, EXPOSURE_KEYS, WorldDynamics
+
+    world_dynamics = dict(world_dynamics or {})
+    unknown = set(world_dynamics) - set(DYNAMICS_KEYS) - set(EXPOSURE_KEYS)
+    if unknown:
+        raise ValueError("unknown world_dynamics keys: %s" % sorted(unknown))
 
     user_tower_kwargs = dict(
         DEFAULT_USER_TOWER_KWARGS if user_tower_kwargs is None else user_tower_kwargs
@@ -133,7 +143,10 @@ def build_recommendation_system(
         movie_states=movie_states,
         rng=child_rng(),
         users_per_tick=users_per_tick,
-        outcome_model=outcome_model
+        outcome_model=outcome_model,
+        user_simulator_kwargs={
+            k: world_dynamics[k] for k in EXPOSURE_KEYS if k in world_dynamics
+        }
     )
 
     sim = Simulator(seed=seeds.getrandbits(64))
@@ -152,6 +165,14 @@ def build_recommendation_system(
 
     ctr_tracker = CTRTracker()
     sim.register(ctr_tracker)
+
+    # Registered only when asked for, so a static world is unchanged. Its
+    # RNG is derived from `seed` directly, not from the shared stream.
+    dynamics = None
+    dynamics_args = {k: world_dynamics[k] for k in DYNAMICS_KEYS if k in world_dynamics}
+    if dynamics_args:
+        dynamics = WorldDynamics(world, seed=seed, **dynamics_args)
+        sim.register(dynamics)
 
     metrics_logger = None
     run_dir = None
@@ -232,6 +253,7 @@ def build_recommendation_system(
         "feature_store": feature_store,
         "spark": sim.get_service("Spark"),
         "ctr_tracker": ctr_tracker,
+        "world_dynamics": dynamics,
         "metrics_logger": metrics_logger,
         "run_dir": run_dir,
         "seed": seed,
