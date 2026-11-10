@@ -194,6 +194,7 @@ ol.runbook { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction:
         get("/api/state"), get("/api/metrics?since=" + lastTick), get("/api/events?since=" + S.logSeq),
         get("/api/incidents"), get("/api/models"), get("/api/pipeline")
       ]);
+      S.faults = await get("/api/faults");
       if (S.st && st.tick < S.st.tick) { S.rows = []; S.log = []; S.logSeq = 0; } // server restarted
       S.st = st; S.pipe = pipe; S.deploys = m.deploys; S.incidents = inc.incidents; S.models = models;
       for (const r of m.rows) if (!S.rows.length || r.tick > S.rows[S.rows.length - 1].tick) S.rows.push(r);
@@ -364,9 +365,9 @@ ol.runbook { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction:
     kafka: { name: "Event bus", tool: "Kafka", lane: "online", real: "Apache Kafka", desc: "Every recommendation shown and every click is published here as an event. Everything downstream reads from it.",
       fields: [[null, "Partitions", "Not simulated", 3], [null, "Retention (ticks)", "Not simulated", 5000]] },
     flink: { name: "Stream features", tool: "Flink", lane: "online", real: "Apache Flink", desc: "Updates online user features (activity, interactions) in Redis as click, watch and rating events arrive.",
-      fields: [[null, "Window (ticks)", "Not simulated", 50]] },
+      fields: [["flink_capacity", "Capacity (events per tick)", "0 = unlimited. Below the event rate, lag builds up"], ["lag_alert", "Lag alert at (events)", "Opens an incident when Flink is this far behind Kafka"]] },
     redis: { name: "Online features", tool: "Redis", lane: "online", real: "Redis behind a Feast or Tecton feature store", desc: "Fast feature lookups at serving time. Must hold the same features the model was trained on.",
-      fields: [[null, "Feature TTL (ticks)", "Not simulated", 1000]] },
+      fields: [["skew_alert_pct", "Skew alert at (%)", "Online vs offline genre preferences of recently served users"], [null, "Feature TTL (ticks)", "Not simulated", 1000]] },
     server: { name: "Model server", tool: "ModelServer", lane: "online", real: "KServe, Triton or TorchServe", desc: "Embeds the user with the user tower, retrieves candidates from the ANN index and shows the top of the list.",
       fields: [["num_candidates", "Retrieved candidates", "Pulled from the ANN index per request"], ["slate_size", "Slate size", "Movies the user actually sees"], [null, "Exploration rate", "Not simulated", 0.05]] },
     ann: { name: "ANN index", tool: "HNSW", lane: "online", real: "FAISS, ScaNN or a vector database", desc: "Holds one embedding per movie, produced by the item tower. It must come from the same model version as the user tower, or user and movie vectors stop being comparable.",
@@ -380,7 +381,11 @@ ol.runbook { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction:
     train: { name: "Training", tool: "Two-tower", lane: "offline", real: "PyTorch jobs on a GPU cluster", desc: "Builds training data from shown slates (clicks are positives, unclicked shown movies are negatives) and trains the two-tower model in the background while serving continues.",
       fields: [["retrain_every", "Retrain every (ticks)", "0 = only when you start one. Each retrain costs 40 credits"], ["epochs", "Epochs", ""], ["negatives", "Negatives per positive", "Sampled from the shown slate"], ["deploy_delay", "Deploy after (ticks)", "The new model serves this many ticks after training starts; the clock waits if training is slower"]] },
     registry: { name: "Model registry", tool: "Registry", lane: "offline", real: "MLflow Model Registry plus a deploy monitor", desc: "Keeps every model version in memory (towers and index) for roll back. Watches CTR after each deploy.",
-      fields: [["alert_drop_pct", "Alert: CTR drop (%)", "Opens an incident when rolling CTR falls this much"], ["alert_ticks", "Alert: within (ticks)", "How long after a deploy the rule watches"], ["alert_window", "Alert: window (ticks)", "Rolling window compared with the pre-deploy CTR"], [null, "Canary share (%)", "Not simulated", 0]] }
+      fields: [["alert_drop_pct", "Alert: CTR drop (%)", "Opens an incident when rolling CTR falls this much"], ["alert_ticks", "Alert: within (ticks)", "How long after a deploy the rule watches"], ["alert_window", "Alert: window (ticks)", "Rolling window compared with the pre-deploy CTR"], [null, "Canary share (%)", "Not simulated", 0]] },
+    users: { name: "Users", tool: "World", lane: "world", real: "Your actual customers: their tastes change, they get bored, new ones sign up", desc: "The simulated users. A static world never changes; a dynamic one drifts, tires of repeats, and grows. Start the server with --world dynamic for the preset, or change these live.",
+      fields: [["taste_drift_every", "Taste drift every (ticks)", "0 = off. Each time, some users' taste moves towards one genre"], ["taste_drift_share_pct", "Users drifting (%)", ""], ["fatigue_pct", "Fatigue (%)", "Click probability lost per repeat impression of the same movie"], ["rewatch_pct", "Rewatch (%)", "Click probability kept for a movie the user already watched"], ["users_joining_per_100_ticks", "New users per 100 ticks", "Only while some users haven't joined yet (dynamic world)"]] },
+    chaos: { name: "Chaos", tool: "Fault injection", lane: "world", real: "Chaos engineering (game days, Chaos Monkey)", desc: "Hidden faults on a seeded schedule: you find them from symptoms (alerts, health tiles) and fix them. Or inject a known fault as a drill.",
+      fields: [["chaos_every", "Random fault about every (ticks)", "0 = off. Which fault and when stay hidden until it ends"]] }
   };
 
   function nodeStatus(id, d) {
@@ -388,15 +393,18 @@ ol.runbook { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction:
     if (!p || !st) return ["info", "…"];
     switch (id) {
       case "kafka": return ["ok", `${fmt(p.kafka.events)} events · ${p.kafka.events_per_tick}/tick`];
-      case "flink": return ["ok", `${fmt(p.flink.users_with_features)} users with live features`];
-      case "redis": return ["ok", `${fmt(p.redis.keys)} keys`];
-      case "server": return d.mismatch ? ["warn", `serving v${p.server.model_version}, index v${p.ann.index_version}`] : ["ok", `serving v${p.server.model_version} · top ${p.server.slate_size} of ${p.server.num_candidates}`];
-      case "ann": return d.mismatch ? ["crit", `embeddings v${p.ann.index_version}, model v${p.ann.model_version}`] : ["ok", `embeddings v${p.ann.index_version} · ${fmt(p.ann.items)} items`];
+      case "flink": return p.flink.lag > p.settings.lag_alert ? ["crit", `lag ${fmt(p.flink.lag)} events · ${p.flink.processed_last_tick} processed last tick`]
+        : p.flink.lag > 0 ? ["warn", `lag ${fmt(p.flink.lag)} events`] : ["ok", `no lag · ${fmt(p.flink.users_with_features)} users`];
+      case "redis": return p.redis_skew != null && p.redis_skew * 100 > p.settings.skew_alert_pct ? ["crit", `skew ${pct(p.redis_skew, 0)} vs offline`] : ["ok", `${fmt(p.redis.keys)} keys · skew ${pct(p.redis_skew, 0)}`];
+      case "server": return p.server.fallback_share > 0 ? ["crit", `${pct(p.server.fallback_share, 0)} served by fallback`] : d.mismatch ? ["warn", `serving v${p.server.model_version}, index v${p.ann.index_version}`] : ["ok", `serving v${p.server.model_version} · top ${p.server.slate_size} of ${p.server.num_candidates}`];
+      case "ann": return p.ann.self_test != null && p.ann.self_test < 0.7 ? ["crit", `self-test ${pct(p.ann.self_test, 0)} recall`] : d.mismatch ? ["crit", `embeddings v${p.ann.index_version}, model v${p.ann.model_version}`] : ["ok", `embeddings v${p.ann.index_version} · ${fmt(p.ann.items)} items`];
       case "lake": return ["ok", `${fmt(p.lake.events)} events`];
       case "spark": return p.spark.last_run_tick == null ? ["info", p.spark.every ? `first run at t ${fmt(p.spark.every)}` : "never run"] : ["ok", `last run t ${fmt(p.spark.last_run_tick)}`];
       case "ofs": return ["ok", `${fmt(p.ofs.users)} users · ${fmt(p.ofs.items)} items`];
       case "train": return p.train ? [p.train.done ? "ok" : "warn", `v${p.train.version} ${p.train.done ? "trained, deploys" : "training, deploys"} t ${fmt(p.train.deploy_tick)}`] : ["ok", p.settings.retrain_every ? `every ${p.settings.retrain_every} ticks` : "idle"];
       case "registry": return ["ok", `${p.registry.versions} versions · v${p.registry.serving_version} live`];
+      case "users": return ["ok", `${fmt(p.world.active_users)} active${p.world.waiting_users ? ` · ${fmt(p.world.waiting_users)} to join` : ""}${p.world.drifted_users ? ` · ${fmt(p.world.drifted_users)} drifts` : ""}`];
+      case "chaos": return p.settings.chaos_every ? ["warn", `on · about every ${p.settings.chaos_every} ticks`] : ["info", "off"];
     }
   }
 
@@ -408,6 +416,7 @@ ol.runbook { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction:
     }).join("")}</div>`;
     return `<div class="lane"><div class="label">Serving path · online, every request</div>${lane(["kafka", "flink", "redis", "server", "ann"])}</div>
       <div class="lane" style="margin-top:20px"><div class="label">Training path · offline</div>${lane(["lake", "spark", "ofs", "train", "registry"])}</div>
+      <div class="lane" style="margin-top:20px"><div class="label">World and chaos · ${S.pipe ? S.pipe.world.kind : ""} world</div>${lane(["users", "chaos"])}</div>
       <p class="muted" style="margin-top:14px; font-size:12px">Statuses come from the running components. Kafka also writes every event into the data lake.</p>`;
   }
 
@@ -423,13 +432,16 @@ ol.runbook { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction:
     const apply = live.length ? `<button class="btn ${dirty ? "primary" : ""}" data-act="apply" style="margin-top:14px" ${dirty ? "" : "disabled"}>Apply at next tick</button>` : "";
     const actions = S.node === "spark" ? `<button class="btn" data-act="spark" style="margin-top:14px">Run feature job now (${d.st ? d.st.budget.spark_cost : 5} credits)</button>`
       : S.node === "train" ? `<button class="btn" data-act="retrain" style="margin-top:14px" ${d.st && d.st.training ? "disabled" : ""}>Start a training run (${d.st ? d.st.budget.retrain_cost : 40} credits)</button>`
-      : S.node === "ann" && d.mismatch ? `<button class="btn primary" data-act="go" data-v="models" style="margin-top:14px">Fix: roll back on Models</button>` : "";
+      : S.node === "ann" ? `<button class="btn ${d.mismatch ? "primary" : ""}" data-act="repair" data-v="rebuild_index" style="margin-top:14px">Rebuild index with v${d.st ? d.st.model_version : ""} embeddings</button>`
+      : S.node === "flink" ? `<button class="btn" data-act="repair" data-v="restart_flink" style="margin-top:14px">Restart Flink</button>`
+      : S.node === "server" ? `<button class="btn" data-act="repair" data-v="restart_model_server" style="margin-top:14px">Restart model server</button>`
+      : S.node === "chaos" && S.faults ? `<div style="margin-top:14px; width:100%"><div class="label">Drill: inject a known fault (100 ticks)</div><div class="row" style="gap:8px; margin-top:8px">${Object.entries(S.faults.kinds).map(([k, t]) => `<button class="btn" data-act="drill" data-v="${k}">${esc(t)}</button>`).join("")}</div></div>` : "";
     return `${toastHtml()}
       <div class="head"><div><h1>Pipeline</h1><p>Every component of the recommender. Select one to see its live status and change the settings that exist in the simulation. Greyed-out settings are not simulated yet.</p></div></div>
       <div class="row" style="align-items:flex-start">
         <section class="panel" style="flex: 999 1 520px" aria-label="Pipeline diagram"><div id="diagram">${diagram(d)}</div></section>
         <section class="panel" style="flex: 1 1 300px" aria-labelledby="node-h">
-          <div class="label">${n.lane === "online" ? "Serving path" : "Training path"}</div>
+          <div class="label">${n.lane === "online" ? "Serving path" : n.lane === "world" ? "World and chaos" : "Training path"}</div>
           <h2 id="node-h" style="margin-top:2px">${n.name}</h2>
           <p class="pill s-${st}" style="margin-top:8px" id="node-status"><span class="dot bg-${st}"></span>${esc(txt)}</p>
           <p style="margin-top:12px">${n.desc}</p>
@@ -487,18 +499,38 @@ ol.runbook { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction:
       <section class="panel" aria-labelledby="ctr-h"><div class="head"><h2 id="ctr-h">Click-through rate</h2><span class="muted" style="font-size:12px">Share of shown ${S.pipe ? S.pipe.settings.slate_size : 10}-movie lists that got a click</span></div><div style="margin-top:20px">${ctrChart(d)}</div></section>
       <div class="row">
         <section class="panel" style="flex: 2 1 340px" aria-labelledby="lat-h"><h2 id="lat-h">Recommend latency (ms)</h2><div style="margin-top:12px">${latencyChart(d)}</div></section>
-        <section class="panel notlive" style="flex: 1 1 240px" aria-labelledby="drift-h"><h2 id="drift-h">Data drift ${notLive}</h2>
-          <p class="mono" style="font-size:26px; margin-top:8px">–</p>
-          <p class="muted" style="font-size:12px; margin-top:4px">Population stability of user features, live vs training data. Not computed by the simulation yet.</p></section>
       </div>
+      <section class="panel" aria-labelledby="health-h"><div class="head"><h2 id="health-h">System health</h2><span class="muted" style="font-size:12px">Checked every 25 ticks (lag and fallback every tick). Red: an alert has fired.</span></div>
+        <div class="tiles" style="margin-top:12px">${healthTiles(d)}</div></section>
       <section class="panel" aria-labelledby="log-h"><h2 id="log-h">Event log</h2><div style="margin-top:8px">${logHtml(12)}</div></section>`;
+  }
+
+  function healthTiles(d) {
+    const h = d.st ? d.st.health : {}, cfg = S.pipe ? S.pipe.settings : {};
+    const tile = (label, value, sub, bad) => `<div class="tile"><span class="label">${label}</span><span class="big ${bad ? "s-crit" : ""}">${value}</span><span class="sub">${sub}</span></div>`;
+    return [
+      tile("Flink lag", fmt(h.flink_lag) + '<span class="muted" style="font-size:14px"> events</span>', `Kafka events not yet processed · alert at ${fmt(cfg.lag_alert)}`, h.flink_lag > cfg.lag_alert),
+      tile("Fallback share", pct(h.fallback_share, 0), "requests served by the popularity fallback, last 10 ticks", h.fallback_share > 0.5),
+      tile("Index self-test", pct(h.index_self_test, 0), "ANN recall vs exact search · alert below 70%", h.index_self_test != null && h.index_self_test < 0.7),
+      tile("Feature skew", pct(h.feature_skew, 0), `online vs offline genre preferences · alert at ${cfg.skew_alert_pct}%`, h.feature_skew != null && h.feature_skew * 100 > cfg.skew_alert_pct),
+      tile("Catalog coverage", pct(h.coverage, 1), "movies shown in the last 100 ticks", false),
+      tile("Click-mix drift", h.drift_psi == null ? "–" : h.drift_psi.toFixed(2), h.drift_psi == null ? "needs 400 ticks after a deploy" : "PSI vs the first 200 ticks after the deploy · alert at 0.2", h.drift_psi != null && h.drift_psi > 0.2)
+    ].join("");
+  }
+
+  function faultsHtml() {
+    const F = S.faults;
+    if (!F) return "";
+    const rows = F.faults.map((f) => `<div class="logitem" style="grid-template-columns:74px 1fr"><span class="mono muted">t ${fmt(f.start)}</span><span>${esc(f.title)}${f.drill ? ' <span class="chip">drill</span>' : ""} · ${f.status === "active" ? '<span class="s-crit">active</span>' : `ended t ${fmt(f.ended_tick)} (${esc(f.ended_by)})`}</span></div>`).join("");
+    return `<section class="panel" aria-labelledby="faults-h"><div class="head"><h2 id="faults-h">Faults</h2><span class="muted" style="font-size:12px">${F.hidden_active ? `<span class="s-warn">${F.hidden_active} hidden fault${F.hidden_active > 1 ? "s" : ""} active</span> · ` : ""}chaos faults are revealed when they end</span></div>
+      <div style="margin-top:8px">${rows || '<p class="empty">No faults yet. Turn on chaos or run a drill on Pipeline, Chaos.</p>'}</div></section>`;
   }
 
   function incidents(d) {
     const list = S.incidents;
     const ruleTxt = S.pipe ? `Rule: rolling CTR over ${S.pipe.settings.alert_window} ticks drops more than ${S.pipe.settings.alert_drop_pct}% below the pre-deploy CTR within ${S.pipe.settings.alert_ticks} ticks of a deploy.` : "Rule: rolling CTR drops sharply soon after a deploy.";
     if (!list.length) return `${toastHtml()}<div class="head"><div><h1>Incidents</h1><p>Alerts from monitoring. Each one links to a runbook: the first steps the on-call engineer should take.</p></div></div>
-      <p class="empty">No incidents. ${esc(ruleTxt)} Thresholds are on Pipeline, Model registry.</p>`;
+      <p class="empty">No incidents. ${esc(ruleTxt)} Thresholds are on Pipeline, Model registry.</p>${faultsHtml()}`;
     const a = list.find((x) => x.id === S.alert) || list[0];
     const stc = (s) => s === "Resolved" ? "s-ok" : s === "Mitigated" ? "s-accent" : "s-crit";
     const st = d.st;
@@ -507,20 +539,20 @@ ol.runbook { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction:
       <div class="head"><div><h1>Incidents</h1><p>Alerts from monitoring. Each one links to a runbook: the first steps the on-call engineer should take. <span class="muted">${esc(ruleTxt)}</span></p></div></div>
       <div class="row" style="align-items:flex-start">
         <section class="panel" style="flex: 1 1 300px; padding: 8px 0 0 8px" aria-label="Alert inbox"><div class="alertlist">
-          ${list.map((x) => `<button class="alert" data-act="alert" data-v="${x.id}" aria-pressed="${x.id === a.id}"><span class="stripe bg-crit"></span>
+          ${list.map((x) => `<button class="alert" data-act="alert" data-v="${x.id}" aria-pressed="${x.id === a.id}"><span class="stripe bg-${x.severity === "SEV2" ? "crit" : "warn"}"></span>
             <span><span style="font-weight:600">${esc(x.title)}</span><span class="meta"><span class="mono">${x.id}</span><span>${x.severity}</span><span class="mono">t ${fmt(x.tick)}</span><span class="${stc(x.status)}">${x.status}</span></span></span></button>`).join("")}
         </div></section>
         <section class="panel" style="flex: 999 1 440px" aria-labelledby="inc-h">
-          <div class="row" style="gap:8px; align-items:center"><span class="mono muted">${a.id}</span><span class="pill s-crit">${a.severity}</span><span class="pill ${stc(a.status)}">${a.status}</span></div>
+          <div class="row" style="gap:8px; align-items:center"><span class="mono muted">${a.id}</span><span class="pill s-${a.severity === "SEV2" ? "crit" : "warn"}">${a.severity}</span><span class="pill ${stc(a.status)}">${a.status}</span></div>
           <h2 id="inc-h" style="margin-top:8px; font-size:18px">${esc(a.title)}</h2>
           <p style="margin-top:8px">${esc(a.description)}</p>
           <section style="margin-top:18px"><h3>Runbook</h3><ol class="runbook">${a.runbook.map((r) => `<li>${esc(r)}</li>`).join("")}</ol></section>
           <section style="margin-top:18px"><h3>Timeline</h3><div class="log" style="margin-top:4px">
             ${a.timeline.map((x) => `<div class="logitem" style="grid-template-columns:74px 1fr"><span class="mono muted">t ${fmt(x.tick)}</span><span>${esc(x.text)}</span></div>`).join("")}</div></section>
           <section style="margin-top:18px"><h3>CTR around the deploy</h3><div style="margin-top:16px">${chart}</div></section>
-          ${a.status === "Open" && st && st.model_version === a.version && S.models && S.models.rollback_target != null ? `<div class="row" style="gap:8px; margin-top:18px"><button class="btn primary" data-act="rollback">Roll back to v${S.models.rollback_target}</button><button class="btn" data-act="gonode" data-v="ann">Inspect ANN index</button></div>` : ""}
+          ${a.status === "Open" && a.version != null && st && st.model_version === a.version && S.models && S.models.rollback_target != null ? `<div class="row" style="gap:8px; margin-top:18px"><button class="btn primary" data-act="rollback">Roll back to v${S.models.rollback_target}</button><button class="btn" data-act="gonode" data-v="ann">Inspect ANN index</button></div>` : ""}
         </section>
-      </div>`;
+      </div>${faultsHtml()}`;
   }
 
   // ---------- render ----------
@@ -567,6 +599,8 @@ ol.runbook { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction:
       }
       case "spark": return call("/api/spark", {}, "Spark feature job queued for the next tick boundary.");
       case "retrain": return call("/api/retrain", {}, (r) => `Retrain queued at tick ${fmt(r.applies_at_tick)}. Serving continues; the new model deploys ${S.pipe ? S.pipe.settings.deploy_delay : "N"} ticks after it starts.` + (st && !st.playing ? " Press play." : ""));
+      case "repair": return call("/api/repair/" + v, {}, "Repair queued: it applies at the next tick boundary.");
+      case "drill": return call("/api/fault", { kind: v, duration: 100 }, "Drill queued: the fault starts at the next tick. Watch Monitoring and Incidents.");
       case "rollback": return call("/api/rollback", {}, "Rollback queued: it applies at the next tick boundary." + (st && !st.playing ? " Press play." : ""));
     }
     render(true);

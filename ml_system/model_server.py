@@ -34,6 +34,16 @@ class ModelServer(Service):
       self.num_candidates = num_candidates
       self.slate_size = slate_size
 
+      # Degraded mode: while `retriever_down` is set (an outage), requests
+      # are served by `fallback` (e.g. PopularityRetrieval). Optional
+      # `router(user_id) -> (retriever, ranker)` picks a model per user
+      # (canary / A-B tests). All off by default.
+      self.fallback = None
+      self.retriever_down = False
+      self.router = None
+      self.requests = 0
+      self.fallback_requests = 0
+
   def recommend(self, user):
 
       request = RetrievalRequest(
@@ -41,10 +51,19 @@ class ModelServer(Service):
           k=self.num_candidates
       )
 
-      candidates = self.retriever.retrieve(request)
+      retriever, ranker = self.retriever, self.ranker
+      if self.router is not None:
+          retriever, ranker = self.router(user.user_id)
 
-      if self.ranker is not None:
-          candidates = self.ranker.rank(
+      self.requests += 1
+      if self.retriever_down and self.fallback is not None:
+          self.fallback_requests += 1
+          retriever, ranker = self.fallback, None
+
+      candidates = retriever.retrieve(request)
+
+      if ranker is not None:
+          candidates = ranker.rank(
               user,
               candidates
           )

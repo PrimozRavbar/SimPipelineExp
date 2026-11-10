@@ -12,6 +12,9 @@ POST /api/speed   {"speed": 1|10|100}
 POST /api/step    {"ticks": n}   advance n ticks now (only while paused)
 POST /api/retrain | /api/rollback | /api/spark      queued for the next tick boundary
 POST /api/settings {name: value, ...}               queued for the next tick boundary
+GET  /api/faults                 faults so far (hidden chaos faults only counted while active)
+POST /api/fault {"kind": k, "duration": n|null}     inject a fault drill at the next tick
+POST /api/repair/{action}        restart_flink | rebuild_index | restart_model_server
 """
 
 from pathlib import Path
@@ -108,10 +111,24 @@ def create_app(session):
     def settings(body: dict = Body(...)):
         return action("settings", **body)
 
+    @app.get("/api/faults")
+    def faults():
+        return session.faults_view()
+
+    @app.post("/api/fault")
+    def fault(body: dict = Body(...)):
+        return action("fault", kind=body.get("kind"), duration=body.get("duration"))
+
+    @app.post("/api/repair/{name}")
+    def repair(name: str):
+        if name not in ("restart_flink", "rebuild_index", "restart_model_server"):
+            raise HTTPException(status_code=404, detail="unknown repair %r" % name)
+        return action(name)
+
     return app
 
 
-def serve(host="127.0.0.1", port=8000, seed=42, users_per_tick=10, runs_dir="runs"):
+def serve(host="127.0.0.1", port=8000, seed=42, users_per_tick=10, runs_dir="runs", world="static"):
     import faulthandler
     import signal
 
@@ -120,8 +137,8 @@ def serve(host="127.0.0.1", port=8000, seed=42, users_per_tick=10, runs_dir="run
     if hasattr(signal, "SIGUSR1"):
         faulthandler.register(signal.SIGUSR1)   # kill -USR1 <pid> dumps every thread's stack
 
-    print("Building the simulation (seed %d)..." % seed, flush=True)
-    session = SimSession(seed=seed, users_per_tick=users_per_tick, runs_dir=runs_dir)
+    print("Building the simulation (seed %d, %s world)..." % (seed, world), flush=True)
+    session = SimSession(seed=seed, users_per_tick=users_per_tick, runs_dir=runs_dir, world=world)
     session.start()
     app = create_app(session)
     shown_host = "localhost" if host in ("127.0.0.1", "0.0.0.0") else host

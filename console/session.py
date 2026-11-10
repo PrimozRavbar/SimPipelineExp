@@ -21,13 +21,17 @@ consistent state.
 """
 
 import copy
+import random
 import statistics
 import threading
 import time
 
 from ml_system.ann import HNSWIndex
+from console import health
 from ml_system.build_recommendation_system import build_recommendation_system
+from ml_system.faults import FAULT_KINDS, FIXES, FaultInjector
 from ml_system.metrics import reference_ctrs
+from world.dynamics import DYNAMIC_WORLD
 from world.external_data_loader import load_movielens
 
 
@@ -58,6 +62,17 @@ DEFAULT_SETTINGS = {
     "alert_drop_pct": 20,
     "alert_ticks": 100,
     "alert_window": 50,
+    # Operations
+    "flink_capacity": 0,       # Flink events processed per tick (0 = unlimited)
+    "lag_alert": 150,          # incident when Flink's Kafka lag exceeds this
+    "skew_alert_pct": 60,      # incident when online/offline feature skew exceeds this %
+    "chaos_every": 0,          # a hidden random fault about every N ticks (0 = off)
+    # World (simulated users)
+    "taste_drift_every": 0,    # every N ticks some users' taste drifts (0 = off)
+    "taste_drift_share_pct": 5,
+    "fatigue_pct": 0,          # click probability lost per repeat impression
+    "rewatch_pct": 100,        # click probability kept for an already-watched movie
+    "users_joining_per_100_ticks": 0,
 }
 
 # (min, max) for numeric settings; bools are listed in BOOL_SETTINGS.
@@ -72,8 +87,69 @@ SETTING_LIMITS = {
     "alert_drop_pct": (1, 100),
     "alert_ticks": (10, 10000),
     "alert_window": (5, 1000),
+    "flink_capacity": (0, 100000),
+    "lag_alert": (10, 1000000),
+    "skew_alert_pct": (1, 100),
+    "chaos_every": (0, 100000),
+    "taste_drift_every": (0, 100000),
+    "taste_drift_share_pct": (1, 100),
+    "fatigue_pct": (0, 90),
+    "rewatch_pct": (0, 100),
+    "users_joining_per_100_ticks": (0, 10000),
 }
 BOOL_SETTINGS = {"rebuild_index"}
+
+WORLDS = ("static", "dynamic")
+
+# Settings that the dynamic world preset starts from.
+DYNAMIC_SETTINGS = {
+    "taste_drift_every": DYNAMIC_WORLD["taste_drift_every"],
+    "taste_drift_share_pct": round(DYNAMIC_WORLD["taste_drift_share"] * 100),
+    "fatigue_pct": round(DYNAMIC_WORLD["fatigue"] * 100),
+    "rewatch_pct": round(DYNAMIC_WORLD["rewatch"] * 100),
+    "users_joining_per_100_ticks": round(DYNAMIC_WORLD["users_joining_per_tick"] * 100),
+}
+
+# Chaos: how long each kind of random fault lasts (None = until fixed).
+CHAOS_DURATIONS = {
+    "flink_outage": 150,
+    "feature_corruption": None,
+    "index_id_mismatch": None,
+    "model_server_outage": 120,
+    "traffic_spike": 80,
+}
+
+RUNBOOKS = {
+    "ctr_drop": [
+        "Check whether the drop lines up with a deploy (Monitoring, CTR chart). If it does, roll back first.",
+        "Otherwise check the health tiles on Monitoring: Flink lag, fallback share, index self-test, feature skew.",
+        "Fix the component that is unhealthy (Pipeline: Restart Flink, Rebuild index, Restart model server).",
+        "If everything is healthy, look for drift: the world may have changed since the model was trained. Retrain.",
+    ],
+    "flink_lag": [
+        "Open Pipeline, Stream features (Flink): is it processing anything?",
+        "If it processes nothing, restart Flink. If it is up but behind, raise its capacity.",
+        "While Flink is behind, online features are stale: expect CTR to sag for active users.",
+    ],
+    "fallback": [
+        "The model server cannot reach two-tower retrieval and serves its popularity fallback.",
+        "Restart the model server (Pipeline, Model server).",
+    ],
+    "index_health": [
+        "The ANN index self-test fails: its results don't match an exact search over the same vectors.",
+        "The index's id mapping is broken. Rebuild the index (Pipeline, ANN index) or deploy a model with a fresh index.",
+    ],
+    "feature_skew": [
+        "Online user features (Redis, used by serving) disagree with offline ones (feature store).",
+        "A bad feature-job deploy is the usual cause: restart Flink (Pipeline, Stream features) to redeploy it.",
+        "Then run the Spark feature job so both sides are recomputed.",
+    ],
+    "drift": [
+        "What users click has shifted away from what the model was trained on.",
+        "Retrain on recent data (Models, Retrain now) and compare online CTR before and after.",
+    ],
+}
+
 
 RUNBOOK_CTR_DROP = [
     "Check whether the drop lines up with a deploy (Monitoring, CTR chart).",
@@ -129,10 +205,16 @@ class SimSession:
         runs_dir="runs",
         run_id=None,
         training_wait_timeout=None,
+        world="static",
     ):
+        if world not in WORLDS:
+            raise ActionError("world must be one of %s" % (WORLDS,))
         self.seed = seed
+        self.world_kind = world
         self.users_per_tick = users_per_tick
         self.settings = dict(DEFAULT_SETTINGS)
+        if world == "dynamic":
+            self.settings.update(DYNAMIC_SETTINGS)
         if settings:
             self._check_settings(settings)
             self.settings.update(settings)
@@ -151,9 +233,24 @@ class SimSession:
             log_metrics=log_metrics,
             runs_dir=runs_dir,
             run_id=run_id,
+            # Always register WorldDynamics so world settings are live; a
+            # static world gets a neutral one (no RNG use outside its own).
+            world_dynamics=(dict(DYNAMIC_WORLD) if world == "dynamic"
+                            else {"taste_drift_every": 0}),
         )
 
         self.sim = self.system["sim"]
+        self.dynamics = self.system["world_dynamics"]
+        self.simulator = self.system["world"].user_simulator
+        self.flink = self.sim.get_service("Flink")
+        self.kafka = self.sim.get_service("Kafka")
+
+        # Fault injection, registered last (after the metrics logger).
+        self.faults = FaultInjector(self.system)
+        self.sim.register(self.faults)
+        self.chaos_rng = random.Random("chaos-%d" % seed)
+        self.next_chaos_tick = None
+        self.drills = set()
         self.logger = self.system["metrics_logger"]
         self.tracker = self.system["ctr_tracker"]
         self.retriever = self.system["retriever"]
@@ -218,6 +315,14 @@ class SimSession:
         # Serving latency: wall-clock ms of ModelServer.recommend per request.
         self.latency = {}                # tick -> list of ms
         self._wrap_recommend()
+
+        # Monitoring: latest health readings, open incident per rule.
+        self.health = {"index_self_test": None, "feature_skew": None, "flink_lag": 0,
+                       "fallback_share": 0.0, "coverage": None, "drift_psi": None}
+        self.fallback_ticks = {}         # tick -> (requests, fallback requests)
+        self.open_rules = {}             # rule -> incident
+        self.drift_reference = None      # genre mix of clicks just after the last deploy
+        self._apply_live_settings()
 
         self._log("system", "Simulation built: seed %d, %d users per tick." % (seed, users_per_tick))
         self._log("deploy", "Model v0 (bootstrap, untrained) serving.")
@@ -320,8 +425,12 @@ class SimSession:
         then run one tick."""
         self._boundary()
         self.tick_versions[self.tick + 1] = self.serving_version
+        before = (self.model_server.requests, self.model_server.fallback_requests)
         self.sim.tick()
+        self.fallback_ticks[self.tick] = (self.model_server.requests - before[0],
+                                          self.model_server.fallback_requests - before[1])
         self._check_alert()
+        self._monitor()
 
     def _boundary(self):
         now = self.tick
@@ -342,6 +451,7 @@ class SimSession:
 
         # 3. Schedules from the settings.
         s = self.settings
+        self._chaos(now)
         if now > 0 and s["spark_every"] and now % s["spark_every"] == 0:
             self._run_spark(by="schedule")
         if now > 0 and s["retrain_every"] and now % s["retrain_every"] == 0:
@@ -357,7 +467,7 @@ class SimSession:
     # Player actions
     # ------------------------------------------------------------------
 
-    ACTIONS = ("retrain", "rollback", "spark", "settings")
+    ACTIONS = ("retrain", "rollback", "spark", "settings", "fault") + tuple(FIXES)
 
     def submit(self, name, **params):
         """Queue an action for the next tick boundary. Returns its record;
@@ -366,6 +476,8 @@ class SimSession:
             raise ActionError("unknown action %r" % name)
         if name == "settings":
             self._check_settings(params)
+        if name == "fault" and params.get("kind") not in FAULT_KINDS:
+            raise ActionError("fault kind must be one of %s" % sorted(FAULT_KINDS))
         with self.lock:
             action = {
                 "id": self._next_action_id,
@@ -387,6 +499,10 @@ class SimSession:
             return self._run_spark(by="you")
         if name == "settings":
             return self._apply_settings(params)
+        if name == "fault":
+            return self._drill(params["kind"], params.get("duration"))
+        if name in FIXES:
+            return self._fix(name)
         raise ActionError("unknown action %r" % name)
 
     # Settings ----------------------------------------------------------
@@ -415,8 +531,7 @@ class SimSession:
         changed = {k: v for k, v in values.items() if self.settings[k] != v}
         for key, value in changed.items():
             self.settings[key] = int(value) if key not in BOOL_SETTINGS else value
-        self.model_server.slate_size = self.settings["slate_size"]
-        self.model_server.num_candidates = self.settings["num_candidates"]
+        self._apply_live_settings()
         if changed:
             text = ", ".join("%s=%s" % (k, v) for k, v in sorted(changed.items()))
             self._log("config", "Settings changed: %s." % text, cls="s-accent")
@@ -568,6 +683,7 @@ class SimSession:
             self.index_version = version
         previous = self.serving_version
         self.serving_version = version
+        self.drift_reference = None      # rebuilt from this model's first clicks
         if model.info.get("deployed_tick") is None:
             model.info["deployed_tick"] = self.tick
         self.deploy_history.append((self.tick, version))
@@ -583,11 +699,17 @@ class SimSession:
                   % (version, by, " (" + note + ")" if note else "", previous, index_text),
                   cls="s-accent" if by == "you" else "s-info")
 
-        # Incidents opened after the previous deploy are mitigated by a new one.
+        # Open CTR incidents are mitigated by a new deploy (component
+        # incidents stay open until their component is healthy again).
         for incident in self.incidents:
-            if incident["status"] == "Open":
+            if incident["status"] == "Open" and incident["rule"] in ("deploy_ctr", "ctr_drop"):
                 incident["status"] = "Mitigated"
                 incident["timeline"].append((self.tick, "Model v%d deployed (by %s)." % (version, by)))
+                self.open_rules.pop(incident["rule"], None)
+
+        # Swapping in a freshly built index also replaces a broken one.
+        if rebuild_index:
+            self.faults.fix("rebuild_index", self.tick)
 
         self._watch_deploy(previous)
 
@@ -657,6 +779,7 @@ class SimSession:
                    watch["version"], watch["tick"], self.settings["alert_drop_pct"],
                    self.settings["alert_ticks"])
             ),
+            "rule": "deploy_ctr",
             "deploy_tick": watch["tick"],
             "version": watch["version"],
             "previous_version": watch["previous"],
@@ -670,11 +793,233 @@ class SimSession:
             ],
         }
         self.incidents.append(incident)
+        self.open_rules["deploy_ctr"] = incident
         self._log("alert", "%s opened: %s." % (incident["id"], incident["title"]), cls="s-crit")
         if self.logger is not None:
             self.logger.log_event("incident", self.tick, incident_id=incident["id"],
                                   model_version=watch["version"], baseline_ctr=watch["baseline"],
                                   current_ctr=current)
+
+    # ------------------------------------------------------------------
+    # Live settings, faults and repairs
+    # ------------------------------------------------------------------
+
+    def _apply_live_settings(self):
+        s = self.settings
+        self.model_server.slate_size = s["slate_size"]
+        self.model_server.num_candidates = s["num_candidates"]
+        self.flink.max_events_per_tick = s["flink_capacity"] or None
+        d = self.dynamics
+        d.taste_drift_every = s["taste_drift_every"]
+        d.taste_drift_share = s["taste_drift_share_pct"] / 100.0
+        d.users_joining_per_tick = s["users_joining_per_100_ticks"] / 100.0
+        self.simulator.fatigue = s["fatigue_pct"] / 100.0
+        self.simulator.rewatch = s["rewatch_pct"] / 100.0
+        if s["chaos_every"] and self.next_chaos_tick is None:
+            self.next_chaos_tick = self.tick + self._chaos_gap()
+        if not s["chaos_every"]:
+            self.next_chaos_tick = None
+
+    def _chaos_gap(self):
+        every = self.settings["chaos_every"]
+        return max(10, int(every * self.chaos_rng.uniform(0.5, 1.5)))
+
+    def _chaos(self, now):
+        """Hidden random faults on a seeded schedule (deterministic)."""
+        if self.next_chaos_tick is None or now < self.next_chaos_tick:
+            return
+        kind = self.chaos_rng.choice(sorted(CHAOS_DURATIONS))
+        self.faults.schedule(kind, now + 1, CHAOS_DURATIONS[kind])
+        self.faults.apply_due(now)
+        self.next_chaos_tick = now + self._chaos_gap()
+
+    def _drill(self, kind, duration=None):
+        if duration is not None and (not isinstance(duration, int) or duration < 1):
+            raise ActionError("duration must be a positive whole number of ticks")
+        fault = self.faults.schedule(kind, self.tick + 1, duration)
+        self.faults.apply_due(self.tick)
+        self.drills.add(fault.id)
+        self._log("drill", "Drill: %s injected (%s)." % (FAULT_KINDS[kind],
+                  "until fixed" if duration is None else "%d ticks" % duration), cls="s-warn")
+        return "fault %s scheduled" % fault.id
+
+    def _fix(self, action):
+        if action == "rebuild_index":
+            # Re-point serving at the serving version's own index (what a
+            # rebuild with the serving item tower produces).
+            model = self.versions[self.serving_version]
+            self.retriever.ann_index = model.index
+            self.index_version = self.serving_version
+        ended = self.faults.fix(action, self.tick)
+        if action == "restart_flink":
+            self.flink.paused = False
+        if action == "restart_model_server":
+            self.model_server.retriever_down = False
+        label = {"restart_flink": "Flink restarted", "rebuild_index": "ANN index rebuilt with v%d embeddings"
+                 % self.serving_version, "restart_model_server": "Model server restarted"}[action]
+        self._log("ops", "%s by you." % label, cls="s-accent")
+        if self.logger is not None:
+            self.logger.log_event("repair", self.tick, action=action, faults_ended=[f.id for f in ended])
+        return label
+
+    # ------------------------------------------------------------------
+    # Monitoring rules (symptom-based, like a real on-call setup)
+    # ------------------------------------------------------------------
+
+    def _ctr_range(self, start, end):
+        shown = clicks = 0
+        for tick in range(max(1, start), end + 1):
+            c = self.tracker.counts.get(tick)
+            if c:
+                shown += c[0]
+                clicks += c[1]
+        return clicks / shown if shown else None
+
+    def _recent_events(self, ticks):
+        events = self.system["datalake"].events
+        cutoff = self.tick - ticks
+        out = []
+        for event in reversed(events):
+            if event.timestamp <= cutoff:
+                break
+            out.append(event)
+        return out
+
+    def _monitor(self):
+        now = self.tick
+        s = self.settings
+        h = self.health
+
+        # Every tick: lag and fallback share.
+        h["flink_lag"] = self.kafka.lag("Flink")
+        recent = [self.fallback_ticks.get(t, (0, 0)) for t in range(now - 9, now + 1)]
+        requests = sum(r for r, _ in recent)
+        h["fallback_share"] = (sum(f for _, f in recent) / requests) if requests else 0.0
+
+        self._rule("flink_lag", h["flink_lag"] > s["lag_alert"], h["flink_lag"] < s["lag_alert"] / 4,
+                   "WARN", "Flink consumer lag at %d events" % h["flink_lag"],
+                   "Flink is %d events behind Kafka (alert at %d). Online features are going stale."
+                   % (h["flink_lag"], s["lag_alert"]))
+        self._rule("fallback", h["fallback_share"] > 0.5, h["fallback_share"] == 0,
+                   "SEV2", "Model server serving popularity fallback",
+                   "%.0f%% of requests in the last 10 ticks were served by the fallback, not the model."
+                   % (h["fallback_share"] * 100))
+
+        if now % 10 == 0:
+            self._ctr_rule(now)
+
+        if now % 25 == 0:
+            h["index_self_test"] = health.index_self_test(self.retriever.ann_index, self.system["world"].movie_objects)
+            ok = h["index_self_test"]
+            self._rule("index_health", ok is not None and ok < 0.7, ok is not None and ok >= 0.8,
+                       "SEV2", "ANN index self-test failing",
+                       "ANN recall against exact search is %.0f%% (healthy is 85-100%%, alert below 70%%)."
+                       % ((ok or 0) * 100))
+
+            events = self._recent_events(50)
+            users = sorted({e.user_id for e in events})
+            h["feature_skew"] = health.feature_skew(self.system["redis"], self.system["feature_store"], users)
+            skew, limit = h["feature_skew"], s["skew_alert_pct"] / 100.0
+            self._rule("feature_skew", skew is not None and skew > limit,
+                       skew is not None and skew < limit * 0.7,
+                       "WARN", "Online/offline feature skew %.0f%%" % ((skew or 0) * 100),
+                       "Online genre preferences of recently served users differ from the offline ones by "
+                       "%.0f%% on average (alert at %d%%)." % ((skew or 0) * 100, s["skew_alert_pct"]))
+
+            shown = [m for e in self._recent_events(100) if hasattr(e, "movie_ids") for m in e.movie_ids]
+            catalog = self.system["world"].movie_objects
+            h["coverage"] = len(set(shown)) / len(catalog) if shown else None
+
+            self._update_drift(now, catalog)
+            psi = h["drift_psi"]
+            self._rule("drift", psi is not None and psi > 0.2, psi is not None and psi < 0.1,
+                       "WARN", "Data drift: click mix PSI %.2f" % (psi or 0),
+                       "The genre mix of recent clicks has shifted from the model's training data "
+                       "(PSI %.2f, alert at 0.2)." % (psi or 0))
+
+    DRIFT_WINDOW = 200
+
+    def _update_drift(self, now, catalog):
+        """PSI of the genre mix of clicks in the last DRIFT_WINDOW ticks vs
+        the first DRIFT_WINDOW ticks after the current model's deploy."""
+        deploy_tick = self.deploy_history[-1][0]
+        window = self.DRIFT_WINDOW
+        if now < deploy_tick + window:
+            self.health["drift_psi"] = None
+            return
+
+        def clicks(start, end):
+            return [e.movie_id for e in self.system["datalake"].events
+                    if start <= e.timestamp <= end and type(e).__name__ == "RecommendationClickedEvent"]
+
+        if self.drift_reference is None:
+            self.drift_reference = health.genre_distribution(clicks(deploy_tick + 1, deploy_tick + window), catalog)
+        if now < deploy_tick + 2 * window:
+            self.health["drift_psi"] = None
+            return
+        recent = [e.movie_id for e in self._recent_events(window)
+                  if type(e).__name__ == "RecommendationClickedEvent"]
+        self.health["drift_psi"] = health.genre_psi(self.drift_reference,
+                                                    health.genre_distribution(recent, catalog))
+
+    def _ctr_rule(self, now):
+        s = self.settings
+        window = s["alert_window"]
+        if now < 5 * window:
+            return
+        current = self._ctr_range(now - window + 1, now)
+        incident = self.open_rules.get("ctr_drop")
+        if incident is not None:
+            if current is not None and current >= incident["baseline_ctr"] * (1 - s["alert_drop_pct"] / 200.0):
+                self._resolve(incident, "CTR back to %.1f%%." % (current * 100))
+            return
+        if "deploy_ctr" in self.open_rules:
+            return
+        baseline = self._ctr_range(now - 5 * window + 1, now - window)
+        if ctr_drop_alert(baseline, current, s["alert_drop_pct"]):
+            drop = (1 - current / baseline) * 100
+            self._open("ctr_drop", "SEV2", "Online CTR down %.0f%%" % drop,
+                       "Rolling CTR over the last %d ticks is %.1f%%, down from %.1f%% over the %d ticks "
+                       "before (alert at a %d%% drop)." % (window, current * 100, baseline * 100,
+                                                          4 * window, s["alert_drop_pct"]),
+                       baseline_ctr=baseline, current_ctr=current)
+
+    def _rule(self, rule, firing, clear, severity, title, description):
+        incident = self.open_rules.get(rule)
+        if incident is None and firing:
+            self._open(rule, severity, title, description)
+        elif incident is not None and clear:
+            self._resolve(incident, "Condition cleared.")
+
+    def _open(self, rule, severity, title, description, **extra):
+        incident = {
+            "id": "INC-%d" % (len(self.incidents) + 1),
+            "rule": rule,
+            "severity": severity,
+            "tick": self.tick,
+            "status": "Open",
+            "title": title,
+            "description": description,
+            "deploy_tick": self.tick,
+            "version": None,
+            "previous_version": None,
+            "runbook": list(RUNBOOKS[rule]),
+            "timeline": [(self.tick, "Alert fired: %s." % title)],
+            **extra,
+        }
+        self.incidents.append(incident)
+        self.open_rules[rule] = incident
+        self._log("alert", "%s opened: %s." % (incident["id"], title),
+                  cls="s-crit" if severity == "SEV2" else "s-warn")
+        if self.logger is not None:
+            self.logger.log_event("incident", self.tick, incident_id=incident["id"], rule=rule)
+        return incident
+
+    def _resolve(self, incident, text):
+        incident["status"] = "Resolved"
+        incident["timeline"].append((self.tick, "Resolved: %s" % text))
+        self.open_rules.pop(incident["rule"], None)
+        self._log("alert", "%s resolved: %s" % (incident["id"], text), cls="s-ok")
 
     # ------------------------------------------------------------------
     # Latency
@@ -734,6 +1079,8 @@ class SimSession:
                 "reference": self.reference,
                 "run_dir": str(self.system["run_dir"]) if self.system["run_dir"] else None,
                 "open_incidents": sum(1 for i in self.incidents if i["status"] == "Open"),
+                "world": self.world_kind,
+                "health": dict(self.health),
                 "pending_actions": len(self._pending),
             }
 
@@ -814,12 +1161,16 @@ class SimSession:
                 "tick": self.tick,
                 "kafka": {"events": sim.event_count, "events_per_tick": round(events_per_tick, 1),
                           "topics": {k: len(v) for k, v in kafka.topics.items()}},
-                "flink": {"users_with_features": sum(1 for (f, _) in redis.store if f == "activity_level")},
+                "flink": {"users_with_features": sum(1 for (f, _) in redis.store if f == "activity_level"),
+                          "lag": kafka.lag("Flink"), "processed_last_tick": self.flink.processed_last_tick,
+                          "capacity": self.flink.max_events_per_tick},
                 "redis": {"keys": len(redis.store)},
                 "server": {"model_version": self.serving_version, "slate_size": self.model_server.slate_size,
                            "num_candidates": self.model_server.num_candidates,
-                           "slates_last_50_ticks": sum(recent)},
+                           "slates_last_50_ticks": sum(recent),
+                           "fallback_share": self.health["fallback_share"]},
                 "ann": {"index_version": self.index_version, "model_version": self.serving_version,
+                        "self_test": self.health["index_self_test"],
                         "items": len(getattr(self.retriever.ann_index, "nodes", {}) or {})},
                 "lake": {"events": len(datalake.events)},
                 "spark": {"last_run_tick": self.last_spark_tick, "runs": self.spark_runs,
@@ -828,6 +1179,8 @@ class SimSession:
                 "train": None if r is None else {"version": r["version"], "started_tick": r["started_tick"],
                                                  "deploy_tick": r["deploy_tick"], "done": r["done"].is_set()},
                 "registry": {"versions": len(self.versions), "serving_version": self.serving_version},
+                "redis_skew": self.health["feature_skew"],
+                "world": {"kind": self.world_kind, **self.dynamics.summary()},
                 "settings": dict(self.settings),
             }
 
@@ -835,6 +1188,22 @@ class SimSession:
         with self.lock:
             return [dict(i, timeline=[{"tick": t, "text": x} for t, x in i["timeline"]])
                     for i in reversed(self.incidents)]
+
+    def faults_view(self):
+        """Faults so far. Hidden chaos faults are only counted while active
+        (the player has to find them); drills and ended faults are shown."""
+        with self.lock:
+            shown, hidden_active = [], 0
+            for fault in self.faults.faults:
+                drill = fault.id in self.drills
+                if fault.status == "active" and not drill:
+                    hidden_active += 1
+                    continue
+                if fault.status == "scheduled" and not drill:
+                    continue
+                shown.append({**fault.summary(), "drill": drill})
+            return {"hidden_active": hidden_active, "faults": list(reversed(shown)),
+                    "kinds": FAULT_KINDS, "fixes": {k: list(v) for k, v in FIXES.items()}}
 
     def actions_pending(self):
         with self.lock:
