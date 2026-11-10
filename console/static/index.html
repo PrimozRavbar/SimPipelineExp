@@ -259,6 +259,8 @@ ol.runbook { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction:
     const st = d.st;
     if (!st) { document.getElementById("top").innerHTML = `<div class="brand">${icon("logo", 20)}<span>SimPipeline Console</span><span class="env">live</span></div><div class="muted">${S.error ? "Cannot reach the server: " + esc(S.error) : "Connecting…"}</div>`; return; }
     const tr = st.training;
+    const cn = st.canary;
+    const canaryTxt = cn ? `<span class="s-accent">canary v${cn.version} · ${cn.share}% until t ${fmt(cn.end_tick)}</span>` : "";
     const trainTxt = tr ? (st.waiting_for_training ? `<span class="s-warn">clock waiting for v${tr.version} training</span>` : `<span class="s-accent">training v${tr.version} · deploys t ${fmt(tr.deploy_tick)}</span>`) : "";
     document.getElementById("top").innerHTML = `
       <div class="brand">${icon("logo", 20)}<span>SimPipeline Console</span><span class="env">live · seed ${st.seed}</span></div>
@@ -270,7 +272,7 @@ ol.runbook { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction:
       </div>
       <div><div class="label">Mission ${mock}</div><div class="muted">Free play</div></div>
       <div><div class="label">Production model</div><div class="mono" id="prod">v${st.model_version} <span class="${d.mismatch ? "s-warn" : "s-ok"}">${d.mismatch ? "· index v" + st.index_version : "· index matches"}</span></div></div>
-      <div>${trainTxt}</div>
+      <div>${trainTxt} ${canaryTxt}</div>
       <div class="spacer"></div>
       <div><div class="label">Compute budget</div><div class="group"><div class="budget" role="meter" aria-valuemin="0" aria-valuemax="${st.budget.total}" aria-valuenow="${st.budget.used}" aria-label="Compute credits used"><span style="width:${st.budget.used / st.budget.total * 100}%"></span></div><span class="mono muted">${st.budget.used}/${st.budget.total}</span></div></div>`;
   }
@@ -382,7 +384,7 @@ ol.runbook { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction:
     train: { name: "Training", tool: "Two-tower", lane: "offline", real: "PyTorch jobs on a GPU cluster", desc: "Builds training data from shown slates (clicks are positives, unclicked shown movies are negatives) and trains the two-tower model in the background while serving continues.",
       fields: [["retrain_every", "Retrain every (ticks)", "0 = only when you start one. Each retrain costs 40 credits"], ["epochs", "Epochs", ""], ["negatives", "Negatives per positive", "Sampled from the shown slate"], ["deploy_delay", "Deploy after (ticks)", "The new model serves this many ticks after training starts; the clock waits if training is slower"]] },
     registry: { name: "Model registry", tool: "Registry", lane: "offline", real: "MLflow Model Registry plus a deploy monitor", desc: "Keeps every model version in memory (towers and index) for roll back. Watches CTR after each deploy.",
-      fields: [["alert_drop_pct", "Alert: CTR drop (%)", "Opens an incident when rolling CTR falls this much"], ["alert_ticks", "Alert: within (ticks)", "How long after a deploy the rule watches"], ["alert_window", "Alert: window (ticks)", "Rolling window compared with the pre-deploy CTR"], [null, "Canary share (%)", "Not simulated", 0]] },
+      fields: [["alert_drop_pct", "Alert: CTR drop (%)", "Opens an incident when rolling CTR falls this much"], ["alert_ticks", "Alert: within (ticks)", "How long after a deploy the rule watches"], ["alert_window", "Alert: window (ticks)", "Rolling window compared with the pre-deploy CTR"], ["canary_share", "Canary share (%)", "0 = deploy to everyone at once. 50 = an A/B test"], ["canary_ticks", "Canary length (ticks)", "Then promote, unless the canary is worse with 95% confidence"]] },
     users: { name: "Users", tool: "World", lane: "world", real: "Your actual customers: their tastes change, they get bored, new ones sign up", desc: "The simulated users. A static world never changes; a dynamic one drifts, tires of repeats, and grows. Start the server with --world dynamic for the preset, or change these live.",
       fields: [["taste_drift_every", "Taste drift every (ticks)", "0 = off. Each time, some users' taste moves towards one genre"], ["taste_drift_share_pct", "Users drifting (%)", ""], ["fatigue_pct", "Fatigue (%)", "Click probability lost per repeat impression of the same movie"], ["rewatch_pct", "Rewatch (%)", "Click probability kept for a movie the user already watched"], ["users_joining_per_100_ticks", "New users per 100 ticks", "Only while some users haven't joined yet (dynamic world)"]] },
     chaos: { name: "Chaos", tool: "Fault injection", lane: "world", real: "Chaos engineering (game days, Chaos Monkey)", desc: "Hidden faults on a seeded schedule: you find them from symptoms (alerts, health tiles) and fix them. Or inject a known fault as a drill.",
@@ -457,7 +459,7 @@ ol.runbook { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction:
     const M = S.models, st = d.st;
     if (!M || !st) return `<p class="empty">Loading…</p>`;
     const tr = M.training, target = M.rollback_target;
-    const pillFor = (s) => s === "Production" ? "s-ok" : s === "Training" ? "s-accent" : "s-info";
+    const pillFor = (s) => s === "Production" ? "s-ok" : s === "Training" || s === "Canary" ? "s-accent" : "s-info";
     const rows = M.versions.map((v) => [
       v.version === 0 ? "bootstrap" : `run-${String(v.version).padStart(2, "0")}`, `v${v.version}`,
       v.version === 0 ? "–" : fmt(v.started_tick), v.deploys.length ? v.deploys.map(fmt).join(", ") : "–",
@@ -478,11 +480,23 @@ ol.runbook { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction:
           <p class="muted" style="font-size:12px; margin-top:4px">Index rebuild and schedules are set in Pipeline.</p>
           <div style="margin-top:12px"><button class="btn" data-act="gonode" data-v="train">Change in Pipeline</button></div></section>
       </div>
+      ${M.canary ? canaryPanel(M.canary) : ""}
       <section class="panel" aria-labelledby="runs-h"><div class="head"><h2 id="runs-h">Model versions</h2><span class="muted" style="font-size:12px">Online CTR: clicks / shown over the ticks this version served</span></div>
         <div class="tablewrap" style="margin-top:8px"><table><thead><tr><th>Run</th><th>Model</th><th>Started (tick)</th><th>Deployed (tick)</th><th>Training examples</th><th>Epochs / negatives</th><th>Train time</th><th>Online CTR</th><th>Ranker</th><th>Held-out Recall@20</th><th>Stage</th></tr></thead>
         <tbody>${rows.map((r) => `<tr><td class="mono">${r[0]}</td><td class="mono">${r[1]}</td><td class="mono">${r[2]}</td><td class="mono">${r[3]}</td><td class="mono">${r[4]}</td><td class="mono">${r[5]}</td><td class="mono">${r[6]}</td><td class="mono">${r[7]}</td><td class="mono muted" style="font-size:12px">${r[9]}</td><td class="muted">pending</td><td><span class="pill ${pillFor(r[8])}">${r[8]}</span></td></tr>`).join("")}</tbody></table></div>
         <p class="muted" style="margin-top:12px; font-size:12px">Held-out Recall@20 is pending: it needs a second training run per version, too slow to do live. Online CTR is the better signal here anyway (see CLAUDE.md, "Offline Recall@K mostly measures exposure").</p>
       </section>`;
+  }
+
+  function canaryPanel(c) {
+    const t = c.test, ctr = (x) => pct(x.ctr), signif = t && (t.low > 0 || t.high < 0);
+    return `<section class="panel" style="border-color:var(--accent)" aria-labelledby="canary-h"><div class="head"><h2 id="canary-h">Canary: v${c.version} on ${c.share}% of users</h2><span class="muted" style="font-size:12px">ticks ${fmt(c.start_tick)}–${fmt(c.end_tick)} · users split by a stable hash of their id</span></div>
+      <div class="tiles" style="margin-top:12px">
+        <div class="tile"><span class="label">v${c.control} (control)</span><span class="big">${ctr(c.control)}</span><span class="sub">${fmt(c.control.shown)} slates · ${fmt(c.control.clicks)} clicks</span></div>
+        <div class="tile"><span class="label">v${c.version} (canary)</span><span class="big">${ctr(c.treatment)}</span><span class="sub">${fmt(c.treatment.shown)} slates · ${fmt(c.treatment.clicks)} clicks</span></div>
+        <div class="tile"><span class="label">Difference (95% CI)</span><span class="big ${signif ? (t.diff > 0 ? "s-ok" : "s-crit") : ""}">${t ? (t.diff >= 0 ? "+" : "") + (t.diff * 100).toFixed(1) + " pts" : "–"}</span><span class="sub">${t ? `${(t.low * 100).toFixed(1)} to ${(t.high * 100).toFixed(1)} pts · ${signif ? "significant" : "not significant yet"}` : "waiting for traffic"}</span></div>
+      </div>
+      <div class="row" style="gap:8px; margin-top:12px"><button class="btn primary" data-act="canary" data-v="promote">Promote v${c.version} now</button><button class="btn" data-act="canary" data-v="abort">Abort canary</button></div></section>`;
   }
 
   function monitoring(d) {
@@ -601,6 +615,7 @@ ol.runbook { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction:
       }
       case "spark": return call("/api/spark", {}, "Spark feature job queued for the next tick boundary.");
       case "retrain": return call("/api/retrain", {}, (r) => `Retrain queued at tick ${fmt(r.applies_at_tick)}. Serving continues; the new model deploys ${S.pipe ? S.pipe.settings.deploy_delay : "N"} ticks after it starts.` + (st && !st.playing ? " Press play." : ""));
+      case "canary": return call("/api/canary/" + v, {}, v === "promote" ? "Promotion queued for the next tick." : "Abort queued for the next tick.");
       case "repair": return call("/api/repair/" + v, {}, "Repair queued: it applies at the next tick boundary.");
       case "drill": return call("/api/fault", { kind: v, duration: 100 }, "Drill queued: the fault starts at the next tick. Watch Monitoring and Incidents.");
       case "rollback": return call("/api/rollback", {}, "Rollback queued: it applies at the next tick boundary." + (st && !st.playing ? " Press play." : ""));

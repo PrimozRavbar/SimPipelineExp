@@ -31,7 +31,9 @@ from console import health
 from ml_system.build_recommendation_system import build_recommendation_system
 from ml_system.faults import FAULT_KINDS, FIXES, FaultInjector
 from ml_system.metrics import reference_ctrs
+from ml_system.experiments import Experiment
 from ml_system.ranking import LogisticRanker, WatchedFilter
+from ml_system.two_tower import TwoTowerRetrieval
 from world.dynamics import DYNAMIC_WORLD
 from world.external_data_loader import load_movielens
 
@@ -60,6 +62,10 @@ DEFAULT_SETTINGS = {
     "rebuild_index": True,     # rebuild the ANN index with the new item tower on deploy
     "ranker": False,           # train and serve a ranking stage after retrieval
     "filter_watched": False,   # drop movies the user already watched (re-ranker)
+    # Canary: a new model first serves canary_share % of users for
+    # canary_ticks ticks, then is promoted unless it is significantly worse.
+    "canary_share": 0,
+    "canary_ticks": 150,
     # Alert rule: open an incident when rolling CTR drops more than
     # alert_drop_pct % within alert_ticks ticks after a deploy.
     "alert_drop_pct": 20,
@@ -90,6 +96,8 @@ SETTING_LIMITS = {
     "alert_drop_pct": (1, 100),
     "alert_ticks": (10, 10000),
     "alert_window": (5, 1000),
+    "canary_share": (0, 100),
+    "canary_ticks": (10, 10000),
     "flink_capacity": (0, 100000),
     "lag_alert": (10, 1000000),
     "skew_alert_pct": (1, 100),
@@ -146,6 +154,11 @@ RUNBOOKS = {
         "Online user features (Redis, used by serving) disagree with offline ones (feature store).",
         "A bad feature-job deploy is the usual cause: restart Flink (Pipeline, Stream features) to redeploy it.",
         "Then run the Spark feature job so both sides are recomputed.",
+    ],
+    "canary": [
+        "The canary served the new model to a share of users and lost to the current model with 95% confidence.",
+        "It was rolled back automatically: only the canary users were affected.",
+        "Compare the two versions on Models (training data, epochs, ranker) before trying again.",
     ],
     "drift": [
         "What users click has shifted away from what the model was trained on.",
@@ -305,6 +318,7 @@ class SimSession:
         self.index_version = 0
         self.deploy_history = [(0, 0)]   # (tick, version)
         self.retrain = None              # the in-flight retrain, if any
+        self.canary = None               # {"experiment", "rebuild_index", "by"} while a canary runs
         self.tick_versions = {}          # tick -> model version that served it
 
         # Offline jobs
@@ -435,6 +449,8 @@ class SimSession:
         self.fallback_ticks[self.tick] = (self.model_server.requests - before[0],
                                           self.model_server.fallback_requests - before[1])
         self._check_alert()
+        if self.canary is not None:
+            self._canary_tick()
         self._monitor()
 
     def _boundary(self):
@@ -472,7 +488,8 @@ class SimSession:
     # Player actions
     # ------------------------------------------------------------------
 
-    ACTIONS = ("retrain", "rollback", "spark", "settings", "fault") + tuple(FIXES)
+    ACTIONS = ("retrain", "rollback", "spark", "settings", "fault",
+               "promote_canary", "abort_canary") + tuple(FIXES)
 
     def submit(self, name, **params):
         """Queue an action for the next tick boundary. Returns its record;
@@ -508,6 +525,10 @@ class SimSession:
             return self._drill(params["kind"], params.get("duration"))
         if name in FIXES:
             return self._fix(name)
+        if name == "promote_canary":
+            return self._end_canary(promote=True, by="you")
+        if name == "abort_canary":
+            return self._end_canary(promote=False, by="you")
         raise ActionError("unknown action %r" % name)
 
     # Settings ----------------------------------------------------------
@@ -569,6 +590,8 @@ class SimSession:
             raise ActionError("a training run is already in progress (deploys at tick %d)" % self.retrain["deploy_tick"])
         if self.budget_used + COST_RETRAIN > BUDGET_TOTAL:
             raise ActionError("not enough compute budget left for a retrain")
+        if self.canary is not None:
+            raise ActionError("a canary is running; promote or abort it first")
 
         now = self.tick
         version = max(self.versions) + 1
@@ -695,8 +718,11 @@ class SimSession:
                                   training_examples=record["training_examples"])
         self._log("train", "Training v%d finished (%d examples, %.1f s wall time)."
                   % (version, record["training_examples"], record.get("train_seconds") or 0), cls="s-accent")
-        self._deploy(version, by="auto" if record["by"] == "schedule" else record["by"],
-                     rebuild_index=record["rebuild_index"])
+        by = "auto" if record["by"] == "schedule" else record["by"]
+        if self.settings["canary_share"] > 0:
+            self._start_canary(version, by, record["rebuild_index"])
+        else:
+            self._deploy(version, by=by, rebuild_index=record["rebuild_index"])
 
     def _deploy(self, version, by, rebuild_index=True, note=""):
         model = self.versions[version]
@@ -738,7 +764,74 @@ class SimSession:
 
         self._watch_deploy(previous)
 
+    # Canary ------------------------------------------------------------
+
+    def _start_canary(self, version, by, rebuild_index):
+        model = self.versions[version]
+        s = self.settings
+        retriever = TwoTowerRetrieval(
+            model.user_tower, model.item_tower,
+            model.index if rebuild_index else self.retriever.ann_index,
+            self.system["redis"], self.system["feature_store"],
+        )
+        experiment = Experiment(self.serving_version, version, s["canary_share"],
+                                self.tick + 1, self.tick + s["canary_ticks"], salt=version)
+
+        def router(user_id):
+            if experiment.arm(user_id) == "treatment":
+                return retriever, (model.ranker if self.settings["ranker"] else None)
+            return self.retriever, self.model_server.ranker
+
+        self.model_server.router = router
+        self.canary = {"experiment": experiment, "rebuild_index": rebuild_index, "by": by}
+        self._log("deploy", "Canary: v%d serves %d%% of users for %d ticks (v%d serves the rest)."
+                  % (version, s["canary_share"], s["canary_ticks"], self.serving_version), cls="s-accent")
+        if self.logger is not None:
+            self.logger.log_event("canary_start", self.tick, model_version=version,
+                                  share=s["canary_share"], until=experiment.end_tick)
+
+    def _canary_tick(self):
+        experiment = self.canary["experiment"]
+        for event in self._recent_events(1):
+            experiment.observe(event)
+        if self.tick >= experiment.end_tick:
+            test = experiment.stats()["test"]
+            worse = test is not None and test["z"] < -1.96
+            self._end_canary(promote=not worse, by="canary check")
+
+    def _end_canary(self, promote, by):
+        if self.canary is None:
+            raise ActionError("no canary is running")
+        canary, self.canary = self.canary, None
+        experiment = canary["experiment"]
+        stats = experiment.stats()
+        self.model_server.router = None
+        version = experiment.treatment
+        self.versions[version].info["canary"] = {
+            "share": experiment.share_pct, "start": experiment.start_tick, "end": self.tick,
+            "control_ctr": stats["control"]["ctr"], "canary_ctr": stats["treatment"]["ctr"],
+            "result": "promoted" if promote else "rolled back",
+        }
+        if self.logger is not None:
+            self.logger.log_event("canary_end", self.tick, model_version=version, promoted=promote,
+                                  control_ctr=stats["control"]["ctr"], canary_ctr=stats["treatment"]["ctr"])
+        text = "Canary v%d %s (by %s): canary CTR %s vs %s on v%d." % (
+            version, "promoted" if promote else "rolled back", by,
+            _pct(stats["treatment"]["ctr"]), _pct(stats["control"]["ctr"]), experiment.control)
+        self._log("deploy", text, cls="s-ok" if promote else "s-warn")
+        if promote:
+            self._deploy(version, by="canary" if by == "canary check" else by,
+                         rebuild_index=canary["rebuild_index"])
+        elif by == "canary check":
+            incident = self._open("canary", "SEV2", "Canary v%d lost to v%d" % (version, experiment.control),
+                                  text + " Rolled back automatically.")
+            incident["status"] = "Mitigated"
+            self.open_rules.pop("canary", None)
+        return text
+
     def _rollback(self):
+        if self.canary is not None:
+            return self._end_canary(promote=False, by="you")
         if len(self.deploy_history) < 2:
             raise ActionError("nothing to roll back to")
         current = self.serving_version
@@ -1106,6 +1199,7 @@ class SimSession:
                 "reference": self.reference,
                 "run_dir": str(self.system["run_dir"]) if self.system["run_dir"] else None,
                 "open_incidents": sum(1 for i in self.incidents if i["status"] == "Open"),
+                "canary": self._canary_view(),
                 "world": self.world_kind,
                 "health": dict(self.health),
                 "pending_actions": len(self._pending),
@@ -1152,7 +1246,8 @@ class SimSession:
                     "deploys": deployed,
                     "ticks_served": len(served_ticks),
                     "online_ctr": ctr,
-                    "stage": "Production" if version == self.serving_version else "Archived",
+                    "stage": "Production" if version == self.serving_version else (
+                        "Canary" if self.canary and self.canary["experiment"].treatment == version else "Archived"),
                 })
             r = self.retrain
             training = None
@@ -1161,12 +1256,20 @@ class SimSession:
                                               "training_examples", "epochs", "negatives", "by")}
                 training["done"] = r["done"].is_set()
             return {
+                "canary": self._canary_view(),
                 "serving_version": self.serving_version,
                 "index_version": self.index_version,
                 "rollback_target": self._rollback_target(),
                 "training": training,
                 "versions": out,
             }
+
+    def _canary_view(self):
+        if self.canary is None:
+            return None
+        e = self.canary["experiment"]
+        return {"version": e.treatment, "control": e.control, "share": e.share_pct,
+                "start_tick": e.start_tick, "end_tick": e.end_tick, **e.stats()}
 
     def _rollback_target(self):
         for _, version in reversed(self.deploy_history):
@@ -1243,3 +1346,7 @@ def ctr_drop_alert(baseline, current, drop_pct):
         return False
     return current < baseline * (1 - drop_pct / 100.0)
 
+
+
+def _pct(value):
+    return "–" if value is None else "%.1f%%" % (value * 100)

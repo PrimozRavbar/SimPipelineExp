@@ -15,6 +15,7 @@ POST /api/settings {name: value, ...}               queued for the next tick bou
 GET  /api/faults                 faults so far (hidden chaos faults only counted while active)
 POST /api/fault {"kind": k, "duration": n|null}     inject a fault drill at the next tick
 POST /api/repair/{action}        restart_flink | rebuild_index | restart_model_server
+POST /api/canary/promote | /api/canary/abort       end a running canary
 """
 
 from pathlib import Path
@@ -110,6 +111,14 @@ def create_app(session):
     @app.post("/api/settings")
     def settings(body: dict = Body(...)):
         return action("settings", **body)
+
+    @app.post("/api/canary/promote")
+    def canary_promote():
+        return action("promote_canary")
+
+    @app.post("/api/canary/abort")
+    def canary_abort():
+        return action("abort_canary")
 
     @app.get("/api/faults")
     def faults():
