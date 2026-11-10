@@ -40,7 +40,10 @@ Run notebooks from the repo root. `SimPipExp_quickstart.ipynb` is the reference 
 | Metrics     | `ml_system/evaluation.py`, `ml_system/metrics.py`, `dashboard/` |
 | Features    | `ml_system/flink.py`, `ml_system/offline_*`, `ml_system/features.py`, `TwoTowerRetrieval.retrieve` |
 | Performance | `ml_system/ann.py`, `ml_system/training.py`                 |
+| Console     | `console/` (SimSession, API server, live UI), `SimPipExp_console.ipynb` |
 | Orchestrator| `pyproject.toml`, `tests/`, notebooks, this file; merges branches |
+
+Screenshots of the live console are in `docs/console/`.
 
 ## Relevance (ground truth)
 
@@ -138,6 +141,64 @@ rolling-CTR chart with retrain markers and random/oracle reference lines, and an
 `dashboard.display_dashboard(run_dir)` also shows it inline in Jupyter/Colab. The rolling
 window defaults to about 250 slates (`window=` ticks to override).
 
+## Live console (`console/`)
+
+A player console connected to one running simulation. `mockups/console/index.html` is the
+original fake-data mockup (keep it unchanged); the live UI is `console/static/index.html`.
+
+```bash
+pip install -e ".[console]"      # fastapi, uvicorn
+python -m console                # http://localhost:8000  (--port, --seed, --users-per-tick)
+```
+
+On Colab, `SimPipExp_console.ipynb` starts the server in the background and opens it with
+`google.colab.output.serve_kernel_port_as_window`.
+
+- `console/session.py:SimSession` has no web code. It wraps `build_recommendation_system`
+  (default 10 users per tick), runs the clock on a background thread (speed 1×/10×/100× =
+  2/20/200 ticks per second, as fast as possible when ticks are slower) and exposes
+  JSON-ready views. `step(n)` advances synchronously (tests, scripts).
+- **Determinism.** `submit(name, **params)` queues an action (`retrain`, `rollback`, `spark`,
+  `settings`); queued actions apply only at the next tick boundary (after tick T, before
+  T+1), in submission order. Retraining builds its features and training set on the clock
+  thread at the boundary, then trains, embeds and builds the HNSW index on a background
+  thread while the current model keeps serving. The new model deploys exactly
+  `deploy_delay` ticks (default 50) after the retrain started; if training is not done by
+  then, the clock waits. Same seed + same actions at the same ticks = same run.
+- **Models.** Every version (v0 = untrained bootstrap) keeps its own towers and index in
+  memory, so roll back redeploys the previously served version instantly. The trainer
+  keeps training its own towers across retrains (warm start); deployed versions are copies.
+  Held-out Recall@20 is not computed live (it needs a second training run); the UI shows it
+  as pending and shows online CTR per version instead.
+- **Settings** (Pipeline screen, `POST /api/settings`): `spark_every`, `retrain_every`
+  (0 = off), `deploy_delay`, `epochs`, `negatives`, `slate_size`, `num_candidates`,
+  `rebuild_index` (off: a deploy swaps the towers but keeps the old index, the classic
+  stale-index bug), and the alert rule's `alert_drop_pct`, `alert_ticks`, `alert_window`.
+  Settings with no simulated counterpart (Kafka partitions, TTLs, canary...) are shown
+  disabled.
+- **Alert.** After each deploy the session compares the rolling CTR over `alert_window`
+  ticks with the CTR over the `2·alert_window` ticks before the deploy; a drop of more than
+  `alert_drop_pct` % within `alert_ticks` ticks opens an incident (with runbook). A later
+  deploy (e.g. a rollback) marks it Mitigated.
+- **Budget** is a game resource: retrain 40 credits, Spark run 5, of 1000.
+- **Latency** is the wall-clock time of `ModelServer.recommend` in the server process
+  (real but machine-dependent, never fed back into the simulation).
+- Session events also go to the metrics log: `retrain_start`, `retrain`, `deploy` (with
+  `index_version`, `by`), `spark`, `settings`, `incident`.
+
+API (`console/server.py`; the UI uses nothing else):
+
+| Endpoint | |
+|---|---|
+| `GET /api/state` | tick, playing, speed, model/index version, training in flight, budget, reference CTRs |
+| `GET /api/metrics?since=T` | per-tick rows for ticks > T: shown, clicks, ctr, active_users, model_version, latency; plus deploys |
+| `GET /api/events?since=SEQ` | event log entries |
+| `GET /api/models` | versions with training stats and online CTR, rollback target |
+| `GET /api/pipeline` | component status and current settings |
+| `GET /api/incidents` | incidents opened by the alert rule |
+| `POST /api/play`, `/api/pause`, `/api/speed {speed}`, `/api/step {ticks}` | clock (step only while paused) |
+| `POST /api/retrain`, `/api/rollback`, `/api/spark`, `/api/settings {...}` | queued for the next tick boundary |
+
 ## Why CTR was flat (fixed)
 
 Main used to go 18.3% → 18.7% after a retrain. Expected-CTR analysis per user showed the
@@ -174,5 +235,9 @@ result is unstable: the model collapses to a few dozen near-global slates.
 - Online and offline features still disagree on popularity (Flink: watches per item in
   Redis `item_popularity`, unused by serving; offline: watches in the feature store).
 - `retrain()` recomputes offline features that the Spark job already computed.
+- Console: a stale index (`rebuild_index` off) does not visibly hurt CTR yet, because the
+  trainer warm-starts from the previous towers, so v(n) user vectors still match v(n-1)
+  item vectors. The CTR-drop alert is unit-tested, but no built-in scenario reliably fires it.
+  Missions and data drift in the console are still mock.
 - With `users_per_tick > 1`, every active user in a tick is served from the same model
   state; nothing models concurrency or latency yet.
