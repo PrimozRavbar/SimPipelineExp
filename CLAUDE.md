@@ -170,6 +170,10 @@ On Colab, `SimPipExp_console.ipynb` starts the server in the background and open
   keeps training its own towers across retrains (warm start); deployed versions are copies.
   Held-out Recall@20 is not computed live (it needs a second training run); the UI shows it
   as pending and shows online CTR per version instead.
+- **Spark.** The offline feature job runs on its own schedule (`spark_every`, default 100
+  ticks) and as the first stage of every retrain (logged as `spark` with `by: "retrain vN"`;
+  covered by the retrain's cost). So the Pipeline's Spark node and the feature-freshness
+  tile reflect both.
 - **Settings** (Pipeline screen, `POST /api/settings`): `spark_every`, `retrain_every`
   (0 = off), `deploy_delay`, `epochs`, `negatives`, `slate_size`, `num_candidates`,
   `rebuild_index` (off: a deploy swaps the towers but keeps the old index, the classic
