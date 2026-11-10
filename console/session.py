@@ -43,7 +43,7 @@ COST_SPARK = 5
 
 DEFAULT_SETTINGS = {
     # Offline schedules (0 = off, the player triggers runs by hand).
-    "spark_every": 0,          # run the Spark feature job every N ticks
+    "spark_every": 100,        # run the Spark feature job every N ticks (0 = off)
     "retrain_every": 0,        # start a retrain every N ticks
     "deploy_delay": 50,        # ticks between retrain start and deploy
     # Training
@@ -426,12 +426,17 @@ class SimSession:
 
     # Spark -------------------------------------------------------------
 
-    def _run_spark(self, by):
-        events = self.system["datalake"].events
+    def _run_spark(self, by, events=None, charge=True):
+        """Run the offline feature job (Spark) over the data lake. Every
+        retrain runs it too, as its first stage (charge=False: the retrain
+        cost covers it)."""
+        if events is None:
+            events = self.system["datalake"].events
         self.system["spark"].run_offline_feature_job(events, self.offline.feature_pipeline)
         self.last_spark_tick = self.tick
         self.spark_runs += 1
-        self.budget_used += COST_SPARK
+        if charge:
+            self.budget_used += COST_SPARK
         self._log("job", "Spark feature job ran over %d events (by %s)." % (len(events), by))
         if self.logger is not None:
             self.logger.log_event("spark", self.tick, events=len(events), by=by)
@@ -450,10 +455,11 @@ class SimSession:
         events = list(self.system["datalake"].events)
 
         # Everything that reads shared state or uses the session RNGs runs
-        # here, on the clock thread at a tick boundary: offline features,
-        # the training set (negative sampling, shuffle) and the item
-        # features the new item tower will embed.
-        self.offline.feature_pipeline.process(events)
+        # here, on the clock thread at a tick boundary: offline features
+        # (a Spark job, the first stage of the training pipeline), the
+        # training set (negative sampling, shuffle) and the item features
+        # the new item tower will embed.
+        self._run_spark(by="retrain v%d" % version, events=events, charge=False)
         generator = self.offline.dataset_generator
         generator.negative_samples = self.settings["negatives"]
         for order, event in enumerate(events):

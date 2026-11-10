@@ -10,7 +10,7 @@ torch = pytest.importorskip("torch")
 from console.session import ActionError, SimSession, ctr_drop_alert
 
 
-FAST = {"deploy_delay": 10, "epochs": 1}
+FAST = {"deploy_delay": 10, "epochs": 1, "spark_every": 0}
 
 
 def make(seed=3, **settings):
@@ -84,6 +84,9 @@ def test_retrain_serves_old_model_until_the_fixed_deploy_tick():
     models = s.models()
     assert models["rollback_target"] == 0
     assert models["versions"][0]["training_examples"] > 0
+
+    # The retrain ran the Spark feature job as its first stage.
+    assert s.spark_runs == 1 and s.last_spark_tick == 30
 
     # A second retrain while one is in flight is rejected, not queued.
     s.submit("retrain")
