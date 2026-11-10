@@ -378,7 +378,7 @@ ol.runbook { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction:
     lake: { name: "Data lake", tool: "DataLake", lane: "offline", real: "S3 with Parquet or Delta Lake", desc: "Long-term store of every event. Training data comes from here.",
       fields: [[null, "Retention (ticks)", "Not simulated", 20000]] },
     spark: { name: "Batch features", tool: "Spark", lane: "offline", real: "Apache Spark on a schedule (Airflow)", desc: "Recomputes offline features from the data lake on a schedule, and as the first stage of every retrain. Training reads these features; serving falls back to them when Redis has nothing for a user.",
-      fields: [["spark_every", "Run every (ticks)", "0 = off. Every retrain also runs it first"]] },
+      fields: [["spark_every", "Run every (ticks)", "0 = off. Every retrain also runs it first"], ["spark_throughput", "Throughput (events per tick)", "0 = instant. Otherwise a job takes events / throughput ticks, and grows with the data lake"], ["freshness_alert", "Freshness alert after (ticks)", "Incident when the last successful run is older than this"]] },
     ofs: { name: "Offline features", tool: "Feature store", lane: "offline", real: "Feast or Tecton offline store", desc: "Point-in-time snapshots, so training sees each feature as it was when the event happened.",
       fields: [[null, "Snapshots kept per user", "Not simulated", 3]] },
     train: { name: "Training", tool: "Two-tower", lane: "offline", real: "PyTorch jobs on a GPU cluster", desc: "Builds training data from shown slates (clicks are positives, unclicked shown movies are negatives) and trains the two-tower model in the background while serving continues.",
@@ -402,9 +402,9 @@ ol.runbook { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction:
       case "server": return p.server.fallback_share > 0 ? ["crit", `${pct(p.server.fallback_share, 0)} served by fallback`] : d.mismatch ? ["warn", `serving v${p.server.model_version}, index v${p.ann.index_version}`] : ["ok", `serving v${p.server.model_version} · top ${p.server.slate_size} of ${p.server.num_candidates}`];
       case "ann": return p.ann.self_test != null && p.ann.self_test < 0.7 ? ["crit", `self-test ${pct(p.ann.self_test, 0)} recall`] : d.mismatch ? ["crit", `embeddings v${p.ann.index_version}, model v${p.ann.model_version}`] : ["ok", `embeddings v${p.ann.index_version} · ${fmt(p.ann.items)} items`];
       case "lake": return ["ok", `${fmt(p.lake.events)} events`];
-      case "spark": return p.spark.last_run_tick == null ? ["info", p.spark.every ? `first run at t ${fmt(p.spark.every)}` : "never run"] : ["ok", `last run t ${fmt(p.spark.last_run_tick)}`];
+      case "spark": return p.spark.running ? ["warn", `running · done t ${fmt(p.spark.running.done_tick)}`] : p.spark.last_run_tick == null ? ["info", p.spark.every ? `first run at t ${fmt(p.spark.every)}` : "never run"] : ["ok", `last run t ${fmt(p.spark.last_run_tick)}`];
       case "ofs": return ["ok", `${fmt(p.ofs.users)} users · ${fmt(p.ofs.items)} items`];
-      case "train": return p.train ? [p.train.done ? "ok" : "warn", `v${p.train.version} ${p.train.done ? "trained, deploys" : "training, deploys"} t ${fmt(p.train.deploy_tick)}`] : ["ok", p.settings.retrain_every ? `every ${p.settings.retrain_every} ticks` : "idle"];
+      case "train": return p.train ? [p.train.done ? "ok" : "warn", p.train.stage === "features" ? `v${p.train.version} waiting for Spark features` : `v${p.train.version} ${p.train.done ? "trained, deploys" : "training, deploys"} t ${fmt(p.train.deploy_tick)}`] : ["ok", p.settings.retrain_every ? `every ${p.settings.retrain_every} ticks` : "idle"];
       case "registry": return ["ok", `${p.registry.versions} versions · v${p.registry.serving_version} live`];
       case "users": return ["ok", `${fmt(p.world.active_users)} active${p.world.waiting_users ? ` · ${fmt(p.world.waiting_users)} to join` : ""}${p.world.drifted_users ? ` · ${fmt(p.world.drifted_users)} drifts` : ""}`];
       case "chaos": return p.settings.chaos_every ? ["warn", `on · about every ${p.settings.chaos_every} ticks`] : ["info", "off"];
@@ -474,7 +474,7 @@ ol.runbook { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction:
           <p class="${d.mismatch ? "s-warn" : "muted"}" style="font-size:12px">${d.mismatch ? `ANN index still holds v${st.index_version} embeddings` : `index matches (v${st.index_version})`}</p>
           <div style="margin-top:12px">${target != null ? `<button class="btn primary" data-act="rollback">Roll back to v${target}</button>` : `<button class="btn" disabled>Roll back</button>`}</div></section>
         <section class="panel" style="flex:1 1 220px"><div class="label">Training</div><p class="mono" style="font-size:26px; margin-top:4px">${tr ? "v" + tr.version : "–"}</p>
-          <p class="muted" style="font-size:12px">${tr ? `${tr.done ? "Trained, waiting" : "Training"} · deploys at tick ${fmt(tr.deploy_tick)}${st.waiting_for_training ? " · clock waiting" : ""}` : "Idle"}</p>
+          <p class="muted" style="font-size:12px">${tr ? (tr.stage === "features" ? "Waiting for its Spark feature job" : `${tr.done ? "Trained, waiting" : "Training"} · deploys at tick ${fmt(tr.deploy_tick)}${st.waiting_for_training ? " · clock waiting" : ""}`) : "Idle"}</p>
           <div style="margin-top:12px"><button class="btn ${tr ? "" : "primary"}" data-act="retrain" ${tr ? "disabled" : ""}>Retrain now (${st.budget.retrain_cost} credits)</button></div></section>
         <section class="panel" style="flex:1 1 220px"><div class="label">Deploy policy</div><p style="margin-top:4px">Deploy ${S.pipe ? S.pipe.settings.deploy_delay : "N"} ticks after training starts</p>
           <p class="muted" style="font-size:12px; margin-top:4px">Index rebuild and schedules are set in Pipeline.</p>
@@ -502,6 +502,7 @@ ol.runbook { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction:
   function monitoring(d) {
     const st = d.st, ref = st ? st.reference : null;
     const fresh = S.pipe && S.pipe.spark.last_run_tick != null ? d.t - S.pipe.spark.last_run_tick : null;
+    const freshLimit = S.pipe ? S.pipe.settings.freshness_alert : 400;
     const deployTxt = d.lastDeploy.tick > 0 ? `${pct(d.sinceDeploy)} since v${d.lastDeploy.version} deploy (t ${fmt(d.lastDeploy.tick)}) · ${pct(d.beforeDeploy)} before` : `random list ${pct(ref && ref.random_ctr)} · perfect ${pct(ref && ref.oracle_ctr)}`;
     return `${toastHtml()}
       <div class="head"><div><h1>Monitoring</h1><p>Live health of the recommender: business metric first, then the system underneath it.</p></div>
@@ -510,7 +511,7 @@ ol.runbook { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction:
         <div class="tile"><span class="label">Online CTR (${S.window} ticks)</span><span class="big">${pct(d.ctr)}</span><span class="sub">${deployTxt}</span></div>
         <div class="tile"><span class="label">Active users</span><span class="big">${d.last ? d.last.active_users : "–"}<span class="muted" style="font-size:14px"> / tick</span></span><span class="sub">${st ? fmt(st.num_users) : "–"} users in the world</span></div>
         <div class="tile"><span class="label">Recommend latency</span><span class="big">${d.latP50 == null ? "–" : d.latP50.toFixed(1) + " ms"}</span><span class="sub">median of per-tick medians · p99 ${d.latP99 == null ? "–" : d.latP99.toFixed(1) + " ms"} · wall clock</span></div>
-        <div class="tile"><span class="label">Feature freshness</span><span class="big">${fresh == null ? "–" : fmt(fresh)}<span class="muted" style="font-size:14px"> ticks</span></span><span class="sub">${fresh == null ? "Spark job not run yet (Pipeline, Batch features)" : "since last Spark run"}</span></div>
+        <div class="tile"><span class="label">Feature freshness</span><span class="big ${fresh != null && fresh > freshLimit ? "s-crit" : ""}">${fresh == null ? "–" : fmt(fresh)}<span class="muted" style="font-size:14px"> ticks</span></span><span class="sub">${fresh == null ? "Spark job not run yet (Pipeline, Batch features)" : `since last successful Spark run · alert after ${fmt(freshLimit)}`}</span></div>
       </div>
       <section class="panel" aria-labelledby="ctr-h"><div class="head"><h2 id="ctr-h">Click-through rate</h2><span class="muted" style="font-size:12px">Share of shown ${S.pipe ? S.pipe.settings.slate_size : 10}-movie lists that got a click</span></div><div style="margin-top:20px">${ctrChart(d)}</div></section>
       <div class="row">

@@ -18,6 +18,8 @@ Kinds and what they break:
 - model_server_outage  Two-tower retrieval is down; the model server serves
                        its popularity fallback.
 - traffic_spike        Several times more users per tick.
+- spark_failure        Spark feature jobs fail (offline features go stale,
+                       retrains that need them are aborted).
 """
 
 from ml_system.ann import ANNIndex
@@ -31,6 +33,7 @@ FAULT_KINDS = {
     "index_id_mismatch": "ANN index returns wrong movie ids",
     "model_server_outage": "Two-tower retrieval down (serving fallback)",
     "traffic_spike": "Traffic spike",
+    "spark_failure": "Spark feature jobs failing",
 }
 
 # Which repair action ends which fault (see FaultInjector.fix).
@@ -199,6 +202,14 @@ class FaultInjector(Service):
 
         def undo():
             server.retriever_down = False
+        return undo
+
+    def _start_spark_failure(self, fault):
+        spark = self.system["spark"]
+        spark.failing = True
+
+        def undo():
+            spark.failing = False
         return undo
 
     def _start_traffic_spike(self, fault):

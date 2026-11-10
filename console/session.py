@@ -76,6 +76,8 @@ DEFAULT_SETTINGS = {
     "lag_alert": 150,          # incident when Flink's Kafka lag exceeds this
     "skew_alert_pct": 60,      # incident when online/offline feature skew exceeds this %
     "chaos_every": 0,          # a hidden random fault about every N ticks (0 = off)
+    "spark_throughput": 0,     # events a Spark job processes per tick (0 = instant)
+    "freshness_alert": 400,    # incident when offline features are older than this (ticks)
     # World (simulated users)
     "taste_drift_every": 0,    # every N ticks some users' taste drifts (0 = off)
     "taste_drift_share_pct": 5,
@@ -102,6 +104,8 @@ SETTING_LIMITS = {
     "lag_alert": (10, 1000000),
     "skew_alert_pct": (1, 100),
     "chaos_every": (0, 100000),
+    "spark_throughput": (0, 10000000),
+    "freshness_alert": (10, 100000),
     "taste_drift_every": (0, 100000),
     "taste_drift_share_pct": (1, 100),
     "fatigue_pct": (0, 90),
@@ -128,6 +132,7 @@ CHAOS_DURATIONS = {
     "index_id_mismatch": None,
     "model_server_outage": 120,
     "traffic_spike": 80,
+    "spark_failure": 300,
 }
 
 RUNBOOKS = {
@@ -159,6 +164,11 @@ RUNBOOKS = {
         "The canary served the new model to a share of users and lost to the current model with 95% confidence.",
         "It was rolled back automatically: only the canary users were affected.",
         "Compare the two versions on Models (training data, epochs, ranker) before trying again.",
+    ],
+    "freshness": [
+        "Offline features have not been recomputed for a long time: training and serving fallbacks use old data.",
+        "Check the Spark job on Pipeline (Batch features): is it scheduled, and do its runs fail?",
+        "If runs fail, wait for the cluster to recover, then run the job by hand.",
     ],
     "drift": [
         "What users click has shifted away from what the model was trained on.",
@@ -323,6 +333,7 @@ class SimSession:
 
         # Offline jobs
         self.last_spark_tick = None
+        self.spark_job = None
         self.spark_runs = 0
 
         # Budget, event log, incidents
@@ -337,7 +348,7 @@ class SimSession:
 
         # Monitoring: latest health readings, open incident per rule.
         self.health = {"index_self_test": None, "feature_skew": None, "flink_lag": 0,
-                       "fallback_share": 0.0, "coverage": None, "drift_psi": None}
+                       "fallback_share": 0.0, "coverage": None, "drift_psi": None, "feature_age": 0}
         self.fallback_ticks = {}         # tick -> (requests, fallback requests)
         self.open_rules = {}             # rule -> incident
         self.drift_reference = None      # genre mix of clicks just after the last deploy
@@ -428,6 +439,7 @@ class SimSession:
         r = self.retrain
         return (
             r is not None
+            and r["thread"] is not None
             and self.tick >= r["deploy_tick"]
             and not r["done"].is_set()
         )
@@ -457,7 +469,12 @@ class SimSession:
         now = self.tick
 
         # 1. A due deploy goes first, so actions at this boundary see it.
-        if self.retrain is not None and now >= self.retrain["deploy_tick"]:
+        # 0. A Spark job that is due finishes first (a retrain may be waiting).
+        if self.spark_job is not None and now >= self.spark_job["done_tick"]:
+            self._finish_spark()
+
+        if self.retrain is not None and self.retrain["thread"] is not None \
+                and now >= self.retrain["deploy_tick"]:
             self._finish_retrain()
 
         # 2. Player actions, in the order they were submitted.
@@ -474,7 +491,10 @@ class SimSession:
         s = self.settings
         self._chaos(now)
         if now > 0 and s["spark_every"] and now % s["spark_every"] == 0:
-            self._run_spark(by="schedule")
+            try:
+                self._run_spark(by="schedule")
+            except ActionError as error:
+                self._log("job", "Scheduled Spark run skipped: %s" % error, cls="s-warn")
         if now > 0 and s["retrain_every"] and now % s["retrain_every"] == 0:
             if self.retrain is not None:
                 self._log("train", "Scheduled retrain skipped: a training run is still in progress.", cls="s-warn")
@@ -567,21 +587,50 @@ class SimSession:
 
     # Spark -------------------------------------------------------------
 
-    def _run_spark(self, by, events=None, charge=True):
-        """Run the offline feature job (Spark) over the data lake. Every
-        retrain runs it too, as its first stage (charge=False: the retrain
-        cost covers it)."""
+    def _run_spark(self, by, events=None, charge=True, then=None):
+        """Start the offline feature job (Spark) over the data lake.
+
+        With spark_throughput 0 it finishes at once (the original
+        behaviour); otherwise it takes ceil(events / throughput) ticks and
+        its features land when it finishes. `then(ok)` runs at completion
+        (a retrain uses it to start training). Every retrain runs this as
+        its first stage (charge=False: the retrain cost covers it)."""
+        if self.spark_job is not None:
+            raise ActionError("a Spark job is already running (finishes at tick %d)" % self.spark_job["done_tick"])
         if events is None:
-            events = self.system["datalake"].events
-        self.system["spark"].run_offline_feature_job(events, self.offline.feature_pipeline)
-        self.last_spark_tick = self.tick
-        self.spark_runs += 1
+            events = list(self.system["datalake"].events)
+        throughput = self.settings["spark_throughput"]
+        duration = 0 if not throughput else max(1, -(-len(events) // throughput))
         if charge:
             self.budget_used += COST_SPARK
-        self._log("job", "Spark feature job ran over %d events (by %s)." % (len(events), by))
-        if self.logger is not None:
-            self.logger.log_event("spark", self.tick, events=len(events), by=by)
-        return "spark job finished"
+        self.spark_job = {"start": self.tick, "done_tick": self.tick + duration, "events": events,
+                          "by": by, "then": then}
+        if duration:
+            self._log("job", "Spark feature job started over %d events (by %s); finishes at tick %d."
+                      % (len(events), by, self.tick + duration))
+            return "spark job started, finishes at tick %d" % (self.tick + duration)
+        return self._finish_spark()
+
+    def _finish_spark(self):
+        job, self.spark_job = self.spark_job, None
+        events = job["events"]
+        try:
+            self.system["spark"].run_offline_feature_job(events, self.offline.feature_pipeline)
+            ok = True
+        except RuntimeError as error:
+            ok = False
+            self._log("job", "Spark feature job FAILED (by %s): %s" % (job["by"], error), cls="s-crit")
+            if self.logger is not None:
+                self.logger.log_event("spark_failed", self.tick, events=len(events), by=job["by"])
+        if ok:
+            self.last_spark_tick = self.tick
+            self.spark_runs += 1
+            self._log("job", "Spark feature job finished over %d events (by %s)." % (len(events), job["by"]))
+            if self.logger is not None:
+                self.logger.log_event("spark", self.tick, events=len(events), by=job["by"])
+        if job["then"] is not None:
+            job["then"](ok)
+        return "spark job finished" if ok else "spark job failed"
 
     # Retrain / deploy --------------------------------------------------
 
@@ -592,63 +641,81 @@ class SimSession:
             raise ActionError("not enough compute budget left for a retrain")
         if self.canary is not None:
             raise ActionError("a canary is running; promote or abort it first")
+        if self.spark_job is not None:
+            raise ActionError("a Spark job is running; retrain when it finishes (tick %d)" % self.spark_job["done_tick"])
+        if not any(type(e).__name__ == "RecommendationClickedEvent" for e in self.system["datalake"].events):
+            raise ActionError("no clicks to learn from yet; let the simulation run first")
 
         now = self.tick
         version = max(self.versions) + 1
         events = list(self.system["datalake"].events)
 
-        # Everything that reads shared state or uses the session RNGs runs
-        # here, on the clock thread at a tick boundary: offline features
-        # (a Spark job, the first stage of the training pipeline), the
-        # training set (negative sampling, shuffle) and the item features
-        # the new item tower will embed.
-        self._run_spark(by="retrain v%d" % version, events=events, charge=False)
-        generator = self.offline.dataset_generator
-        generator.negative_samples = self.settings["negatives"]
-        for order, event in enumerate(events):
-            generator.add_event(event, order)
-        training_data = generator.build()
-        if not training_data:
-            raise ActionError("no clicks to learn from yet; let the simulation run first")
-        items = _ItemFeatureSnapshot(self.offline.feature_pipeline.feature_store)
-
-        # Ranker rows (point-in-time lookups) are built here too; the fit
-        # itself runs in the background with the towers.
-        ranker_rows = None
-        if self.settings["ranker"]:
-            ranker_rows = LogisticRanker.training_rows_from(events, self.system["feature_store"])
-
         self.budget_used += COST_RETRAIN
-        deploy_tick = now + self.settings["deploy_delay"]
         record = {
             "version": version,
             "started_tick": now,
-            "deploy_tick": deploy_tick,
-            "training_examples": len(training_data),
+            "deploy_tick": now + self.settings["deploy_delay"],
+            "stage": "features",
+            "training_examples": None,
             "epochs": self.settings["epochs"],
             "negatives": self.settings["negatives"],
             "rebuild_index": self.settings["rebuild_index"],
-            "ranker_rows": ranker_rows,
+            "ranker": self.settings["ranker"],
+            "ranker_rows": None,
             "by": by,
             "done": threading.Event(),
             "result": None,
             "error": None,
             "thread": None,
         }
+        self.retrain = record
+        if self.logger is not None:
+            self.logger.log_event("retrain_start", now, model_version=version,
+                                  deploy_tick=record["deploy_tick"])
+        # Stage 1: offline features (Spark). Training starts when it ends.
+        self._run_spark(by="retrain v%d" % version, events=events, charge=False,
+                        then=lambda ok: self._features_ready(record, events, ok))
+        if record["stage"] == "features":
+            return "retrain v%d: waiting for the Spark job" % version
+        return "training v%d, deploys at tick %d" % (version, record["deploy_tick"])
+
+    def _features_ready(self, record, events, ok):
+        """Stage 2, at a tick boundary: build the training set and start the
+        background training. Everything that reads shared state or uses the
+        session RNGs happens here: the training set (negative sampling,
+        shuffle), the item features the new item tower will embed and the
+        ranker's point-in-time rows."""
+        version = record["version"]
+        if not ok:
+            self.retrain = None
+            self._log("train", "Retrain v%d aborted: its Spark feature job failed." % version, cls="s-crit")
+            return
+        generator = self.offline.dataset_generator
+        generator.negative_samples = record["negatives"]
+        for order, event in enumerate(events):
+            generator.add_event(event, order)
+        training_data = generator.build()
+        if not training_data:
+            self.retrain = None
+            self._log("train", "Retrain v%d aborted: no usable training examples." % version, cls="s-warn")
+            return
+        items = _ItemFeatureSnapshot(self.offline.feature_pipeline.feature_store)
+        if record["ranker"]:
+            record["ranker_rows"] = LogisticRanker.training_rows_from(events, self.system["feature_store"])
+
+        # A slow Spark job pushes the deploy back (deterministically).
+        record["deploy_tick"] = max(record["deploy_tick"], self.tick + 10)
+        record["training_examples"] = len(training_data)
+        record["stage"] = "training"
         thread = threading.Thread(
             target=self._train, args=(record, training_data, items),
             name="retrain-v%d" % version, daemon=True,
         )
         record["thread"] = thread
-        self.retrain = record
         thread.start()
-
         self._log("train", "Training v%d started on %d examples (%d epochs, %d negatives, by %s). Deploys at tick %d."
-                  % (version, len(training_data), record["epochs"], record["negatives"], by, deploy_tick), cls="s-accent")
-        if self.logger is not None:
-            self.logger.log_event("retrain_start", now, model_version=version,
-                                  training_examples=len(training_data), deploy_tick=deploy_tick)
-        return "training v%d, deploys at tick %d" % (version, deploy_tick)
+                  % (version, len(training_data), record["epochs"], record["negatives"], record["by"],
+                     record["deploy_tick"]), cls="s-accent")
 
     def _train(self, record, training_data, items):
         """Background thread: train, embed every movie, build the index.
@@ -1050,6 +1117,14 @@ class SimSession:
             catalog = self.system["world"].movie_objects
             h["coverage"] = len(set(shown)) / len(catalog) if shown else None
 
+            last = self.last_spark_tick if self.last_spark_tick is not None else 0
+            age = now - last
+            h["feature_age"] = age
+            self._rule("freshness", age > s["freshness_alert"], age <= s["freshness_alert"],
+                       "WARN", "Offline features %d ticks old" % age,
+                       "The last successful Spark feature job was at tick %d (alert after %d ticks)."
+                       % (last, s["freshness_alert"]))
+
             self._update_drift(now, catalog)
             psi = h["drift_psi"]
             self._rule("drift", psi is not None and psi > 0.2, psi is not None and psi < 0.1,
@@ -1188,7 +1263,11 @@ class SimSession:
                 "num_movies": len(self.system["world"].movie_objects),
                 "model_version": self.serving_version,
                 "index_version": self.index_version,
+                "spark_job": None if self.spark_job is None else {
+                    "start": self.spark_job["start"], "done_tick": self.spark_job["done_tick"],
+                    "events": len(self.spark_job["events"]), "by": self.spark_job["by"]},
                 "training": None if r is None else {
+                    "stage": r["stage"],
                     "version": r["version"],
                     "started_tick": r["started_tick"],
                     "deploy_tick": r["deploy_tick"],
@@ -1252,7 +1331,7 @@ class SimSession:
             r = self.retrain
             training = None
             if r is not None:
-                training = {k: r[k] for k in ("version", "started_tick", "deploy_tick",
+                training = {k: r[k] for k in ("version", "stage", "started_tick", "deploy_tick",
                                               "training_examples", "epochs", "negatives", "by")}
                 training["done"] = r["done"].is_set()
             return {
@@ -1304,10 +1383,13 @@ class SimSession:
                         "items": len(getattr(self.retriever.ann_index, "nodes", {}) or {})},
                 "lake": {"events": len(datalake.events)},
                 "spark": {"last_run_tick": self.last_spark_tick, "runs": self.spark_runs,
-                          "every": self.settings["spark_every"]},
+                          "every": self.settings["spark_every"],
+                          "running": None if self.spark_job is None else {
+                              "start": self.spark_job["start"], "done_tick": self.spark_job["done_tick"]}},
                 "ofs": {"users": len(store.user_features), "items": len(store.item_features)},
                 "train": None if r is None else {"version": r["version"], "started_tick": r["started_tick"],
-                                                 "deploy_tick": r["deploy_tick"], "done": r["done"].is_set()},
+                                                 "deploy_tick": r["deploy_tick"], "done": r["done"].is_set(),
+                                                 "stage": r["stage"]},
                 "registry": {"versions": len(self.versions), "serving_version": self.serving_version},
                 "redis_skew": self.health["feature_skew"],
                 "world": {"kind": self.world_kind, **self.dynamics.summary()},
