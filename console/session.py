@@ -739,8 +739,11 @@ class SimSession:
         if record["ranker"]:
             record["ranker_rows"] = LogisticRanker.training_rows_from(train_events, self.system["feature_store"])
 
-        # A slow Spark job pushes the deploy back (deterministically).
-        record["deploy_tick"] = max(record["deploy_tick"], self.tick + 10)
+        # A slow Spark job pushes the deploy back (deterministically): the
+        # training stage always gets at least min(10, deploy_delay) ticks.
+        if self.tick > record["started_tick"]:
+            delay = record["deploy_tick"] - record["started_tick"]
+            record["deploy_tick"] = max(record["deploy_tick"], self.tick + min(10, delay))
         record["training_examples"] = len(training_data)
         record["stage"] = "training"
         thread = threading.Thread(

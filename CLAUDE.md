@@ -39,7 +39,8 @@ Run notebooks from the repo root. `SimPipExp_quickstart.ipynb` is the reference 
 | World       | `world/*`                                                   |
 | Metrics     | `ml_system/evaluation.py`, `ml_system/metrics.py`, `dashboard/` |
 | Features    | `ml_system/flink.py`, `ml_system/offline_*`, `ml_system/features.py`, `TwoTowerRetrieval.retrieve` |
-| Performance | `ml_system/ann.py`, `ml_system/training.py`                 |
+| Performance | `ml_system/ann.py`, `ml_system/training.py`, `ml_system/ranking.py` |
+| Ops         | `ml_system/faults.py`, `ml_system/fallback.py`, `ml_system/experiments.py`, `ml_system/model_registry.py` |
 | Console     | `console/` (SimSession, API server, live UI), `SimPipExp_console.ipynb` |
 | Orchestrator| `pyproject.toml`, `tests/`, notebooks, this file; merges branches |
 
@@ -98,6 +99,7 @@ metrics, game scoring) uses that module. Don't redefine it elsewhere.
 | `user_tower_kwargs` | `{"use_id_embedding": False, "use_activity_features": False}` | Trained user tower inputs |
 | `item_tower_kwargs` | `{"use_id_embedding": False, "use_rating_feature": False}` | Trained item tower inputs |
 | `log_metrics`, `runs_dir`, `run_id` | `True`, `"runs"`, auto | Metrics log at `runs_dir/run_id/metrics.jsonl` |
+| `world_dynamics` | `None` (static world) | Dict: taste drift, users joining, fatigue, rewatch (see "Realism features"); `world.dynamics.DYNAMIC_WORLD` turns all on |
 
 The tower classes themselves default to every input on (so old checkpoints load); the
 defaults above are `two_tower.DEFAULT_USER_TOWER_KWARGS` / `DEFAULT_ITEM_TOWER_KWARGS`,
@@ -202,6 +204,74 @@ API (`console/server.py`; the UI uses nothing else):
 | `GET /api/incidents` | incidents opened by the alert rule |
 | `POST /api/play`, `/api/pause`, `/api/speed {speed}`, `/api/step {ticks}` | clock (step only while paused) |
 | `POST /api/retrain`, `/api/rollback`, `/api/spark`, `/api/settings {...}` | queued for the next tick boundary |
+| `GET /api/faults` | faults so far (hidden chaos faults only counted while active), fault kinds, repairs |
+| `POST /api/fault {kind, duration}`, `/api/repair/{restart_flink\|rebuild_index\|restart_model_server}` | drills and repairs, next tick boundary |
+| `POST /api/canary/promote`, `/api/canary/abort`, `/api/models/{v}/export` | canary control, model export |
+
+`GET /api/state` also carries `health` (lag, fallback share, index self-test, skew, coverage,
+drift PSI, feature age), `canary` (per-arm counts and the test) and `spark_job`.
+
+## Realism features (all opt-in)
+
+Everything below is off by default: a default build produces byte-identical events to
+the version before it (`tests/test_defaults_unchanged.py` holds a fingerprint taken on
+main). New randomness uses its own string-seeded RNGs (`random.Random("world-dynamics-<seed>")`,
+`"chaos-<seed>"`), never the shared seed stream, so switching a feature on never shifts
+another component's random draws.
+
+- **Changing world** (`world/dynamics.py`, `UserSimulator(fatigue=, rewatch=)`): taste drift
+  (every N ticks a share of users moves part of its taste to one genre), users joining over
+  time (`World.active_user_ids`, cold start), fatigue (each repeat impression of a movie
+  multiplies its click probability by `1 - fatigue`), no rewatching (`rewatch` multiplier for
+  movies watched in the simulation). `expected_click_rate` applies the same factors.
+  `reference_ctrs` is computed at build time and goes stale once tastes drift.
+- **Pipeline infra:** `OfflineFeatureStore` binary-search point-in-time lookups and
+  `clear_history()` (the offline pipeline clears before recomputing, so repeated Spark runs
+  no longer stack duplicate snapshots); `Kafka.poll(max_records=)`, `Kafka.lag(consumer)`;
+  `Flink.paused`, `Flink.max_events_per_tick` (lag builds up), `Flink.track_watched`;
+  `Redis.read_transforms` (fault hook); `Spark.failing`.
+- **Faults** (`ml_system/faults.py`): `FaultInjector` (a Service, registered last; a fault
+  starting at tick S is switched on at the end of tick S-1, or immediately via
+  `apply_due(now)`). Kinds: `flink_outage`, `feature_corruption` (serving reads rotated genre
+  preferences), `index_id_mismatch` (`RemappedIndex`: right neighbours, wrong ids),
+  `model_server_outage` (ModelServer serves `PopularityRetrieval`), `traffic_spike`,
+  `spark_failure`. Repairs: `restart_flink`, `rebuild_index`, `restart_model_server`.
+- **ModelServer** gained optional `fallback` + `retriever_down`, a `router(user_id) ->
+  (retriever, ranker)` for canaries, and applies `reranker` after `ranker` (all None by default).
+- **Ranking** (`ml_system/ranking.py`): `Ranker`/`Reranker` ABCs. `LogisticRanker` uses
+  ML-side features only (genre match from learned preferences, has-profile, log popularity,
+  rating) and is trained on logged slates under the cascade (positive = click, negatives =
+  movies shown above it; unclicked slates give negatives at every position) with slate
+  position as a feature fixed at serving (position debiasing). `WatchedFilter` drops
+  already-watched movies (needs `Flink.track_watched`). Seed 42, 10 users/tick, retrain at
+  400: CTR over the next 300 ticks 17.9% without the ranker, 23.6% with it.
+- **Experiments** (`ml_system/experiments.py`): stable hash bucketing (a new salt reshuffles
+  users independently), two-proportion z-test, per-arm counting from the event stream.
+- **Registry** (`ml_system/model_registry.py`): `export_bundle` / `load_bundle` (towers with
+  constructor config, index embeddings, ranker parameters, metadata).
+
+In the console (all live settings, applied at tick boundaries; see `console/session.py`
+`DEFAULT_SETTINGS`): `--world dynamic`, chaos (`chaos_every`: hidden seeded faults, revealed
+when they end) and drills, repair actions, `flink_capacity`, `ranker`, `filter_watched`,
+`canary_share`/`canary_ticks` (promote unless the canary loses with 95% confidence; 50% is an
+A/B test), `eval_gate` (newest `holdout_pct`% of events held out of training; both models
+scored by Recall@20 on its clicks; a model more than `gate_tolerance_pct`% worse is
+Rejected), `spark_throughput` (Spark jobs take events/throughput ticks; a retrain waits for
+its Spark stage), `freshness_alert`, export to `<run_dir>/models/vN`.
+
+Health checks and incident rules (`console/health.py`, `SimSession._monitor`): CTR drop at
+any time (rolling window vs the 4 windows before) and after a deploy, Flink lag
+(`lag_alert`), fallback share > 50%, ANN self-test (recall against exact search on stored
+item embeddings, alert < 70%; healthy trained indexes score ~85%), online/offline feature
+skew (`skew_alert_pct`), feature freshness, click-mix drift (PSI of the genre mix of clicks in
+the last 200 ticks vs the first 200 after the current deploy, so the model's own effect is
+not counted as drift; alert > 0.2). Each rule opens one incident with a runbook and
+resolves it when the condition clears; deploys mitigate CTR incidents only.
+
+Measured fault effects (seed 42, after one retrain, CTR ~20%): `index_id_mismatch` drops CTR
+to ~14% and fails the self-test; `feature_corruption` barely moves CTR but skew jumps to
+~96%; `flink_outage` builds ~1.9 lagged events per tick; `model_server_outage` *raised* CTR
+to ~26% (the popularity fallback beats an early two-tower model: see Known issues).
 
 ## Why CTR was flat (fixed)
 
@@ -241,7 +311,18 @@ result is unstable: the model collapses to a few dozen near-global slates.
 - `retrain()` recomputes offline features that the Spark job already computed.
 - Console: a stale index (`rebuild_index` off) does not visibly hurt CTR yet, because the
   trainer warm-starts from the previous towers, so v(n) user vectors still match v(n-1)
-  item vectors. The CTR-drop alert is unit-tested, but no built-in scenario reliably fires it.
-  Missions and data drift in the console are still mock.
+  item vectors. Faults (`index_id_mismatch`) now give the CTR alerts a real cause.
+  Missions are still mock.
+- Trained item embeddings are nearly collapsed (every pair has cosine > 0.92, ~250 distinct
+  vectors for 1682 movies: the trained item tower sees only genres). HNSW finds the exact
+  nearest neighbour for only ~85% of item queries on such an index (duplicates are pruned by
+  the neighbour heuristic); the console's index self-test threshold allows for it.
+- A popularity list beats the first retrained two-tower model online (~26% vs ~20%), so the
+  `model_server_outage` fault can raise CTR early in a game.
+- Canary statistics treat each slate as independent (users repeat), so the 95% intervals are
+  somewhat too narrow. The gate's Recall@20 ignores the ranker and, like all offline recall
+  here, mostly measures exposure.
+- Spark jobs and model bundles cannot be resumed after a server restart; only the metrics
+  log persists.
 - With `users_per_tick > 1`, every active user in a tick is served from the same model
   state; nothing models concurrency or latency yet.

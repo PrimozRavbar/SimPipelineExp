@@ -344,14 +344,15 @@ ol.runbook { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction:
   function missions(d) {
     return `${toastHtml()}
       <div class="head"><div><div class="label">Missions ${mock}</div><h1>Free play</h1>
-        <p>Missions are not connected to the simulation yet. Everything else in this console is live: the clock, CTR, models, pipeline settings and incidents come from the running simulation.</p></div></div>
+        <p>Scored missions are not built yet. Everything else in this console is live: the clock, CTR, models, canaries, pipeline settings, faults and incidents come from the running simulation.</p></div></div>
       <div class="row">
         <section class="panel" style="flex: 999 1 420px" aria-labelledby="obj-h">
           <div class="head"><h2 id="obj-h">Things to try</h2></div>
           <div class="objective"><span class="check"></span><span>Press play and watch CTR settle near the random-list line (the bootstrap model is untrained).</span></div>
-          <div class="objective"><span class="check"></span><span>Retrain on Models. Serving continues; the new model deploys ${d.st ? d.st.training ? "at tick " + fmt(d.st.training.deploy_tick) : "a fixed number of ticks later" : ""}.</span></div>
-          <div class="objective"><span class="check"></span><span>Turn off "Rebuild index on deploy" (Pipeline, ANN index), retrain, and see what a stale index does to CTR.</span></div>
-          <div class="objective"><span class="check"></span><span>When the CTR-drop alert opens an incident, roll back.</span></div>
+          <div class="objective"><span class="check"></span><span>Retrain on Models. Serving continues; the new model deploys ${d.st ? d.st.training ? "at tick " + fmt(d.st.training.deploy_tick) : "a fixed number of ticks later" : ""}. Then turn on the ranking stage (Pipeline, Model server) and retrain again.</span></div>
+          <div class="objective"><span class="check"></span><span>Ship safely: set a canary share on Pipeline, Model registry, and let the canary prove itself before it reaches everyone. Try the offline evaluation gate too.</span></div>
+          <div class="objective"><span class="check"></span><span>Run a drill (Pipeline, Chaos), find it from the health tiles and the incident, and fix it with the right repair.</span></div>
+          <div class="objective"><span class="check"></span><span>Turn on chaos and keep CTR up for 2,000 ticks without knowing what will break. Start the server with --world dynamic for users who drift, tire and keep arriving.</span></div>
           <div class="row" style="margin-top:12px; gap:8px">
             <button class="btn primary" data-act="go" data-v="monitoring">Open monitoring</button>
             <button class="btn" data-act="go" data-v="models">Open models</button>
