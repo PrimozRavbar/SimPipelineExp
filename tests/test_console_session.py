@@ -159,3 +159,18 @@ def test_background_clock_runs_and_pauses():
     time.sleep(0.3)
     assert paused_at >= 5 and s.tick == paused_at
     s.close()
+
+
+def test_ranker_setting_trains_and_serves_a_ranker():
+    s = make(ranker=True, filter_watched=True)
+    s.step(30)
+    s.submit("retrain")
+    s.step(12)
+    assert s.serving_version == 1
+    assert s.model_server.ranker is s.versions[1].ranker is not None
+    assert s.models()["versions"][0]["ranker_info"]["training_rows"] > 0
+    assert s.model_server.reranker is not None
+    s.submit("settings", ranker=False)
+    s.step(1)
+    assert s.model_server.ranker is None
+    s.close()

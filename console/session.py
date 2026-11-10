@@ -31,6 +31,7 @@ from console import health
 from ml_system.build_recommendation_system import build_recommendation_system
 from ml_system.faults import FAULT_KINDS, FIXES, FaultInjector
 from ml_system.metrics import reference_ctrs
+from ml_system.ranking import LogisticRanker, WatchedFilter
 from world.dynamics import DYNAMIC_WORLD
 from world.external_data_loader import load_movielens
 
@@ -57,6 +58,8 @@ DEFAULT_SETTINGS = {
     "slate_size": 10,
     "num_candidates": 100,
     "rebuild_index": True,     # rebuild the ANN index with the new item tower on deploy
+    "ranker": False,           # train and serve a ranking stage after retrieval
+    "filter_watched": False,   # drop movies the user already watched (re-ranker)
     # Alert rule: open an incident when rolling CTR drops more than
     # alert_drop_pct % within alert_ticks ticks after a deploy.
     "alert_drop_pct": 20,
@@ -97,7 +100,7 @@ SETTING_LIMITS = {
     "rewatch_pct": (0, 100),
     "users_joining_per_100_ticks": (0, 10000),
 }
-BOOL_SETTINGS = {"rebuild_index"}
+BOOL_SETTINGS = {"rebuild_index", "ranker", "filter_watched"}
 
 WORLDS = ("static", "dynamic")
 
@@ -166,8 +169,9 @@ class ActionError(ValueError):
 class ModelVersion:
     """One deployable model: user tower + item tower + ANN index."""
 
-    def __init__(self, version, user_tower, item_tower, index, **info):
+    def __init__(self, version, user_tower, item_tower, index, ranker=None, **info):
         self.version = version
+        self.ranker = ranker
         self.user_tower = user_tower
         self.item_tower = item_tower
         self.index = index
@@ -243,6 +247,7 @@ class SimSession:
         self.dynamics = self.system["world_dynamics"]
         self.simulator = self.system["world"].user_simulator
         self.flink = self.sim.get_service("Flink")
+        self.flink.track_watched = True      # for the watched-movies filter
         self.kafka = self.sim.get_service("Kafka")
 
         # Fault injection, registered last (after the metrics logger).
@@ -584,6 +589,12 @@ class SimSession:
             raise ActionError("no clicks to learn from yet; let the simulation run first")
         items = _ItemFeatureSnapshot(self.offline.feature_pipeline.feature_store)
 
+        # Ranker rows (point-in-time lookups) are built here too; the fit
+        # itself runs in the background with the towers.
+        ranker_rows = None
+        if self.settings["ranker"]:
+            ranker_rows = LogisticRanker.training_rows_from(events, self.system["feature_store"])
+
         self.budget_used += COST_RETRAIN
         deploy_tick = now + self.settings["deploy_delay"]
         record = {
@@ -594,6 +605,7 @@ class SimSession:
             "epochs": self.settings["epochs"],
             "negatives": self.settings["negatives"],
             "rebuild_index": self.settings["rebuild_index"],
+            "ranker_rows": ranker_rows,
             "by": by,
             "done": threading.Event(),
             "result": None,
@@ -634,7 +646,14 @@ class SimSession:
             index = HNSWIndex(seed=self.seed * 1000 + record["version"])
             index.build(embeddings)
 
-            record["result"] = (user_tower, item_tower, index)
+            ranker = None
+            if record["ranker_rows"] is not None:
+                rows, labels = record["ranker_rows"]
+                record["ranker_rows"] = None
+                ranker = LogisticRanker(self.retriever.user_features, self.system["feature_store"])
+                ranker.fit(rows, labels)
+
+            record["result"] = (user_tower, item_tower, index, ranker)
             record["train_seconds"] = round(time.monotonic() - started, 2)
         except Exception as error:  # surfaced in the log at deploy time
             record["error"] = repr(error)
@@ -653,9 +672,9 @@ class SimSession:
             self._log("train", "Training v%d failed: %s" % (version, record["error"]), cls="s-crit")
             return
 
-        user_tower, item_tower, index = record["result"]
+        user_tower, item_tower, index, ranker = record["result"]
         self.versions[version] = ModelVersion(
-            version, user_tower, item_tower, index,
+            version, user_tower, item_tower, index, ranker=ranker,
             started_tick=record["started_tick"],
             trained_tick=record["started_tick"],
             deployed_tick=None,
@@ -665,6 +684,11 @@ class SimSession:
             train_seconds=record.get("train_seconds"),
             recall_at_20=None,
             note="",
+            ranker_info=None if ranker is None else {
+                "training_rows": ranker.training_rows,
+                "click_rate": round(ranker.positive_rate, 4),
+                "weights": ranker.content_weights(),
+            },
         )
         if self.logger is not None:
             self.logger.log_event("retrain", now, model_version=version,
@@ -678,6 +702,7 @@ class SimSession:
         model = self.versions[version]
         self.retriever.user_tower = model.user_tower
         self.retriever.item_tower = model.item_tower
+        self.model_server.ranker = model.ranker if self.settings["ranker"] else None
         if rebuild_index:
             self.retriever.ann_index = model.index
             self.index_version = version
@@ -808,6 +833,8 @@ class SimSession:
         s = self.settings
         self.model_server.slate_size = s["slate_size"]
         self.model_server.num_candidates = s["num_candidates"]
+        self.model_server.ranker = self.versions[self.serving_version].ranker if s["ranker"] else None
+        self.model_server.reranker = WatchedFilter(self.system["redis"]) if s["filter_watched"] else None
         self.flink.max_events_per_tick = s["flink_capacity"] or None
         d = self.dynamics
         d.taste_drift_every = s["taste_drift_every"]

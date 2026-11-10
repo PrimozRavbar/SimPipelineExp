@@ -369,7 +369,8 @@ ol.runbook { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction:
     redis: { name: "Online features", tool: "Redis", lane: "online", real: "Redis behind a Feast or Tecton feature store", desc: "Fast feature lookups at serving time. Must hold the same features the model was trained on.",
       fields: [["skew_alert_pct", "Skew alert at (%)", "Online vs offline genre preferences of recently served users"], [null, "Feature TTL (ticks)", "Not simulated", 1000]] },
     server: { name: "Model server", tool: "ModelServer", lane: "online", real: "KServe, Triton or TorchServe", desc: "Embeds the user with the user tower, retrieves candidates from the ANN index and shows the top of the list.",
-      fields: [["num_candidates", "Retrieved candidates", "Pulled from the ANN index per request"], ["slate_size", "Slate size", "Movies the user actually sees"], [null, "Exploration rate", "Not simulated", 0.05]] },
+      fields: [["num_candidates", "Retrieved candidates", "Pulled from the ANN index per request"], ["slate_size", "Slate size", "Movies the user actually sees"], [null, "Exploration rate", "Not simulated", 0.05]],
+      toggles: [["ranker", "Ranking stage", "Re-order the candidates with a learned ranker (trained at the next retrain; position-debiased)"], ["filter_watched", "Filter watched movies", "Drop movies the user already watched before showing the slate"]] },
     ann: { name: "ANN index", tool: "HNSW", lane: "online", real: "FAISS, ScaNN or a vector database", desc: "Holds one embedding per movie, produced by the item tower. It must come from the same model version as the user tower, or user and movie vectors stop being comparable.",
       fields: [[null, "M (links per node)", "Not adjustable yet", 16], [null, "efSearch", "Not adjustable yet", 64]], toggles: [["rebuild_index", "Rebuild index on deploy", "Re-embed all movies with the new item tower. Off: the new user tower is served against the old index."]] },
     lake: { name: "Data lake", tool: "DataLake", lane: "offline", real: "S3 with Parquet or Delta Lake", desc: "Long-term store of every event. Training data comes from here.",
@@ -461,8 +462,9 @@ ol.runbook { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction:
       v.version === 0 ? "bootstrap" : `run-${String(v.version).padStart(2, "0")}`, `v${v.version}`,
       v.version === 0 ? "–" : fmt(v.started_tick), v.deploys.length ? v.deploys.map(fmt).join(", ") : "–",
       fmt(v.training_examples), v.epochs == null ? "–" : `${v.epochs} / ${v.negatives}`,
-      v.train_seconds == null ? "–" : v.train_seconds.toFixed(1) + " s", pct(v.online_ctr), v.stage]);
-    if (tr) rows.unshift([`run-${String(tr.version).padStart(2, "0")}`, `v${tr.version}`, fmt(tr.started_tick), `due t ${fmt(tr.deploy_tick)}`, fmt(tr.training_examples), `${tr.epochs} / ${tr.negatives}`, tr.done ? "done" : "running", "–", "Training"]);
+      v.train_seconds == null ? "–" : v.train_seconds.toFixed(1) + " s", pct(v.online_ctr), v.stage,
+      v.ranker_info ? `${fmt(v.ranker_info.training_rows)} rows · genre ${v.ranker_info.weights.genre_match} · pop ${v.ranker_info.weights.log_popularity}` : "–"]);
+    if (tr) rows.unshift([`run-${String(tr.version).padStart(2, "0")}`, `v${tr.version}`, fmt(tr.started_tick), `due t ${fmt(tr.deploy_tick)}`, fmt(tr.training_examples), `${tr.epochs} / ${tr.negatives}`, tr.done ? "done" : "running", "–", "Training", "–"]);
     return `${toastHtml()}
       <div class="head"><div><h1>Models</h1><p>Every model version stays in memory with its towers and ANN index. Retraining runs in the background while the current model keeps serving; the new one deploys a fixed number of ticks after training starts.</p></div></div>
       <div class="row">
@@ -477,8 +479,8 @@ ol.runbook { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction:
           <div style="margin-top:12px"><button class="btn" data-act="gonode" data-v="train">Change in Pipeline</button></div></section>
       </div>
       <section class="panel" aria-labelledby="runs-h"><div class="head"><h2 id="runs-h">Model versions</h2><span class="muted" style="font-size:12px">Online CTR: clicks / shown over the ticks this version served</span></div>
-        <div class="tablewrap" style="margin-top:8px"><table><thead><tr><th>Run</th><th>Model</th><th>Started (tick)</th><th>Deployed (tick)</th><th>Training examples</th><th>Epochs / negatives</th><th>Train time</th><th>Online CTR</th><th>Held-out Recall@20</th><th>Stage</th></tr></thead>
-        <tbody>${rows.map((r) => `<tr><td class="mono">${r[0]}</td><td class="mono">${r[1]}</td><td class="mono">${r[2]}</td><td class="mono">${r[3]}</td><td class="mono">${r[4]}</td><td class="mono">${r[5]}</td><td class="mono">${r[6]}</td><td class="mono">${r[7]}</td><td class="muted">pending</td><td><span class="pill ${pillFor(r[8])}">${r[8]}</span></td></tr>`).join("")}</tbody></table></div>
+        <div class="tablewrap" style="margin-top:8px"><table><thead><tr><th>Run</th><th>Model</th><th>Started (tick)</th><th>Deployed (tick)</th><th>Training examples</th><th>Epochs / negatives</th><th>Train time</th><th>Online CTR</th><th>Ranker</th><th>Held-out Recall@20</th><th>Stage</th></tr></thead>
+        <tbody>${rows.map((r) => `<tr><td class="mono">${r[0]}</td><td class="mono">${r[1]}</td><td class="mono">${r[2]}</td><td class="mono">${r[3]}</td><td class="mono">${r[4]}</td><td class="mono">${r[5]}</td><td class="mono">${r[6]}</td><td class="mono">${r[7]}</td><td class="mono muted" style="font-size:12px">${r[9]}</td><td class="muted">pending</td><td><span class="pill ${pillFor(r[8])}">${r[8]}</span></td></tr>`).join("")}</tbody></table></div>
         <p class="muted" style="margin-top:12px; font-size:12px">Held-out Recall@20 is pending: it needs a second training run per version, too slow to do live. Online CTR is the better signal here anyway (see CLAUDE.md, "Offline Recall@K mostly measures exposure").</p>
       </section>`;
   }
