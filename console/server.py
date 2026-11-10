@@ -16,6 +16,7 @@ GET  /api/faults                 faults so far (hidden chaos faults only counted
 POST /api/fault {"kind": k, "duration": n|null}     inject a fault drill at the next tick
 POST /api/repair/{action}        restart_flink | rebuild_index | restart_model_server
 POST /api/canary/promote | /api/canary/abort       end a running canary
+POST /api/models/{v}/export      save model v (towers, index, ranker) under <run_dir>/models/v<v>
 """
 
 from pathlib import Path
@@ -111,6 +112,10 @@ def create_app(session):
     @app.post("/api/settings")
     def settings(body: dict = Body(...)):
         return action("settings", **body)
+
+    @app.post("/api/models/{version}/export")
+    def export(version: int):
+        return action("export", version=version)
 
     @app.post("/api/canary/promote")
     def canary_promote():

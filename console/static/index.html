@@ -384,7 +384,8 @@ ol.runbook { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction:
     train: { name: "Training", tool: "Two-tower", lane: "offline", real: "PyTorch jobs on a GPU cluster", desc: "Builds training data from shown slates (clicks are positives, unclicked shown movies are negatives) and trains the two-tower model in the background while serving continues.",
       fields: [["retrain_every", "Retrain every (ticks)", "0 = only when you start one. Each retrain costs 40 credits"], ["epochs", "Epochs", ""], ["negatives", "Negatives per positive", "Sampled from the shown slate"], ["deploy_delay", "Deploy after (ticks)", "The new model serves this many ticks after training starts; the clock waits if training is slower"]] },
     registry: { name: "Model registry", tool: "Registry", lane: "offline", real: "MLflow Model Registry plus a deploy monitor", desc: "Keeps every model version in memory (towers and index) for roll back. Watches CTR after each deploy.",
-      fields: [["alert_drop_pct", "Alert: CTR drop (%)", "Opens an incident when rolling CTR falls this much"], ["alert_ticks", "Alert: within (ticks)", "How long after a deploy the rule watches"], ["alert_window", "Alert: window (ticks)", "Rolling window compared with the pre-deploy CTR"], ["canary_share", "Canary share (%)", "0 = deploy to everyone at once. 50 = an A/B test"], ["canary_ticks", "Canary length (ticks)", "Then promote, unless the canary is worse with 95% confidence"]] },
+      fields: [["alert_drop_pct", "Alert: CTR drop (%)", "Opens an incident when rolling CTR falls this much"], ["alert_ticks", "Alert: within (ticks)", "How long after a deploy the rule watches"], ["alert_window", "Alert: window (ticks)", "Rolling window compared with the pre-deploy CTR"], ["canary_share", "Canary share (%)", "0 = deploy to everyone at once. 50 = an A/B test"], ["canary_ticks", "Canary length (ticks)", "Then promote, unless the canary is worse with 95% confidence"], ["holdout_pct", "Gate: held-out events (%)", "Newest events kept out of training for the gate"], ["gate_tolerance_pct", "Gate: tolerance (%)", "Reject a model whose Recall@20 is this much below production's"]],
+      toggles: [["eval_gate", "Offline evaluation gate", "Score Recall@20 of the new and the production model on held-out clicks before deploying"]] },
     users: { name: "Users", tool: "World", lane: "world", real: "Your actual customers: their tastes change, they get bored, new ones sign up", desc: "The simulated users. A static world never changes; a dynamic one drifts, tires of repeats, and grows. Start the server with --world dynamic for the preset, or change these live.",
       fields: [["taste_drift_every", "Taste drift every (ticks)", "0 = off. Each time, some users' taste moves towards one genre"], ["taste_drift_share_pct", "Users drifting (%)", ""], ["fatigue_pct", "Fatigue (%)", "Click probability lost per repeat impression of the same movie"], ["rewatch_pct", "Rewatch (%)", "Click probability kept for a movie the user already watched"], ["users_joining_per_100_ticks", "New users per 100 ticks", "Only while some users haven't joined yet (dynamic world)"]] },
     chaos: { name: "Chaos", tool: "Fault injection", lane: "world", real: "Chaos engineering (game days, Chaos Monkey)", desc: "Hidden faults on a seeded schedule: you find them from symptoms (alerts, health tiles) and fix them. Or inject a known fault as a drill.",
@@ -459,20 +460,21 @@ ol.runbook { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction:
     const M = S.models, st = d.st;
     if (!M || !st) return `<p class="empty">Loading…</p>`;
     const tr = M.training, target = M.rollback_target;
-    const pillFor = (s) => s === "Production" ? "s-ok" : s === "Training" || s === "Canary" ? "s-accent" : "s-info";
+    const pillFor = (s) => s === "Production" ? "s-ok" : s === "Training" || s === "Canary" ? "s-accent" : s === "Rejected" ? "s-warn" : "s-info";
     const rows = M.versions.map((v) => [
       v.version === 0 ? "bootstrap" : `run-${String(v.version).padStart(2, "0")}`, `v${v.version}`,
       v.version === 0 ? "–" : fmt(v.started_tick), v.deploys.length ? v.deploys.map(fmt).join(", ") : "–",
       fmt(v.training_examples), v.epochs == null ? "–" : `${v.epochs} / ${v.negatives}`,
       v.train_seconds == null ? "–" : v.train_seconds.toFixed(1) + " s", pct(v.online_ctr), v.stage,
+      v.gate ? `${pct(v.gate.recall_at_20)} <span class="muted">vs v${v.gate.production_version} ${pct(v.gate.production_recall_at_20)}</span>` : '<span class="muted">pending</span>',
       v.ranker_info ? `${fmt(v.ranker_info.training_rows)} rows · genre ${v.ranker_info.weights.genre_match} · pop ${v.ranker_info.weights.log_popularity}` : "–"]);
-    if (tr) rows.unshift([`run-${String(tr.version).padStart(2, "0")}`, `v${tr.version}`, fmt(tr.started_tick), `due t ${fmt(tr.deploy_tick)}`, fmt(tr.training_examples), `${tr.epochs} / ${tr.negatives}`, tr.done ? "done" : "running", "–", "Training", "–"]);
+    if (tr) rows.unshift([`run-${String(tr.version).padStart(2, "0")}`, `v${tr.version}`, fmt(tr.started_tick), `due t ${fmt(tr.deploy_tick)}`, fmt(tr.training_examples), `${tr.epochs} / ${tr.negatives}`, tr.stage === "features" ? "Spark" : tr.done ? "done" : "running", "–", "Training", "–", "–"]);
     return `${toastHtml()}
       <div class="head"><div><h1>Models</h1><p>Every model version stays in memory with its towers and ANN index. Retraining runs in the background while the current model keeps serving; the new one deploys a fixed number of ticks after training starts.</p></div></div>
       <div class="row">
         <section class="panel" style="flex:1 1 220px"><div class="label">Production</div><p class="mono" style="font-size:26px; margin-top:4px">v${st.model_version}</p>
           <p class="${d.mismatch ? "s-warn" : "muted"}" style="font-size:12px">${d.mismatch ? `ANN index still holds v${st.index_version} embeddings` : `index matches (v${st.index_version})`}</p>
-          <div style="margin-top:12px">${target != null ? `<button class="btn primary" data-act="rollback">Roll back to v${target}</button>` : `<button class="btn" disabled>Roll back</button>`}</div></section>
+          <div class="row" style="margin-top:12px; gap:8px">${target != null ? `<button class="btn primary" data-act="rollback">Roll back to v${target}</button>` : `<button class="btn" disabled>Roll back</button>`}<button class="btn" data-act="export" data-v="${st.model_version}">Export v${st.model_version}</button></div></section>
         <section class="panel" style="flex:1 1 220px"><div class="label">Training</div><p class="mono" style="font-size:26px; margin-top:4px">${tr ? "v" + tr.version : "–"}</p>
           <p class="muted" style="font-size:12px">${tr ? (tr.stage === "features" ? "Waiting for its Spark feature job" : `${tr.done ? "Trained, waiting" : "Training"} · deploys at tick ${fmt(tr.deploy_tick)}${st.waiting_for_training ? " · clock waiting" : ""}`) : "Idle"}</p>
           <div style="margin-top:12px"><button class="btn ${tr ? "" : "primary"}" data-act="retrain" ${tr ? "disabled" : ""}>Retrain now (${st.budget.retrain_cost} credits)</button></div></section>
@@ -483,8 +485,8 @@ ol.runbook { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction:
       ${M.canary ? canaryPanel(M.canary) : ""}
       <section class="panel" aria-labelledby="runs-h"><div class="head"><h2 id="runs-h">Model versions</h2><span class="muted" style="font-size:12px">Online CTR: clicks / shown over the ticks this version served</span></div>
         <div class="tablewrap" style="margin-top:8px"><table><thead><tr><th>Run</th><th>Model</th><th>Started (tick)</th><th>Deployed (tick)</th><th>Training examples</th><th>Epochs / negatives</th><th>Train time</th><th>Online CTR</th><th>Ranker</th><th>Held-out Recall@20</th><th>Stage</th></tr></thead>
-        <tbody>${rows.map((r) => `<tr><td class="mono">${r[0]}</td><td class="mono">${r[1]}</td><td class="mono">${r[2]}</td><td class="mono">${r[3]}</td><td class="mono">${r[4]}</td><td class="mono">${r[5]}</td><td class="mono">${r[6]}</td><td class="mono">${r[7]}</td><td class="mono muted" style="font-size:12px">${r[9]}</td><td class="muted">pending</td><td><span class="pill ${pillFor(r[8])}">${r[8]}</span></td></tr>`).join("")}</tbody></table></div>
-        <p class="muted" style="margin-top:12px; font-size:12px">Held-out Recall@20 is pending: it needs a second training run per version, too slow to do live. Online CTR is the better signal here anyway (see CLAUDE.md, "Offline Recall@K mostly measures exposure").</p>
+        <tbody>${rows.map((r) => `<tr><td class="mono">${r[0]}</td><td class="mono">${r[1]}</td><td class="mono">${r[2]}</td><td class="mono">${r[3]}</td><td class="mono">${r[4]}</td><td class="mono">${r[5]}</td><td class="mono">${r[6]}</td><td class="mono">${r[7]}</td><td class="mono muted" style="font-size:12px">${r[10]}</td><td class="mono">${r[9]}</td><td><span class="pill ${pillFor(r[8])}">${r[8]}</span></td></tr>`).join("")}</tbody></table></div>
+        <p class="muted" style="margin-top:12px; font-size:12px">Held-out Recall@20 is computed when the offline evaluation gate is on (Pipeline, Model registry): the newest events are held out of training and both models are scored on their clicks. It mostly measures exposure (see CLAUDE.md), and it scores each model with its own fresh index, so it cannot catch a stale-index deploy. Online CTR is the final word.</p>
       </section>`;
   }
 
@@ -616,6 +618,7 @@ ol.runbook { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction:
       }
       case "spark": return call("/api/spark", {}, "Spark feature job queued for the next tick boundary.");
       case "retrain": return call("/api/retrain", {}, (r) => `Retrain queued at tick ${fmt(r.applies_at_tick)}. Serving continues; the new model deploys ${S.pipe ? S.pipe.settings.deploy_delay : "N"} ticks after it starts.` + (st && !st.playing ? " Press play." : ""));
+      case "export": return call(`/api/models/${v}/export`, {}, `Export of v${v} queued: it is written under the run directory at the next tick.`);
       case "canary": return call("/api/canary/" + v, {}, v === "promote" ? "Promotion queued for the next tick." : "Abort queued for the next tick.");
       case "repair": return call("/api/repair/" + v, {}, "Repair queued: it applies at the next tick boundary.");
       case "drill": return call("/api/fault", { kind: v, duration: 100 }, "Drill queued: the fault starts at the next tick. Watch Monitoring and Incidents.");

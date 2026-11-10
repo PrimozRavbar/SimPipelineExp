@@ -22,6 +22,7 @@ consistent state.
 
 import copy
 import random
+from pathlib import Path
 import statistics
 import threading
 import time
@@ -33,7 +34,8 @@ from ml_system.faults import FAULT_KINDS, FIXES, FaultInjector
 from ml_system.metrics import reference_ctrs
 from ml_system.experiments import Experiment
 from ml_system.ranking import LogisticRanker, WatchedFilter
-from ml_system.two_tower import TwoTowerRetrieval
+from ml_system.model_registry import export_bundle
+from ml_system.two_tower import USER_FEATURE_DEFAULTS, TwoTowerRetrieval
 from world.dynamics import DYNAMIC_WORLD
 from world.external_data_loader import load_movielens
 
@@ -66,6 +68,12 @@ DEFAULT_SETTINGS = {
     # canary_ticks ticks, then is promoted unless it is significantly worse.
     "canary_share": 0,
     "canary_ticks": 150,
+    # Offline evaluation gate: hold out the newest holdout_pct % of events,
+    # score Recall@20 of the new and the production model on their clicks,
+    # and refuse to deploy a model more than gate_tolerance_pct % worse.
+    "eval_gate": False,
+    "holdout_pct": 10,
+    "gate_tolerance_pct": 10,
     # Alert rule: open an incident when rolling CTR drops more than
     # alert_drop_pct % within alert_ticks ticks after a deploy.
     "alert_drop_pct": 20,
@@ -99,6 +107,8 @@ SETTING_LIMITS = {
     "alert_ticks": (10, 10000),
     "alert_window": (5, 1000),
     "canary_share": (0, 100),
+    "holdout_pct": (1, 50),
+    "gate_tolerance_pct": (0, 100),
     "canary_ticks": (10, 10000),
     "flink_capacity": (0, 100000),
     "lag_alert": (10, 1000000),
@@ -112,7 +122,7 @@ SETTING_LIMITS = {
     "rewatch_pct": (0, 100),
     "users_joining_per_100_ticks": (0, 10000),
 }
-BOOL_SETTINGS = {"rebuild_index", "ranker", "filter_watched"}
+BOOL_SETTINGS = {"rebuild_index", "ranker", "filter_watched", "eval_gate"}
 
 WORLDS = ("static", "dynamic")
 
@@ -509,7 +519,7 @@ class SimSession:
     # ------------------------------------------------------------------
 
     ACTIONS = ("retrain", "rollback", "spark", "settings", "fault",
-               "promote_canary", "abort_canary") + tuple(FIXES)
+               "promote_canary", "abort_canary", "export") + tuple(FIXES)
 
     def submit(self, name, **params):
         """Queue an action for the next tick boundary. Returns its record;
@@ -545,6 +555,8 @@ class SimSession:
             return self._drill(params["kind"], params.get("duration"))
         if name in FIXES:
             return self._fix(name)
+        if name == "export":
+            return self._export(params.get("version", self.serving_version))
         if name == "promote_canary":
             return self._end_canary(promote=True, by="you")
         if name == "abort_canary":
@@ -662,6 +674,12 @@ class SimSession:
             "rebuild_index": self.settings["rebuild_index"],
             "ranker": self.settings["ranker"],
             "ranker_rows": None,
+            "eval_gate": self.settings["eval_gate"],
+            "holdout_pct": self.settings["holdout_pct"],
+            "gate_tolerance_pct": self.settings["gate_tolerance_pct"],
+            "holdout": None,
+            "production": None,
+            "recall": None,
             "by": by,
             "done": threading.Event(),
             "result": None,
@@ -690,9 +708,27 @@ class SimSession:
             self.retrain = None
             self._log("train", "Retrain v%d aborted: its Spark feature job failed." % version, cls="s-crit")
             return
+        train_events = events
+        if record["eval_gate"]:
+            # Hold out the newest events: train on the rest, score both
+            # models on the held-out clicks (features as of each click).
+            split = int(len(events) * (1 - record["holdout_pct"] / 100.0))
+            train_events = events[:split]
+            store = self.system["feature_store"]
+            holdout = []
+            for order, event in enumerate(events[split:], start=split):
+                if type(event).__name__ != "RecommendationClickedEvent":
+                    continue
+                features = dict(store.get_user_features_as_of(event.user_id, event.timestamp, order)
+                                or USER_FEATURE_DEFAULTS)
+                features["user_id"] = event.user_id
+                holdout.append((features, event.movie_id))
+            record["holdout"] = holdout
+            record["production"] = self.versions[self.serving_version]
+
         generator = self.offline.dataset_generator
         generator.negative_samples = record["negatives"]
-        for order, event in enumerate(events):
+        for order, event in enumerate(train_events):
             generator.add_event(event, order)
         training_data = generator.build()
         if not training_data:
@@ -701,7 +737,7 @@ class SimSession:
             return
         items = _ItemFeatureSnapshot(self.offline.feature_pipeline.feature_store)
         if record["ranker"]:
-            record["ranker_rows"] = LogisticRanker.training_rows_from(events, self.system["feature_store"])
+            record["ranker_rows"] = LogisticRanker.training_rows_from(train_events, self.system["feature_store"])
 
         # A slow Spark job pushes the deploy back (deterministically).
         record["deploy_tick"] = max(record["deploy_tick"], self.tick + 10)
@@ -743,6 +779,13 @@ class SimSession:
                 ranker = LogisticRanker(self.retriever.user_features, self.system["feature_store"])
                 ranker.fit(rows, labels)
 
+            if record["holdout"]:
+                production = record["production"]
+                record["recall"] = (
+                    recall_at_k(user_tower, index, record["holdout"]),
+                    recall_at_k(production.user_tower, production.index, record["holdout"]),
+                )
+
             record["result"] = (user_tower, item_tower, index, ranker)
             record["train_seconds"] = round(time.monotonic() - started, 2)
         except Exception as error:  # surfaced in the log at deploy time
@@ -763,6 +806,13 @@ class SimSession:
             return
 
         user_tower, item_tower, index, ranker = record["result"]
+        gate = None
+        if record["recall"] is not None:
+            new_recall, prod_recall = record["recall"]
+            passed = new_recall >= prod_recall * (1 - record["gate_tolerance_pct"] / 100.0)
+            gate = {"recall_at_20": new_recall, "production_version": record["production"].version,
+                    "production_recall_at_20": prod_recall, "holdout_clicks": len(record["holdout"]),
+                    "passed": passed}
         self.versions[version] = ModelVersion(
             version, user_tower, item_tower, index, ranker=ranker,
             started_tick=record["started_tick"],
@@ -772,7 +822,8 @@ class SimSession:
             epochs=record["epochs"],
             negatives=record["negatives"],
             train_seconds=record.get("train_seconds"),
-            recall_at_20=None,
+            recall_at_20=None if gate is None else gate["recall_at_20"],
+            gate=gate,
             note="",
             ranker_info=None if ranker is None else {
                 "training_rows": ranker.training_rows,
@@ -786,6 +837,20 @@ class SimSession:
         self._log("train", "Training v%d finished (%d examples, %.1f s wall time)."
                   % (version, record["training_examples"], record.get("train_seconds") or 0), cls="s-accent")
         by = "auto" if record["by"] == "schedule" else record["by"]
+        if gate is not None:
+            self._log("train", "Gate: v%d Recall@20 %.1f%% vs v%d %.1f%% on %d held-out clicks: %s."
+                      % (version, gate["recall_at_20"] * 100, gate["production_version"],
+                         gate["production_recall_at_20"] * 100, gate["holdout_clicks"],
+                         "passed" if gate["passed"] else "REJECTED, not deployed"),
+                      cls="s-ok" if gate["passed"] else "s-warn")
+            if self.logger is not None:
+                self.logger.log_event("evaluation", now, model_version=version, k=20,
+                                      recall_at_k=gate["recall_at_20"],
+                                      production_recall_at_k=gate["production_recall_at_20"],
+                                      passed=gate["passed"])
+            if not gate["passed"]:
+                self.versions[version].info["rejected"] = True
+                return
         if self.settings["canary_share"] > 0:
             self._start_canary(version, by, record["rebuild_index"])
         else:
@@ -830,6 +895,20 @@ class SimSession:
             self.faults.fix("rebuild_index", self.tick)
 
         self._watch_deploy(previous)
+
+    def _export(self, version):
+        if version not in self.versions:
+            raise ActionError("no model version %r" % (version,))
+        if self.system["run_dir"] is None:
+            raise ActionError("this session has no run directory (metrics logging is off)")
+        model = self.versions[version]
+        directory = export_bundle(
+            Path(self.system["run_dir"]) / "models" / ("v%d" % version),
+            model.user_tower, model.item_tower, model.index, ranker=model.ranker,
+            metadata={"version": version, "seed": self.seed, "exported_tick": self.tick, **model.info},
+        )
+        self._log("registry", "Model v%d exported to %s." % (version, directory), cls="s-accent")
+        return str(directory)
 
     # Canary ------------------------------------------------------------
 
@@ -1326,7 +1405,8 @@ class SimSession:
                     "ticks_served": len(served_ticks),
                     "online_ctr": ctr,
                     "stage": "Production" if version == self.serving_version else (
-                        "Canary" if self.canary and self.canary["experiment"].treatment == version else "Archived"),
+                        "Canary" if self.canary and self.canary["experiment"].treatment == version else
+                        "Rejected" if model.info.get("rejected") else "Archived"),
                 })
             r = self.retrain
             training = None
@@ -1432,3 +1512,11 @@ def ctr_drop_alert(baseline, current, drop_pct):
 
 def _pct(value):
     return "–" if value is None else "%.1f%%" % (value * 100)
+
+
+def recall_at_k(user_tower, index, holdout, k=20):
+    """Share of held-out clicks whose movie is in the model's top k."""
+    if not holdout:
+        return None
+    hits = sum(movie_id in index.search(user_tower.embed(features), k) for features, movie_id in holdout)
+    return hits / len(holdout)
