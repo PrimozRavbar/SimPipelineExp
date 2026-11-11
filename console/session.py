@@ -57,6 +57,7 @@ DEFAULT_SETTINGS = {
     "deploy_delay": 50,        # ticks between retrain start and deploy
     # Training
     "epochs": 5,
+    "batched_training": True,  # train the towers a batch at a time (fast) or example by example
     "negatives": 5,            # sampled negatives per positive
     # Serving
     "slate_size": 10,
@@ -122,7 +123,7 @@ SETTING_LIMITS = {
     "rewatch_pct": (0, 100),
     "users_joining_per_100_ticks": (0, 10000),
 }
-BOOL_SETTINGS = {"rebuild_index", "ranker", "filter_watched", "eval_gate"}
+BOOL_SETTINGS = {"rebuild_index", "ranker", "filter_watched", "eval_gate", "batched_training"}
 
 WORLDS = ("static", "dynamic")
 
@@ -672,6 +673,7 @@ class SimSession:
             "training_examples": None,
             "epochs": self.settings["epochs"],
             "negatives": self.settings["negatives"],
+            "batched": self.settings["batched_training"],
             "rebuild_index": self.settings["rebuild_index"],
             "ranker": self.settings["ranker"],
             "ranker_rows": None,
@@ -764,6 +766,7 @@ class SimSession:
             started = time.monotonic()
             trainer = self.offline.trainer
             trainer.epochs = record["epochs"]
+            trainer.batched = record["batched"]
             trainer.train(training_data)
 
             user_tower = copy.deepcopy(trainer.user_tower).eval()
@@ -826,6 +829,7 @@ class SimSession:
             epochs=record["epochs"],
             negatives=record["negatives"],
             train_seconds=record.get("train_seconds"),
+            batched=record["batched"],
             recall_at_20=None if gate is None else gate["recall_at_20"],
             gate=gate,
             note="",
