@@ -53,6 +53,12 @@ class Flink(Service):
         self.track_recent = False
         self.recent = None
 
+        # track_item_signals: per-movie behaviour statistics and co-watching
+        # (ml_system.item_signals), published to Redis as
+        # ("item_signals", "all"). Needs shown slates (switches track_recent on).
+        self.track_item_signals = False
+        self.signals = None
+
         # profile_mode: how user genre profiles are built ("watches" = the
         # original, or "rich"; see features.update_genre_counts; the
         # offline pipeline uses the same). track_onboarding: also consume
@@ -77,10 +83,18 @@ class Flink(Service):
         kafka = sim.get_service("Kafka")
         self.processed_last_tick = 0
 
+        if self.track_item_signals and self.signals is None:
+            from ml_system.item_signals import ItemSignals
+            self.signals = ItemSignals()
+            sim.get_service("Redis").set("item_signals", "all", self.signals)
+            self.track_recent = True
+
         if self.track_recent and self.recent is None:
             from ml_system.ranking import RecentHistory
             self.recent = RecentHistory()
-            kafka.subscribe(self.consumer_name, "RecommendationShownEvent", from_end=True)
+            # From the start of the current tick: the World has already
+            # published this tick's slates before Flink runs.
+            kafka.subscribe(self.consumer_name, "RecommendationShownEvent", from_tick=sim.clock.now)
             self.topics = self.topics + ["RecommendationShownEvent"]
 
         if self.track_onboarding and not self._onboarding_subscribed:
@@ -99,6 +113,8 @@ class Flink(Service):
             start = sim.clock.now % len(topics)
             topics = topics[start:] + topics[:start]
 
+        signal_events = []
+
         for topic in topics:
 
             if budget is not None and budget <= 0:
@@ -114,6 +130,9 @@ class Flink(Service):
                 budget -= len(events)
 
             self.processed_last_tick += len(events)
+
+            if self.signals is not None:
+                signal_events.extend(events)
 
             for event in events:
 
@@ -135,6 +154,19 @@ class Flink(Service):
                             "recent_slates", event.user_id,
                             self.recent.add_slate(event.user_id, event.movie_ids))
 
+
+        if self.signals is not None and signal_events:
+            self.apply_signals(signal_events)
+
+    # Movie signals depend on event order (a click needs its slate first),
+    # so each tick's events are applied in the data lake's topic order,
+    # the order training replays them in.
+    SIGNAL_ORDER = {"RecommendationShownEvent": 0, "RecommendationClickedEvent": 1,
+                    "WatchEvent": 2, "RatingEvent": 3}
+
+    def apply_signals(self, events):
+        for event in sorted(events, key=lambda e: (e.timestamp, self.SIGNAL_ORDER.get(type(e).__name__, 4))):
+            self.signals.observe(event)
 
     def update_activity_level(self, sim, user_id):
 

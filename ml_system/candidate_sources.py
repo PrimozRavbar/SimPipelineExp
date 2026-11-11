@@ -67,3 +67,20 @@ def merge_candidates(primary, extras, k):
                     break
         position += 1
     return merged
+
+
+class CoWatchRetrieval(RetrievalService):
+    """'Because you watched X': movies most co-watched with the user's
+    recent watches (ml_system.item_signals, kept online by Flink with
+    track_item_signals). Users without watches get nothing from it."""
+
+    def __init__(self, redis):
+        super().__init__()
+        self.redis = redis
+
+    def retrieve(self, request):
+        signals = self.redis.get("item_signals", "all")
+        recent = self.redis.get("recent_watches", request.user_id) or []
+        if signals is None or not recent:
+            return []
+        return signals.neighbours(list(recent), request.k)

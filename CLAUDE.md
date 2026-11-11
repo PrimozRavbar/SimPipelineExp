@@ -349,6 +349,22 @@ another component's random draws.
   37.2% static (s1 37.6%) / 19.7% dynamic. Static stage report: oracle 68.8, best of all
   candidates 58.0, served 39.4: retrieval is now good, the ranker loses ~19 points because all
   its features are genre-based.
+- **Movie signals and co-watching** (`ml_system/item_signals.py`, rich-world phase B):
+  `ItemSignals` is one definition updated event by event, online by Flink
+  (`track_item_signals`, Redis `("item_signals", "all")`) and by a point-in-time replay in
+  training. Per movie: smoothed click rate, completion, rating, impressions and clicks over
+  expected clicks (COEC: clicks vs the average click rate of the slots it was shown in, a
+  position-debiased quality signal); co-watch similarity (count / sqrt(watches a x watches b)
+  over each user's last 20 watches). `MLPRanker(feature_set="v4")` = v3 + those + co-watch score
+  with the recent watches; `CoWatchRetrieval` ("because you watched X") is an extra candidate
+  source. Console: `ranker_signals`, `cowatch_candidates`. Rich world, on top of the best
+  genre-era stack (37.2% static / 19.7% dynamic): both 43.8% static (s1 41.1%, base 37.6%) and
+  26.0% dynamic; each alone +0.5 / -2.5 static. Flink applies each tick's events to the signals
+  in the data lake's topic order (shown, clicked, watch, rating): COEC needs a click's slate
+  first, and with Flink's own order (clicks before slates) online and training COEC differed,
+  a train/serve skew that dropped CTR to 29.7% until fixed (`tests/test_item_signals.py`
+  checks Flink's signals equal a replay of the log). `Kafka.subscribe(from_tick=T)`: Flink now
+  subscribes to slates from the start of the current tick (it used to miss that tick's slates).
 - **Experiments** (`ml_system/experiments.py`): stable hash bucketing (a new salt reshuffles
   users independently), two-proportion z-test, per-arm counting from the event stream.
 - **Registry** (`ml_system/model_registry.py`): `export_bundle` / `load_bundle` (towers with
@@ -357,7 +373,8 @@ another component's random draws.
 In the console (all live settings, applied at tick boundaries; see `console/session.py`
 `DEFAULT_SETTINGS`): `--world dynamic`, chaos (`chaos_every`: hidden seeded faults, revealed
 when they end) and drills, repair actions, `flink_capacity`, `ranker`, `filter_watched`,
-`ranker_mlp`, `ranker_genre_features`, `ranker_multitask`, `profile_candidates`, `rich_profiles`,
+`ranker_mlp`, `ranker_genre_features`, `ranker_multitask`, `ranker_signals`, `profile_candidates`,
+`cowatch_candidates`, `rich_profiles`,
 `onboarding`, `logq_correction`, `random_negatives`, `graded_positives`, `tower_history`,
 `train_from_scratch`,
 `diversity_pct`, `exploration_pct`, `batched_training`,

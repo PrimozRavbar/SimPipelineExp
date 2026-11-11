@@ -32,7 +32,7 @@ from console import health
 from ml_system.build_recommendation_system import build_recommendation_system
 from ml_system.faults import FAULT_KINDS, FIXES, FaultInjector
 from ml_system.metrics import reference_ctrs
-from ml_system.candidate_sources import ProfileRetrieval
+from ml_system.candidate_sources import CoWatchRetrieval, ProfileRetrieval
 from ml_system.experiments import Experiment
 from ml_system.ranking import (ExplorationReranker, LogisticRanker, MLPRanker, MMRReranker,
                                RerankerChain, WatchedFilter)
@@ -76,6 +76,8 @@ DEFAULT_SETTINGS = {
     "ranker_mlp": True,        # ranker model: MLP with cross/recent-history features (off: logistic)
     "ranker_genre_features": True,  # MLP also sees the taste match genre by genre (feature set v3)
     "ranker_multitask": False, # MLP also predicts watch completion; orders by p(click) x completion
+    "ranker_signals": False,   # MLP also sees movie signals from the logs: click rate, completion, rating, co-watching (v4)
+    "cowatch_candidates": 0,   # extra candidates co-watched with the user's recent watches (0 = off)
     # Personalisation
     "profile_candidates": 0,   # extra candidates from the user's genre profile (0 = two-tower only)
     "rich_profiles": False,    # profiles from clicks, watch completion and ratings, recent first
@@ -127,6 +129,7 @@ SETTING_LIMITS = {
     "alert_window": (5, 1000),
     "profile_candidates": (0, 100),
     "random_negatives": (0, 20),
+    "cowatch_candidates": (0, 100),
     "diversity_pct": (0, 100),
     "exploration_pct": (0, 50),
     "canary_share": (0, 100),
@@ -148,7 +151,7 @@ SETTING_LIMITS = {
 BOOL_SETTINGS = {"rebuild_index", "ranker", "ranker_mlp", "filter_watched", "eval_gate", "batched_training",
                  "ranker_genre_features", "rich_profiles", "onboarding",
                  "logq_correction", "graded_positives", "tower_history", "train_from_scratch",
-                 "ranker_multitask"}
+                 "ranker_multitask", "ranker_signals"}
 
 WORLDS = ("static", "dynamic")
 
@@ -711,7 +714,8 @@ class SimSession:
             "rebuild_index": self.settings["rebuild_index"],
             "ranker": self.settings["ranker"],
             "ranker_mlp": self.settings["ranker_mlp"],
-            "ranker_features": "v3" if self.settings["ranker_genre_features"] else "v2",
+            "ranker_features": ("v4" if self.settings["ranker_signals"] else
+                                "v3" if self.settings["ranker_genre_features"] else "v2"),
             "ranker_multitask": self.settings["ranker_multitask"],
             "logq_correction": self.settings["logq_correction"],
             "random_negatives": self.settings["random_negatives"],
@@ -1166,8 +1170,13 @@ class SimSession:
             # Second candidate source: content-based, from the genre profile.
             self.profile_source = ProfileRetrieval(self.retriever.user_features, self.system["feature_store"],
                                                    self.system["world"].movie_objects)
+        if getattr(self, "cowatch_source", None) is None:
+            self.cowatch_source = CoWatchRetrieval(self.system["redis"])
         self.model_server.extra_sources = (
-            [(self.profile_source, s["profile_candidates"])] if s["profile_candidates"] else [])
+            ([(self.profile_source, s["profile_candidates"])] if s["profile_candidates"] else [])
+            + ([(self.cowatch_source, s["cowatch_candidates"])] if s["cowatch_candidates"] else []))
+        if s["cowatch_candidates"] or (s["ranker"] and s["ranker_mlp"] and s["ranker_signals"]):
+            self.flink.track_item_signals = True   # stays on once switched on
         mode = "rich" if s["rich_profiles"] else "watches"
         self.flink.profile_mode = mode
         self.offline.feature_pipeline.profile_mode = mode

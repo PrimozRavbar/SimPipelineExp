@@ -280,13 +280,36 @@ def features_v3(user_features, recent_watches, recent_slates, item_features, mov
     return row + [cosine] + [share.get(g, 0.0) if g in genres else 0.0 for g in _v3_genres()]
 
 
+def features_v4(user_features, recent_watches, recent_slates, item_features, movie_id, genres_of,
+                signals=None):
+    """v3 + what the game's own logs say about the movie (click rate when
+    shown, completion, rating, impressions: quality) and how often it is
+    co-watched with the user's recent watches (hidden tastes). `signals` is
+    an ml_system.item_signals.ItemSignals (Flink's online one at serving,
+    a point-in-time replay in training)."""
+    row = features_v3(user_features, recent_watches, recent_slates, item_features, movie_id, genres_of)
+    if signals is None:
+        return row + [0.0, 0.5, 0.6, 0.0, 1.0, 0.0]
+    return row + signals.stats(movie_id) + [signals.cowatch_score(movie_id, recent_watches)]
+
+
 def feature_names(feature_set):
     if feature_set == "v2":
         return list(FEATURES_V2)
-    return list(FEATURES_V2) + ["profile_cosine"] + ["genre_%s" % g for g in _v3_genres()]
+    names = list(FEATURES_V2) + ["profile_cosine"] + ["genre_%s" % g for g in _v3_genres()]
+    if feature_set == "v4":
+        names += ["item_click_rate", "item_completion", "item_rating", "item_log_impressions",
+                  "item_coec", "cowatch_score"]
+    return names
 
 
-FEATURE_SETS = {"v2": features_v2, "v3": features_v3}
+FEATURE_SETS = {"v2": features_v2, "v3": features_v3, "v4": features_v4}
+
+
+def _build_row(feature_set, user, watches, slates, item, movie_id, genres_of, signals):
+    if feature_set == "v4":
+        return features_v4(user, watches, slates, item, movie_id, genres_of, signals=signals)
+    return FEATURE_SETS[feature_set](user, watches, slates, item, movie_id, genres_of)
 
 
 def _make_multitask_net():
@@ -348,9 +371,9 @@ class MLPRanker(Ranker):
         user_features = self.user_features_fn(user.user_id)
         watches = self.redis.get("recent_watches", user.user_id) or []
         slates = self.redis.get("recent_slates", user.user_id) or []
-        build = FEATURE_SETS[self.feature_set]
-        rows = [build(user_features, watches, slates, self.feature_store.get_item_features(m),
-                            m, self.genres_of) for m in candidates]
+        signals = self.redis.get("item_signals", "all") if self.feature_set == "v4" else None
+        rows = [_build_row(self.feature_set, user_features, watches, slates, self.feature_store.get_item_features(m),
+                            m, self.genres_of, signals) for m in candidates]
         with torch.no_grad():
             x = (torch.tensor(rows, dtype=torch.float32) - self.mean) / self.scale
             if self.multitask:
@@ -384,6 +407,10 @@ class MLPRanker(Ranker):
                     if rec is not None:
                         completion_of[rec] = e.completion
         history = RecentHistory()
+        signals = None
+        if feature_set == "v4":
+            from ml_system.item_signals import ItemSignals
+            signals = ItemSignals()
         rows, positions, labels, completions = [], [], [], []
         for event_order, event in enumerate(events):
             if isinstance(event, RecommendationShownEvent):
@@ -394,11 +421,13 @@ class MLPRanker(Ranker):
                 last = movie_ids.index(clicked) if clicked in movie_ids else len(movie_ids) - 1
                 for position, movie_id in enumerate(movie_ids[:last + 1]):
                     item = feature_store.get_item_features_as_of(movie_id, event.timestamp, event_order)
-                    rows.append(FEATURE_SETS[feature_set](user, watches, slates, item, movie_id, genres_of))
+                    rows.append(_build_row(feature_set, user, watches, slates, item, movie_id, genres_of, signals))
                     positions.append(min(position, POSITIONS - 1))
                     labels.append(1.0 if movie_id == clicked else 0.0)
                     completions.append(completion_of.get(event.recommendation_id) if movie_id == clicked else None)
             history.observe(event)
+            if signals is not None:
+                signals.observe(event)
         if with_completion:
             return rows, positions, labels, completions
         return rows, positions, labels
