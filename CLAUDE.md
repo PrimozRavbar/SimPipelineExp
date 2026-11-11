@@ -269,6 +269,29 @@ another component's random draws.
   diversity 60% 13.3%, exploration 10% 18.6% (catalog coverage 13.5% -> 23%); static world
   baseline 23.4%, diversity 30% 21.2%. Variety pays when users tire of repeats, costs when
   they don't, and too much always hurts.
+- **Personalisation** (all off by default):
+  - *Profile candidates* (`ml_system/candidate_sources.py`): `ProfileRetrieval` retrieves by
+    the user's learned genre profile (`genre_match`, ties by popularity) and
+    `ModelServer.extra_sources` merges it round-robin with the two-tower candidates.
+  - *Onboarding* (`World(onboarding={"genres": 3, "noise": 0.3})`): the first time a user is
+    active they declare favourite genres (`OnboardingEvent`, before their first slate; their
+    true top genres, each replaced by a random genre with probability `noise`; own RNG
+    `"onboarding-<seed>"`). Flink (`track_onboarding`) and the offline pipeline add
+    `ONBOARDING_WEIGHT` (2) per declared genre to the profile; the data lake stores them.
+  - *Rich profiles* (`ml_system/features.update_genre_counts`, one definition for Flink and
+    the offline pipeline): `profile_mode="rich"` counts clicks (0.5), watch completion and
+    ratings ((r-3)/2, floored at 0) with decay 0.97 per new signal. `"watches"` is the
+    original code path, untouched.
+  - *Per-genre ranker features* (`MLPRanker(feature_set="v3")`): v2 + profile cosine + one
+    taste-match feature per genre.
+
+  Seed 42, MLP ranker on, retrains at 400 and 800, CTR over ticks 852-1200 (after v2):
+  static world baseline 23.5% -> all four **48.5%** (seed 1: 19.0% -> 45.5%); dynamic world
+  22.2% -> 27.2% (29.3% with diversity 30%). Leaving one out of "all four" (static):
+  without profile candidates 24.6%, without onboarding 30.7%, without rich profiles 43.7%,
+  without per-genre features 45.6%. Onboarding is what gives every user a profile, and the
+  profile candidates are what put matching movies in front of the ranker; alone, each moves
+  CTR only a little.
 - **Experiments** (`ml_system/experiments.py`): stable hash bucketing (a new salt reshuffles
   users independently), two-proportion z-test, per-arm counting from the event stream.
 - **Registry** (`ml_system/model_registry.py`): `export_bundle` / `load_bundle` (towers with
@@ -277,7 +300,8 @@ another component's random draws.
 In the console (all live settings, applied at tick boundaries; see `console/session.py`
 `DEFAULT_SETTINGS`): `--world dynamic`, chaos (`chaos_every`: hidden seeded faults, revealed
 when they end) and drills, repair actions, `flink_capacity`, `ranker`, `filter_watched`,
-`ranker_mlp`, `diversity_pct`, `exploration_pct`, `batched_training`,
+`ranker_mlp`, `ranker_genre_features`, `profile_candidates`, `rich_profiles`, `onboarding`,
+`diversity_pct`, `exploration_pct`, `batched_training`,
 `canary_share`/`canary_ticks` (promote unless the canary loses with 95% confidence; 50% is an
 A/B test), `eval_gate` (newest `holdout_pct`% of events held out of training; both models
 scored by Recall@20 on its clicks; a model more than `gate_tolerance_pct`% worse is
@@ -347,6 +371,10 @@ result is unstable: the model collapses to a few dozen near-global slates.
   golden queries instead (`tests/test_faults.py` has the regression test).
 - A popularity list beats the first retrained two-tower model online (~26% vs ~20%), so the
   `model_server_outage` fault can raise CTR early in a game.
+- Switching `rich_profiles` mid-game: Flink keeps the counts it has and adds new signal in
+  the new mode, while the next Spark run recomputes every profile in the new mode, so online
+  and offline profiles differ until users have new activity (the skew tile shows it).
+- Demographics (age, gender, occupation) are still unused by the models.
 - Exploration's long-run benefit (better training data for later retrains) is not measured
   yet, and explored slots are not logged with their propensity, so training treats them
   like any other impression.
