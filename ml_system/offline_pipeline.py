@@ -7,7 +7,7 @@ from simulation.events import (
 )
 
 from simulation.events import OnboardingEvent
-from ml_system.features import update_genre_counts
+from ml_system.features import update_genre_counts, update_engagement, engagement_features, new_engagement_state
 from ml_system.features import (
     RatingFeatureComputer,
     ItemRatingFeatureComputer,
@@ -76,6 +76,10 @@ class OfflineFeaturePipeline:
     # see ml_system.features.update_genre_counts). Flink uses the same.
     profile_mode = "watches"
 
+    # engagement: also compute per-genre click-through ("genre_engagement")
+    # and "profile_strength" (ml_system.features); off by default.
+    engagement = False
+
     def process(self, events):
 
         # History is recomputed from the full event log below; start clean
@@ -125,9 +129,13 @@ class OfflineFeaturePipeline:
 
             user = user_features[user_id]
 
+            if self.engagement and "_engagement" not in user:
+                user["_engagement"] = new_engagement_state()
+                user["genre_engagement"], user["profile_strength"] = {}, 0.0
+
 
             # Snapshot BEFORE processing the current event.
-            user_snapshot = deepcopy(user)
+            user_snapshot = deepcopy({k: v for k, v in user.items() if k != "_engagement"})
 
             total = sum(
                 user_snapshot["genre_preferences"].values()
@@ -150,6 +158,19 @@ class OfflineFeaturePipeline:
 
             if isinstance(event, OnboardingEvent):
                 update_genre_counts(user["genre_preferences"], "onboarding", event.genres)
+
+            if self.engagement:
+                kind = {"RecommendationShownEvent": "shown", "RecommendationClickedEvent": "click",
+                        "WatchEvent": "watch", "OnboardingEvent": "onboarding"}.get(type(event).__name__)
+                if kind == "shown":
+                    update_engagement(user["_engagement"], kind,
+                                      [self.movie_objects[m].genres for m in event.movie_ids])
+                elif kind in ("click", "watch"):
+                    update_engagement(user["_engagement"], kind, self.movie_objects[event.movie_id].genres)
+                elif kind == "onboarding":
+                    update_engagement(user["_engagement"], kind, event.genres)
+                if kind:
+                    user["genre_engagement"], user["profile_strength"] = engagement_features(user["_engagement"])
 
             if hasattr(event, "movie_id"):
 
@@ -238,6 +259,8 @@ class OfflineFeaturePipeline:
 
         # Preserve latest feature API.
         for user_id, features in user_features.items():
+
+            features.pop("_engagement", None)
 
             total = sum(
                 features["genre_preferences"].values()

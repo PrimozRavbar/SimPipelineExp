@@ -89,3 +89,42 @@ def update_genre_counts(counts, kind, genres, mode="watches", value=None):
     for genre in genres:
         counts[genre] = max(0.0, counts.get(genre, 0) + weight)
     return True
+
+
+# ---------------------------------------------------------------------
+# Engagement features (skips): per genre, how often the user clicked when
+# shown a movie of that genre, and how much evidence their profile rests on.
+# One definition for Flink (online) and the offline pipeline (training).
+# ---------------------------------------------------------------------
+
+ENGAGEMENT_PRIOR = 3.0       # impressions of prior per genre
+ENGAGEMENT_PRIOR_RATE = 0.05
+
+
+def update_engagement(state, kind, genres_list):
+    """state: {"impressions": {g: n}, "clicks": {g: n}, "signals": n}.
+    kind "shown": genres_list = list of genre lists (one per slate movie);
+    kind "click" / "watch" / "onboarding": genres_list = one genre list."""
+    if kind == "shown":
+        for genres in genres_list:
+            for g in genres:
+                state["impressions"][g] = state["impressions"].get(g, 0) + 1
+        return
+    if kind == "click":
+        for g in genres_list:
+            state["clicks"][g] = state["clicks"].get(g, 0) + 1
+    if kind in ("click", "watch", "onboarding"):
+        state["signals"] = state.get("signals", 0) + 1
+
+
+def new_engagement_state():
+    return {"impressions": {}, "clicks": {}, "signals": 0}
+
+
+def engagement_features(state):
+    """(genre -> smoothed click-through, profile strength in [0, 1))."""
+    rates = {}
+    for g, shown in state["impressions"].items():
+        rates[g] = (state["clicks"].get(g, 0) + ENGAGEMENT_PRIOR * ENGAGEMENT_PRIOR_RATE) / (shown + ENGAGEMENT_PRIOR)
+    import math
+    return rates, math.tanh(math.log1p(state.get("signals", 0)) / 3.0)

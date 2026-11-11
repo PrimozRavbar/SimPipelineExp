@@ -52,11 +52,13 @@ class TwoTowerTrainer:
         self.seed = seed
         self.train_calls = 0
 
-        self.optimizer = torch.optim.Adam(
-            list(self.user_tower.parameters()) +
-            list(self.item_tower.parameters()),
-            lr=learning_rate
-        )
+        # Unique parameters: the towers may share a table (history_table).
+        params, seen = [], set()
+        for p in list(self.user_tower.parameters()) + list(self.item_tower.parameters()):
+            if id(p) not in seen:
+                seen.add(id(p))
+                params.append(p)
+        self.optimizer = torch.optim.Adam(params, lr=learning_rate)
 
 
     def train(self, training_data):

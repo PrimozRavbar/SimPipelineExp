@@ -41,7 +41,10 @@ class SimpleUserTower(nn.Module, UserTower):
         use_id_embedding=True,
         use_activity_features=True,
         use_history=False,
-        num_movies=None
+        num_movies=None,
+        use_engagement=False,
+        demographics=None,
+        history_table=None
     ):
         super().__init__()
 
@@ -54,17 +57,33 @@ class SimpleUserTower(nn.Module, UserTower):
         # so seeded initialisation is unchanged.
         self.use_history = use_history
         self.num_movies = num_movies
+        self.shared_history = use_history and history_table is not None
         if use_history:
             if not num_movies:
                 raise ValueError("use_history needs num_movies")
-            self.history_embedding = nn.Embedding(num_movies + 1, 16)
+            # history_table: share the item tower's movie embedding table
+            # (both towers then describe movies with the same vectors).
+            self.history_embedding = (history_table if history_table is not None
+                                      else nn.Embedding(num_movies + 1, 16))
+
+        # use_engagement: per-genre click-through ("genre_engagement") and
+        # "profile_strength" as inputs. demographics: fixed (users x D)
+        # table indexed by user id (ml_system.demographics). Both optional.
+        self.use_engagement = use_engagement
+        if demographics is not None:
+            self.register_buffer("demographics", demographics)
+        else:
+            self.demographics = None
+        extra = (len(genre_names) + 1 if use_engagement else 0) + (
+            demographics.shape[1] if demographics is not None else 0)
 
         self.user_embedding = nn.Embedding(
             num_users + 1,
             16
         )
 
-        input_dim = 16 + len(genre_names) + 5 + (16 if use_history else 0)
+        input_dim = 16 + len(genre_names) + 5 + (16 if use_history else 0) + (
+            extra if (use_engagement or demographics is not None) else 0)
 
         self.network = nn.Sequential(
             nn.Linear(input_dim, 128),
@@ -76,6 +95,24 @@ class SimpleUserTower(nn.Module, UserTower):
 
 
     def encode_features(self, user_features):
+
+        x = self._encode_with_history(user_features)
+        parts = [x]
+        if self.use_engagement:
+            rates = user_features.get("genre_engagement") or {}
+            parts.append(torch.tensor([float(rates.get(g, 0.0)) for g in genre_names]
+                                      + [float(user_features.get("profile_strength", 0.0) or 0.0)],
+                                      dtype=torch.float32))
+        if self.demographics is not None:
+            user_id = int(user_features["user_id"])
+            if 0 <= user_id < self.demographics.shape[0]:
+                parts.append(self.demographics[user_id])
+            else:
+                parts.append(torch.zeros(self.demographics.shape[1]))
+        return torch.cat(parts) if len(parts) > 1 else x
+
+
+    def _encode_with_history(self, user_features):
 
         if self.use_history:
             watches = [m for m in (user_features.get("recent_watches") or ())
@@ -208,7 +245,8 @@ class SimpleItemTower(nn.Module, ItemTower):
         embedding_dim=32,
         use_id_embedding=True,
         use_rating_feature=True,
-        use_popularity_feature=True
+        use_popularity_feature=True,
+        id_init_std=None
     ):
         super().__init__()
 
@@ -220,6 +258,10 @@ class SimpleItemTower(nn.Module, ItemTower):
             num_movies + 1,
             16
         )
+        # id_init_std: start the movie ID vectors small (e.g. 0.01) so movies
+        # the model has not learned about yet add little noise.
+        if id_init_std is not None:
+            nn.init.normal_(self.movie_embedding.weight, 0.0, id_init_std)
 
         input_dim = 16 + len(genre_names) + 2
 
@@ -346,6 +388,10 @@ DEFAULT_ITEM_TOWER_KWARGS = {"use_id_embedding": False, "use_rating_feature": Fa
 # pipeline's initial user state, so serving and training agree.
 USER_FEATURE_DEFAULTS = {
     "genre_preferences": {},
+    # Engagement (only when Flink / Spark compute them; towers without
+    # use_engagement ignore them).
+    "genre_engagement": {},
+    "profile_strength": 0.0,
     "average_rating": 0,
     "activity_level": 0,
     "watch_count": 0,

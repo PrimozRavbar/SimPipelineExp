@@ -67,6 +67,9 @@ DEFAULT_SETTINGS = {
     "graded_positives": False, # weight clicks by watch completion and rating
     "tower_history": False,    # user tower also sees the recent-watch history
     "train_from_scratch": False,  # new towers every retrain instead of continuing the last ones
+    "tower_engagement": False, # user tower sees per-genre click-through (skips) and profile strength
+    "tower_demographics": False,  # user tower sees age bracket, gender, occupation
+    "tower_shared_ids": False, # movie IDs in the movie tower, shared with the user's watch history
     "negatives": 5,            # sampled negatives per positive
     # Serving
     "slate_size": 10,
@@ -77,6 +80,7 @@ DEFAULT_SETTINGS = {
     "ranker_genre_features": True,  # MLP also sees the taste match genre by genre (feature set v3)
     "ranker_multitask": False, # MLP also predicts watch completion; orders by p(click) x completion
     "ranker_signals": False,   # MLP also sees movie signals from the logs: click rate, completion, rating, co-watching (v4)
+    "ranker_tower_score": False,  # MLP also sees the two-tower retrieval score (v5; needs ranker_signals)
     "cowatch_candidates": 0,   # extra candidates co-watched with the user's recent watches (0 = off)
     # Personalisation
     "profile_candidates": 0,   # extra candidates from the user's genre profile (0 = two-tower only)
@@ -151,7 +155,8 @@ SETTING_LIMITS = {
 BOOL_SETTINGS = {"rebuild_index", "ranker", "ranker_mlp", "filter_watched", "eval_gate", "batched_training",
                  "ranker_genre_features", "rich_profiles", "onboarding",
                  "logq_correction", "graded_positives", "tower_history", "train_from_scratch",
-                 "ranker_multitask", "ranker_signals"}
+                 "ranker_multitask", "ranker_signals", "tower_engagement", "tower_demographics",
+                 "tower_shared_ids", "ranker_tower_score"}
 
 WORLDS = ("static", "dynamic")
 
@@ -714,13 +719,17 @@ class SimSession:
             "rebuild_index": self.settings["rebuild_index"],
             "ranker": self.settings["ranker"],
             "ranker_mlp": self.settings["ranker_mlp"],
-            "ranker_features": ("v4" if self.settings["ranker_signals"] else
+            "ranker_features": ("v5" if self.settings["ranker_signals"] and self.settings["ranker_tower_score"] else
+                                "v4" if self.settings["ranker_signals"] else
                                 "v3" if self.settings["ranker_genre_features"] else "v2"),
             "ranker_multitask": self.settings["ranker_multitask"],
             "logq_correction": self.settings["logq_correction"],
             "random_negatives": self.settings["random_negatives"],
             "graded_positives": self.settings["graded_positives"],
-            "tower_history": self.settings["tower_history"],
+            "tower_history": self.settings["tower_history"] or self.settings["tower_shared_ids"],
+            "tower_engagement": self.settings["tower_engagement"],
+            "tower_demographics": self.settings["tower_demographics"],
+            "tower_shared_ids": self.settings["tower_shared_ids"],
             "train_from_scratch": self.settings["train_from_scratch"],
             "ranker_rows": None,
             "eval_gate": self.settings["eval_gate"],
@@ -788,9 +797,10 @@ class SimSession:
             return
         items = _ItemFeatureSnapshot(self.offline.feature_pipeline.feature_store)
         if record["ranker"] and record["ranker_mlp"]:
+            record["ranker_inputs"] = [] if record["ranker_features"] == "v5" else None
             record["ranker_rows"] = MLPRanker.training_rows_from(
                 train_events, self.system["feature_store"], self._genres_of, record["ranker_features"],
-                with_completion=record["ranker_multitask"])
+                with_completion=record["ranker_multitask"], inputs=record["ranker_inputs"])
         elif record["ranker"]:
             record["ranker_rows"] = LogisticRanker.training_rows_from(train_events, self.system["feature_store"])
 
@@ -817,8 +827,8 @@ class SimSession:
         try:
             started = time.monotonic()
             trainer = self.offline.trainer
-            if record["train_from_scratch"] or \
-                    getattr(trainer.user_tower, "use_history", False) != record["tower_history"]:
+            current = getattr(trainer, "tower_signature", (False, False, False, False))
+            if record["train_from_scratch"] or current != self._tower_signature(record):
                 trainer = self.offline.trainer = self._fresh_trainer(record)
             trainer.epochs = record["epochs"]
             trainer.batched = record["batched"] or bool(
@@ -849,6 +859,9 @@ class SimSession:
                                    seed=self.seed * 1000 + record["version"],
                                    feature_set=record["ranker_features"],
                                    multitask=record["ranker_multitask"])
+                if record["ranker_features"] == "v5":
+                    ranker.set_towers(user_tower, embeddings)
+                    ranker.fill_tower_scores(rows, record.pop("ranker_inputs"))
                 ranker.fit(rows, positions, labels, rest[0] if rest else None)
             elif record["ranker_rows"] is not None:
                 rows, labels = record["ranker_rows"]
@@ -1175,6 +1188,9 @@ class SimSession:
         self.model_server.extra_sources = (
             ([(self.profile_source, s["profile_candidates"])] if s["profile_candidates"] else [])
             + ([(self.cowatch_source, s["cowatch_candidates"])] if s["cowatch_candidates"] else []))
+        if s["tower_engagement"]:
+            self.flink.track_engagement = True       # stays on once switched on
+        self.offline.feature_pipeline.engagement = s["tower_engagement"]
         if s["cowatch_candidates"] or (s["ranker"] and s["ranker_mlp"] and s["ranker_signals"]):
             self.flink.track_item_signals = True   # stays on once switched on
         mode = "rich" if s["rich_profiles"] else "watches"
@@ -1346,6 +1362,11 @@ class SimSession:
         self.health["drift_psi"] = health.genre_psi(self.drift_reference,
                                                     health.genre_distribution(recent, catalog))
 
+    @staticmethod
+    def _tower_signature(record):
+        return (record["tower_history"], record["tower_engagement"], record["tower_demographics"],
+                record["tower_shared_ids"])
+
     def _fresh_trainer(self, record):
         """New towers (and optimizer) for this retrain, seeded from the
         session seed and the version, with or without the history input."""
@@ -1356,11 +1377,23 @@ class SimSession:
         num_movies = len(self.system["world"].movie_objects)
         with torch.random.fork_rng(devices=[]):
             torch.manual_seed(self.seed * 1000 + record["version"])
+            item_kwargs = dict(self.system["item_tower_kwargs"])
+            if record["tower_shared_ids"]:
+                item_kwargs.update(use_id_embedding=True, id_init_std=0.01)
+            item = SimpleItemTower(num_movies=num_movies, **item_kwargs)
+            demographics = None
+            if record["tower_demographics"]:
+                from ml_system.demographics import demographics_table
+                demographics = demographics_table(self.system["world"].user_objects)
             user = SimpleUserTower(num_users=len(self.system["world"].user_objects),
-                                   use_history=record["tower_history"], num_movies=num_movies, **user_kwargs)
-            item = SimpleItemTower(num_movies=num_movies, **self.system["item_tower_kwargs"])
-        return TwoTowerTrainer(user, item, epochs=old.epochs, temperature=old.temperature,
-                               batch_size=old.batch_size, batched=old.batched)
+                                   use_history=record["tower_history"], num_movies=num_movies,
+                                   use_engagement=record["tower_engagement"], demographics=demographics,
+                                   history_table=item.movie_embedding if record["tower_shared_ids"] else None,
+                                   **user_kwargs)
+        trainer = TwoTowerTrainer(user, item, epochs=old.epochs, temperature=old.temperature,
+                                  batch_size=old.batch_size, batched=old.batched)
+        trainer.tower_signature = self._tower_signature(record)
+        return trainer
 
     def _genres_of(self, movie_id):
         return self.system["world"].movie_objects[movie_id].genres

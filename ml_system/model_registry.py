@@ -52,7 +52,11 @@ def tower_config(tower):
                 "embedding_dim": out_dim, "use_id_embedding": tower.use_id_embedding,
                 "use_activity_features": tower.use_activity_features,
                 "use_history": getattr(tower, "use_history", False),
-                "num_movies": getattr(tower, "num_movies", None)}
+                "num_movies": getattr(tower, "num_movies", None),
+                "use_engagement": getattr(tower, "use_engagement", False),
+                "demographics_shape": (list(tower.demographics.shape)
+                                       if getattr(tower, "demographics", None) is not None else None),
+                "shared_history": bool(getattr(tower, "shared_history", False))}
     if name == "SimpleItemTower":
         return {"class": name, "num_movies": tower.movie_embedding.num_embeddings - 1,
                 "embedding_dim": out_dim, "use_id_embedding": tower.use_id_embedding,
@@ -100,12 +104,20 @@ def load_bundle(directory, index_seed=0):
 
     directory = Path(directory)
     towers = torch.load(directory / "towers.pt", weights_only=False)
+    import torch as _torch
+
     built = {}
-    for key, cls in (("user_tower", SimpleUserTower), ("item_tower", SimpleItemTower)):
+    for key, cls in (("item_tower", SimpleItemTower), ("user_tower", SimpleUserTower)):
         config = dict(towers[key]["config"])
         config.pop("class")
+        shape = config.pop("demographics_shape", None)
+        shared = config.pop("shared_history", False)
+        if shape:
+            config["demographics"] = _torch.zeros(*shape)
+        if shared:
+            config["history_table"] = built["item_tower"].movie_embedding
         tower = cls(**config)
-        tower.load_state_dict(towers[key]["state"])
+        tower.load_state_dict(towers[key]["state"], strict=not shared)
         built[key] = tower.eval()
 
     embeddings = {int(k): v for k, v in json.loads((directory / "index.json").read_text()).items()}

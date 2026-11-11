@@ -6,7 +6,7 @@ from simulation.events import (
     RatingEvent,
 )
 from simulation.events import OnboardingEvent
-from .features import update_genre_counts
+from .features import update_genre_counts, update_engagement, engagement_features, new_engagement_state
 from .features import (
     RatingFeatureComputer,
     ItemRatingFeatureComputer,
@@ -59,6 +59,12 @@ class Flink(Service):
         self.track_item_signals = False
         self.signals = None
 
+        # track_engagement: per-genre click-through and profile strength
+        # (features.update_engagement), published as "genre_engagement" and
+        # "profile_strength". Needs shown slates (switches track_recent on).
+        self.track_engagement = False
+        self.engagement = {}
+
         # profile_mode: how user genre profiles are built ("watches" = the
         # original, or "rich"; see features.update_genre_counts; the
         # offline pipeline uses the same). track_onboarding: also consume
@@ -87,6 +93,9 @@ class Flink(Service):
             from ml_system.item_signals import ItemSignals
             self.signals = ItemSignals()
             sim.get_service("Redis").set("item_signals", "all", self.signals)
+            self.track_recent = True
+
+        if self.track_engagement:
             self.track_recent = True
 
         if self.track_recent and self.recent is None:
@@ -135,6 +144,9 @@ class Flink(Service):
                 signal_events.extend(events)
 
             for event in events:
+
+                if self.track_engagement:
+                    self.update_engagement(sim, event)
 
                 if isinstance(event, RecommendationClickedEvent):
                     self.handle_recommendation_clicked(sim, event)
@@ -219,6 +231,23 @@ class Flink(Service):
                 "user_id": user_id,
                 "value": {genre: count / total for genre, count in counts.items()},
             })
+
+    def update_engagement(self, sim, event):
+        kind = {"RecommendationShownEvent": "shown", "RecommendationClickedEvent": "click",
+                "WatchEvent": "watch", "OnboardingEvent": "onboarding"}.get(type(event).__name__)
+        if kind is None:
+            return
+        state = self.engagement.setdefault(event.user_id, new_engagement_state())
+        if kind == "shown":
+            update_engagement(state, kind, [self.movie_genres(sim, m) for m in event.movie_ids])
+        elif kind == "onboarding":
+            update_engagement(state, kind, event.genres)
+        else:
+            update_engagement(state, kind, self.movie_genres(sim, event.movie_id))
+        rates, strength = engagement_features(state)
+        redis = sim.get_service("Redis")
+        redis.set("genre_engagement", event.user_id, rates)
+        redis.set("profile_strength", event.user_id, strength)
 
     def movie_genres(self, sim, movie_id):
         return sim.get_service("World").movie_objects[movie_id].genres

@@ -365,6 +365,23 @@ another component's random draws.
   a train/serve skew that dropped CTR to 29.7% until fixed (`tests/test_item_signals.py`
   checks Flink's signals equal a replay of the log). `Kafka.subscribe(from_tick=T)`: Flink now
   subscribes to slates from the start of the current tick (it used to miss that tick's slates).
+- **Two-tower inputs for the rich world** (all off by default; a change of tower inputs gives
+  the next retrain fresh, seeded towers): `SimpleUserTower(use_engagement=True)` (per-genre
+  click-through "genre_engagement" = skips, and "profile_strength"; `features.update_engagement`
+  is one definition for Flink `track_engagement` and the offline pipeline `engagement`),
+  `demographics=` (fixed table from `ml_system/demographics.py`: age bracket, gender,
+  occupation), `history_table=` (the item tower's movie ID table shared with the watch history;
+  `SimpleItemTower(id_init_std=0.01)` starts movie IDs small). Console: `tower_engagement`,
+  `tower_demographics`, `tower_shared_ids`. Rich world, on top of signals + co-watch (43.8%
+  static / 26.0% dynamic): engagement 39.3 / 22.8, demographics 39.5 / 26.8, shared IDs
+  42.5 / 22.3, all three 39.4 / 24.2. They raise the quality of the two-tower candidates (best
+  10 up to 60.1 vs ~55) but not served CTR: in the rich world the ranker is the bottleneck.
+- **Retrieval score as a ranker feature** (`MLPRanker(feature_set="v5")`, console
+  `ranker_tower_score`, experimental, off): v4 + user vector . movie vector. Known label
+  leakage: training rows are scored by towers trained on those same clicks, so the score looks
+  far more predictive in training than at serving. Alone 41.7 / 25.3 (vs 43.8 / 26.0); with
+  the richer towers (which memorise more) 29.0 / 15.2. The fix is to log the score at serving
+  time and train the ranker on logged values (not built yet).
 - **Experiments** (`ml_system/experiments.py`): stable hash bucketing (a new salt reshuffles
   users independently), two-proportion z-test, per-arm counting from the event stream.
 - **Registry** (`ml_system/model_registry.py`): `export_bundle` / `load_bundle` (towers with
@@ -373,7 +390,8 @@ another component's random draws.
 In the console (all live settings, applied at tick boundaries; see `console/session.py`
 `DEFAULT_SETTINGS`): `--world dynamic`, chaos (`chaos_every`: hidden seeded faults, revealed
 when they end) and drills, repair actions, `flink_capacity`, `ranker`, `filter_watched`,
-`ranker_mlp`, `ranker_genre_features`, `ranker_multitask`, `ranker_signals`, `profile_candidates`,
+`ranker_mlp`, `ranker_genre_features`, `ranker_multitask`, `ranker_signals`, `ranker_tower_score`,
+`tower_engagement`, `tower_demographics`, `tower_shared_ids`, `profile_candidates`,
 `cowatch_candidates`, `rich_profiles`,
 `onboarding`, `logq_correction`, `random_negatives`, `graded_positives`, `tower_history`,
 `train_from_scratch`,
