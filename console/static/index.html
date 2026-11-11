@@ -174,10 +174,18 @@ ol.runbook { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction:
   const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
   // ---------- API ----------
+  // Every request times out, so one stuck request can never freeze the
+  // screen (it used to wait for the browser to give up, up to minutes).
+  const TIMEOUT_MS = 5000;
   async function get(path) {
-    const r = await fetch(path, { cache: "no-store" });
-    if (!r.ok) throw new Error(path + ": HTTP " + r.status);
-    return r.json();
+    const ctrl = new AbortController(), timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
+    try {
+      const r = await fetch(path, { cache: "no-store", signal: ctrl.signal });
+      if (!r.ok) throw new Error(path + ": HTTP " + r.status);
+      return await r.json();
+    } catch (e) {
+      throw e.name === "AbortError" ? new Error("no answer from the server within " + TIMEOUT_MS / 1000 + " s") : e;
+    } finally { clearTimeout(timer); }
   }
   async function post(path, body) {
     const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
@@ -191,11 +199,11 @@ ol.runbook { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction:
     if (polling) return; polling = true;
     try {
       const lastTick = S.rows.length ? S.rows[S.rows.length - 1].tick : 0;
-      const [st, m, ev, inc, models, pipe] = await Promise.all([
-        get("/api/state"), get("/api/metrics?since=" + lastTick), get("/api/events?since=" + S.logSeq),
-        get("/api/incidents"), get("/api/models"), get("/api/pipeline")
-      ]);
-      S.faults = await get("/api/faults");
+      // One request for everything (fewer round trips through proxies).
+      const snap = await get("/api/snapshot?since=" + lastTick + "&events_since=" + S.logSeq);
+      const st = snap.state, m = snap.metrics, ev = { events: snap.events },
+        inc = { incidents: snap.incidents }, models = snap.models, pipe = snap.pipeline;
+      S.faults = snap.faults;
       if (S.st && st.tick < S.st.tick) { S.rows = []; S.log = []; S.logSeq = 0; } // server restarted
       // Pending settings stay on screen until the server reports them
       // (or until no action is queued any more, i.e. it was rejected).
@@ -205,7 +213,7 @@ ol.runbook { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction:
       S.st = st; S.pipe = pipe; S.deploys = m.deploys; S.incidents = inc.incidents; S.models = models;
       for (const r of m.rows) if (!S.rows.length || r.tick > S.rows[S.rows.length - 1].tick) S.rows.push(r);
       for (const e of ev.events) { S.log.push(e); S.logSeq = Math.max(S.logSeq, e.seq); }
-      S.connected = true; S.error = null;
+      S.connected = true; S.error = null; S.lastOk = Date.now();
       if (S.toast && Date.now() - (S.toastAt || 0) > 10000) S.toast = null;
     } catch (e) {
       S.connected = false; S.error = String(e.message || e);
@@ -287,9 +295,22 @@ ol.runbook { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction:
     const labels = { missions: "Missions", pipeline: "Pipeline", models: "Models", monitoring: "Monitoring", incidents: "Incidents" };
     document.getElementById("nav").innerHTML = SCREENS.map((s) => `
       <button class="navbtn" data-act="go" data-v="${s}" ${S.screen === s ? 'aria-current="page"' : ""}>${icon(s)}<span>${labels[s]}</span>${s === "missions" ? mock : ""}${s === "incidents" && d.open ? `<span class="count">${d.open}</span>` : ""}</button>`).join("");
-    document.getElementById("conn").innerHTML = S.connected
-      ? `<span class="s-ok">●</span> Live: connected to the simulation${d.st && d.st.run_dir ? ` (log <span class="mono">${esc(d.st.run_dir)}</span>)` : ""}. Missions are still mock.`
-      : `<span class="s-crit">●</span> ${S.error ? "Disconnected: " + esc(S.error) : "Connecting…"}`;
+    renderConn();
+  }
+
+  // Connection note with the age of the data on screen. It has its own
+  // timer, so it shows a stale screen even while a request is stuck.
+  function renderConn() {
+    const el = document.getElementById("conn");
+    if (!el) return;
+    const age = S.lastOk ? Math.round((Date.now() - S.lastOk) / 1000) : null;
+    const stale = age != null && age >= 5;
+    const run = S.st && S.st.run_dir ? ` (log <span class="mono">${esc(S.st.run_dir)}</span>)` : "";
+    el.innerHTML = !S.lastOk
+      ? `<span class="s-crit">●</span> ${S.error ? "Cannot reach the server: " + esc(S.error) : "Connecting…"}`
+      : stale
+        ? `<span class="s-warn">●</span> Screen not updated for ${age} s${S.error ? ": " + esc(S.error) : ""}. Retrying every second.`
+        : `<span class="s-ok">●</span> Live: connected to the simulation${run}. Updated ${age} s ago. Missions are still mock.`;
   }
 
   function toastHtml() { return S.toast ? `<div class="toast ${S.toastErr ? "err" : ""}" role="status">${icon("check", 16)}<span>${esc(S.toast)}</span></div>` : ""; }
@@ -659,6 +680,10 @@ ol.runbook { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction:
   render(true);
   poll();
   setInterval(poll, 1000);
+  setInterval(renderConn, 1000);
+  // Browsers slow timers down in background tabs (Chrome: down to once a
+  // minute); refresh at once when the tab is shown again.
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) poll(); });
 })();
 </script>
 </body></html>

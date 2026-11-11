@@ -196,6 +196,7 @@ API (`console/server.py`; the UI uses nothing else):
 
 | Endpoint | |
 |---|---|
+| `GET /api/snapshot?since=T&events_since=S` | all the reads below in one response; the UI polls only this, once a second, with a 5 s timeout per request |
 | `GET /api/state` | tick, playing, speed, model/index version, training in flight, budget, reference CTRs |
 | `GET /api/metrics?since=T` | per-tick rows for ticks > T: shown, clicks, ctr, active_users, model_version, latency; plus deploys |
 | `GET /api/events?since=SEQ` | event log entries |

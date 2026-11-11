@@ -1,6 +1,7 @@
 """FastAPI app around one SimSession. The UI (static/index.html) talks to
 it only through the JSON endpoints below.
 
+GET  /api/snapshot?since=T&events_since=S   all of the reads below in one response (what the UI polls)
 GET  /api/state                  clock, speed, serving model, budget, references
 GET  /api/metrics?since=T        per-tick shown/clicks/ctr/active users/latency for ticks > T
 GET  /api/events?since=SEQ       event log entries with seq > SEQ
@@ -54,6 +55,19 @@ def create_app(session):
     @app.get("/api/events")
     def events(since: int = 0):
         return {"events": session.events(since)}
+
+    @app.get("/api/snapshot")
+    def snapshot(since: int = 0, events_since: int = 0):
+        """Everything the UI polls, in one request (fewer round trips)."""
+        return {
+            "state": session.state(),
+            "metrics": session.metrics(since),
+            "events": session.events(events_since),
+            "incidents": session.incidents_view(),
+            "models": session.models(),
+            "pipeline": session.pipeline(),
+            "faults": session.faults_view(),
+        }
 
     @app.get("/api/models")
     def models():
