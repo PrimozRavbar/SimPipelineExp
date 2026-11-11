@@ -34,6 +34,11 @@ class DataLake(Service):
             "RatingEvent"
         )
 
+        kafka.subscribe(
+            "DataLake",
+            "OnboardingEvent"
+        )
+
     def process(self, sim):
 
         kafka = sim.get_service("Kafka")
@@ -42,7 +47,8 @@ class DataLake(Service):
             "RecommendationShownEvent",
             "RecommendationClickedEvent",
             "WatchEvent",
-            "RatingEvent"
+            "RatingEvent",
+            "OnboardingEvent"
         ]:
             events = kafka.poll(
                 "DataLake",

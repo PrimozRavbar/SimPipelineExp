@@ -50,7 +50,8 @@ def build_recommendation_system(
     log_metrics=True,
     runs_dir="runs",
     run_id=None,
-    world_dynamics=None
+    world_dynamics=None,
+    onboarding=None
 ):
     """Wire up World, streaming, serving and the offline retraining loop.
 
@@ -65,6 +66,9 @@ def build_recommendation_system(
     `world_dynamics` (dict, default None = a static world) switches on
     taste drift, users joining over time, fatigue and no-rewatching; see
     world.dynamics (DYNAMIC_WORLD is a preset with everything on).
+    `onboarding` (dict {"genres": 3, "noise": 0.3}, default None = off):
+    new users declare favourite genres before their first slate; the
+    console can also switch it on later (world.onboarding).
     """
     from world.dynamics import DYNAMICS_KEYS, EXPOSURE_KEYS, WorldDynamics
 
@@ -146,7 +150,11 @@ def build_recommendation_system(
         outcome_model=outcome_model,
         user_simulator_kwargs={
             k: world_dynamics[k] for k in EXPOSURE_KEYS if k in world_dynamics
-        }
+        },
+        onboarding=onboarding,
+        # Own RNG, derived from the seed directly (no draw from the shared
+        # stream), so switching onboarding on never shifts other components.
+        onboarding_rng=random.Random("onboarding-%s" % seed)
     )
 
     sim = Simulator(seed=seeds.getrandbits(64))

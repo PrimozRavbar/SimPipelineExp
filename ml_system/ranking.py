@@ -254,6 +254,41 @@ def features_v2(user_features, recent_watches, recent_slates, item_features, mov
     ]
 
 
+# v3: v2 + the user's taste matched genre by genre, so the MLP can weigh
+# genres instead of seeing one summary number.
+_V3_GENRES = None
+
+
+def _v3_genres():
+    global _V3_GENRES
+    if _V3_GENRES is None:
+        from world.external_data_loader import GENRE_NAMES
+        _V3_GENRES = [g for g in GENRE_NAMES if g != "unknown"]
+    return _V3_GENRES
+
+
+def features_v3(user_features, recent_watches, recent_slates, item_features, movie_id, genres_of):
+    """v2 + profile cosine (user share vector vs the movie's genre vector)
+    + one feature per genre: user share of g if the movie has g, else 0."""
+    row = features_v2(user_features, recent_watches, recent_slates, item_features, movie_id, genres_of)
+    prefs = (user_features or {}).get("genre_preferences") or {}
+    total = sum(max(v, 0.0) for v in prefs.values())
+    share = {g: max(v, 0.0) / total for g, v in prefs.items()} if total > 0 else {}
+    genres = set((item_features or {}).get("genres") or genres_of(movie_id))
+    norm = sum(v * v for v in share.values()) ** 0.5
+    cosine = (sum(share.get(g, 0.0) for g in genres) / (norm * len(genres) ** 0.5)) if norm and genres else 0.0
+    return row + [cosine] + [share.get(g, 0.0) if g in genres else 0.0 for g in _v3_genres()]
+
+
+def feature_names(feature_set):
+    if feature_set == "v2":
+        return list(FEATURES_V2)
+    return list(FEATURES_V2) + ["profile_cosine"] + ["genre_%s" % g for g in _v3_genres()]
+
+
+FEATURE_SETS = {"v2": features_v2, "v3": features_v3}
+
+
 class MLPRanker(Ranker):
     """score = MLP(features) + position_bias[position] in training; the
     position term (a separate 'shallow tower') is dropped at serving, so
@@ -261,7 +296,11 @@ class MLPRanker(Ranker):
     at the top. Trained with binary cross-entropy on cascade rows, seeded,
     CPU only."""
 
-    def __init__(self, user_features_fn, redis, feature_store, genres_of, hidden=16, seed=0):
+    def __init__(self, user_features_fn, redis, feature_store, genres_of, hidden=16, seed=0,
+                 feature_set="v2"):
+        if feature_set not in FEATURE_SETS:
+            raise ValueError("feature_set must be one of %s" % sorted(FEATURE_SETS))
+        self.feature_set = feature_set
         self.user_features_fn = user_features_fn
         self.redis = redis
         self.feature_store = feature_store
@@ -285,7 +324,8 @@ class MLPRanker(Ranker):
         user_features = self.user_features_fn(user.user_id)
         watches = self.redis.get("recent_watches", user.user_id) or []
         slates = self.redis.get("recent_slates", user.user_id) or []
-        rows = [features_v2(user_features, watches, slates, self.feature_store.get_item_features(m),
+        build = FEATURE_SETS[self.feature_set]
+        rows = [build(user_features, watches, slates, self.feature_store.get_item_features(m),
                             m, self.genres_of) for m in candidates]
         with torch.no_grad():
             x = (torch.tensor(rows, dtype=torch.float32) - self.mean) / self.scale
@@ -296,7 +336,7 @@ class MLPRanker(Ranker):
     # -- training --------------------------------------------------------
 
     @staticmethod
-    def training_rows_from(events, feature_store, genres_of):
+    def training_rows_from(events, feature_store, genres_of, feature_set="v2"):
         """Cascade rows (see LogisticRanker.training_rows_from) with v2
         features; recent history is replayed in event order, as of just
         before each slate. Returns (rows, positions, labels)."""
@@ -313,7 +353,7 @@ class MLPRanker(Ranker):
                 last = movie_ids.index(clicked) if clicked in movie_ids else len(movie_ids) - 1
                 for position, movie_id in enumerate(movie_ids[:last + 1]):
                     item = feature_store.get_item_features_as_of(movie_id, event.timestamp, event_order)
-                    rows.append(features_v2(user, watches, slates, item, movie_id, genres_of))
+                    rows.append(FEATURE_SETS[feature_set](user, watches, slates, item, movie_id, genres_of))
                     positions.append(min(position, POSITIONS - 1))
                     labels.append(1.0 if movie_id == clicked else 0.0)
             history.observe(event)
@@ -367,7 +407,8 @@ class MLPRanker(Ranker):
         return self
 
     def summary(self):
-        return {"model": "mlp", "features": list(FEATURES_V2), "hidden": self.hidden,
+        return {"model": "mlp", "feature_set": self.feature_set,
+                "features": feature_names(self.feature_set), "hidden": self.hidden,
                 "training_rows": self.training_rows,
                 "click_rate": None if self.positive_rate is None else round(self.positive_rate, 4),
                 "final_loss": round(self.losses[-1], 4) if self.losses else None,

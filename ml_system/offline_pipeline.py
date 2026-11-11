@@ -6,6 +6,8 @@ from simulation.events import (
     RecommendationClickedEvent,
 )
 
+from simulation.events import OnboardingEvent
+from ml_system.features import update_genre_counts
 from ml_system.features import (
     RatingFeatureComputer,
     ItemRatingFeatureComputer,
@@ -69,6 +71,10 @@ class OfflineFeaturePipeline:
         self.rating_features = RatingFeatureComputer()
         self.item_rating_features = ItemRatingFeatureComputer()
 
+
+    # How user genre profiles are built ("watches" = the original; "rich":
+    # see ml_system.features.update_genre_counts). Flink uses the same.
+    profile_mode = "watches"
 
     def process(self, events):
 
@@ -142,6 +148,9 @@ class OfflineFeaturePipeline:
             )
 
 
+            if isinstance(event, OnboardingEvent):
+                update_genre_counts(user["genre_preferences"], "onboarding", event.genres)
+
             if hasattr(event, "movie_id"):
 
                 movie_id = event.movie_id
@@ -183,14 +192,26 @@ class OfflineFeaturePipeline:
 
                     item["popularity"] += 1
 
-                    for genre in movie.genres:
+                    if self.profile_mode == "watches":
+                        for genre in movie.genres:
 
-                        user["genre_preferences"][genre] = (
-                            user["genre_preferences"].get(
-                                genre,
-                                0
-                            ) + 1
-                        )
+                            user["genre_preferences"][genre] = (
+                                user["genre_preferences"].get(
+                                    genre,
+                                    0
+                                ) + 1
+                            )
+                    else:
+                        update_genre_counts(user["genre_preferences"], "watch", movie.genres,
+                                            self.profile_mode, event.completion)
+
+                if self.profile_mode != "watches":
+                    if isinstance(event, RecommendationClickedEvent):
+                        update_genre_counts(user["genre_preferences"], "click", movie.genres,
+                                            self.profile_mode)
+                    elif isinstance(event, RatingEvent):
+                        update_genre_counts(user["genre_preferences"], "rating", movie.genres,
+                                            self.profile_mode, event.rating)
 
 
                 if isinstance(event, RecommendationClickedEvent):
