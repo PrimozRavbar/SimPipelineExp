@@ -50,7 +50,9 @@ def tower_config(tower):
     if name == "SimpleUserTower":
         return {"class": name, "num_users": tower.user_embedding.num_embeddings - 1,
                 "embedding_dim": out_dim, "use_id_embedding": tower.use_id_embedding,
-                "use_activity_features": tower.use_activity_features}
+                "use_activity_features": tower.use_activity_features,
+                "use_history": getattr(tower, "use_history", False),
+                "num_movies": getattr(tower, "num_movies", None)}
     if name == "SimpleItemTower":
         return {"class": name, "num_movies": tower.movie_embedding.num_embeddings - 1,
                 "embedding_dim": out_dim, "use_id_embedding": tower.use_id_embedding,

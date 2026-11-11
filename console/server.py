@@ -69,6 +69,11 @@ def create_app(session):
             "faults": session.faults_view(),
         }
 
+    @app.post("/api/insight")
+    def insight():
+        """Where the system loses clicks (uses ground truth; on request)."""
+        return {"insight": session.insight()}
+
     @app.get("/api/models")
     def models():
         return session.models()

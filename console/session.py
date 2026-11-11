@@ -37,7 +37,8 @@ from ml_system.experiments import Experiment
 from ml_system.ranking import (ExplorationReranker, LogisticRanker, MLPRanker, MMRReranker,
                                RerankerChain, WatchedFilter)
 from ml_system.model_registry import export_bundle
-from ml_system.two_tower import USER_FEATURE_DEFAULTS, TwoTowerRetrieval
+from ml_system.training import TwoTowerTrainer
+from ml_system.two_tower import USER_FEATURE_DEFAULTS, SimpleItemTower, SimpleUserTower, TwoTowerRetrieval
 from world.dynamics import DYNAMIC_WORLD
 from world.external_data_loader import load_movielens
 
@@ -60,6 +61,12 @@ DEFAULT_SETTINGS = {
     # Training
     "epochs": 5,
     "batched_training": True,  # train the towers a batch at a time (fast) or example by example
+    # Retrieval training (two-tower); all off by default
+    "logq_correction": False,  # correct in-batch negatives for item popularity (sampling bias)
+    "random_negatives": 0,     # extra random catalog negatives per example
+    "graded_positives": False, # weight clicks by watch completion and rating
+    "tower_history": False,    # user tower also sees the recent-watch history
+    "train_from_scratch": False,  # new towers every retrain instead of continuing the last ones
     "negatives": 5,            # sampled negatives per positive
     # Serving
     "slate_size": 10,
@@ -68,6 +75,7 @@ DEFAULT_SETTINGS = {
     "ranker": False,           # train and serve a ranking stage after retrieval
     "ranker_mlp": True,        # ranker model: MLP with cross/recent-history features (off: logistic)
     "ranker_genre_features": True,  # MLP also sees the taste match genre by genre (feature set v3)
+    "ranker_multitask": False, # MLP also predicts watch completion; orders by p(click) x completion
     # Personalisation
     "profile_candidates": 0,   # extra candidates from the user's genre profile (0 = two-tower only)
     "rich_profiles": False,    # profiles from clicks, watch completion and ratings, recent first
@@ -118,6 +126,7 @@ SETTING_LIMITS = {
     "alert_ticks": (10, 10000),
     "alert_window": (5, 1000),
     "profile_candidates": (0, 100),
+    "random_negatives": (0, 20),
     "diversity_pct": (0, 100),
     "exploration_pct": (0, 50),
     "canary_share": (0, 100),
@@ -137,7 +146,9 @@ SETTING_LIMITS = {
     "users_joining_per_100_ticks": (0, 10000),
 }
 BOOL_SETTINGS = {"rebuild_index", "ranker", "ranker_mlp", "filter_watched", "eval_gate", "batched_training",
-                 "ranker_genre_features", "rich_profiles", "onboarding"}
+                 "ranker_genre_features", "rich_profiles", "onboarding",
+                 "logq_correction", "graded_positives", "tower_history", "train_from_scratch",
+                 "ranker_multitask"}
 
 WORLDS = ("static", "dynamic")
 
@@ -696,6 +707,12 @@ class SimSession:
             "ranker": self.settings["ranker"],
             "ranker_mlp": self.settings["ranker_mlp"],
             "ranker_features": "v3" if self.settings["ranker_genre_features"] else "v2",
+            "ranker_multitask": self.settings["ranker_multitask"],
+            "logq_correction": self.settings["logq_correction"],
+            "random_negatives": self.settings["random_negatives"],
+            "graded_positives": self.settings["graded_positives"],
+            "tower_history": self.settings["tower_history"],
+            "train_from_scratch": self.settings["train_from_scratch"],
             "ranker_rows": None,
             "eval_gate": self.settings["eval_gate"],
             "holdout_pct": self.settings["holdout_pct"],
@@ -751,6 +768,8 @@ class SimSession:
 
         generator = self.offline.dataset_generator
         generator.negative_samples = record["negatives"]
+        generator.graded = record["graded_positives"]
+        generator.history = record["tower_history"]
         for order, event in enumerate(train_events):
             generator.add_event(event, order)
         training_data = generator.build()
@@ -761,7 +780,8 @@ class SimSession:
         items = _ItemFeatureSnapshot(self.offline.feature_pipeline.feature_store)
         if record["ranker"] and record["ranker_mlp"]:
             record["ranker_rows"] = MLPRanker.training_rows_from(
-                train_events, self.system["feature_store"], self._genres_of, record["ranker_features"])
+                train_events, self.system["feature_store"], self._genres_of, record["ranker_features"],
+                with_completion=record["ranker_multitask"])
         elif record["ranker"]:
             record["ranker_rows"] = LogisticRanker.training_rows_from(train_events, self.system["feature_store"])
 
@@ -788,8 +808,17 @@ class SimSession:
         try:
             started = time.monotonic()
             trainer = self.offline.trainer
+            if record["train_from_scratch"] or \
+                    getattr(trainer.user_tower, "use_history", False) != record["tower_history"]:
+                trainer = self.offline.trainer = self._fresh_trainer(record)
             trainer.epochs = record["epochs"]
-            trainer.batched = record["batched"]
+            trainer.batched = record["batched"] or bool(
+                record["logq_correction"] or record["random_negatives"] or record["graded_positives"])
+            trainer.logq_correction = record["logq_correction"]
+            trainer.random_negatives = record["random_negatives"]
+            trainer.graded = record["graded_positives"]
+            trainer.item_pool = [items.item_features[m] for m in sorted(items.item_features)]
+            trainer.seed = self.seed
             trainer.train(training_data)
 
             user_tower = copy.deepcopy(trainer.user_tower).eval()
@@ -804,13 +833,14 @@ class SimSession:
 
             ranker = None
             if record["ranker_rows"] is not None and record["ranker_mlp"]:
-                rows, positions, labels = record["ranker_rows"]
+                rows, positions, labels, *rest = record["ranker_rows"]
                 record["ranker_rows"] = None
                 ranker = MLPRanker(self.retriever.user_features, self.system["redis"],
                                    self.system["feature_store"], self._genres_of,
                                    seed=self.seed * 1000 + record["version"],
-                                   feature_set=record["ranker_features"])
-                ranker.fit(rows, positions, labels)
+                                   feature_set=record["ranker_features"],
+                                   multitask=record["ranker_multitask"])
+                ranker.fit(rows, positions, labels, rest[0] if rest else None)
             elif record["ranker_rows"] is not None:
                 rows, labels = record["ranker_rows"]
                 record["ranker_rows"] = None
@@ -1125,8 +1155,8 @@ class SimSession:
                                                     lambda: self.model_server.slate_size, self.explore_rng)
             chain.append(self.explorer)
         self.model_server.reranker = RerankerChain(chain) if chain else None
-        if s["ranker"] and s["ranker_mlp"]:
-            self.flink.track_recent = True     # recent history for the MLP ranker (stays on)
+        if (s["ranker"] and s["ranker_mlp"]) or s["tower_history"]:
+            self.flink.track_recent = True     # recent history for the MLP ranker / user tower (stays on)
         if getattr(self, "profile_source", None) is None:
             # Second candidate source: content-based, from the genre profile.
             self.profile_source = ProfileRetrieval(self.retriever.user_features, self.system["feature_store"],
@@ -1301,6 +1331,22 @@ class SimSession:
                   if type(e).__name__ == "RecommendationClickedEvent"]
         self.health["drift_psi"] = health.genre_psi(self.drift_reference,
                                                     health.genre_distribution(recent, catalog))
+
+    def _fresh_trainer(self, record):
+        """New towers (and optimizer) for this retrain, seeded from the
+        session seed and the version, with or without the history input."""
+        import torch
+
+        old = self.offline.trainer
+        user_kwargs = dict(self.system["user_tower_kwargs"])
+        num_movies = len(self.system["world"].movie_objects)
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(self.seed * 1000 + record["version"])
+            user = SimpleUserTower(num_users=len(self.system["world"].user_objects),
+                                   use_history=record["tower_history"], num_movies=num_movies, **user_kwargs)
+            item = SimpleItemTower(num_movies=num_movies, **self.system["item_tower_kwargs"])
+        return TwoTowerTrainer(user, item, epochs=old.epochs, temperature=old.temperature,
+                               batch_size=old.batch_size, batched=old.batched)
 
     def _genres_of(self, movie_id):
         return self.system["world"].movie_objects[movie_id].genres
@@ -1574,6 +1620,15 @@ class SimSession:
                 shown.append({**fault.summary(), "drill": drill})
             return {"hidden_active": hidden_active, "faults": list(reversed(shown)),
                     "kinds": FAULT_KINDS, "fixes": {k: list(v) for k, v in FIXES.items()}}
+
+    def insight(self):
+        """Stage-by-stage report (console/insight.py). Uses ground truth;
+        read-only and deterministic (no RNG). Computed on request."""
+        from console.insight import stage_report
+
+        with self.lock:
+            self.last_insight = stage_report(self)
+            return self.last_insight
 
     def actions_pending(self):
         with self.lock:
