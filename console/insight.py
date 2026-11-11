@@ -26,7 +26,7 @@ import numpy as np
 from ml_system.candidate_sources import merge_candidates
 from ml_system.ranking import ExplorationReranker, genre_match
 from simulation.events import RetrievalRequest
-from world.relevance import RELEVANCE_THRESHOLD, relevance_matrix
+from world.relevance import relevance_matrix, relevance_threshold
 
 
 def stage_report(session, max_users=150, window=300):
@@ -43,7 +43,9 @@ def stage_report(session, max_users=150, window=300):
 
     movie_ids = list(world.movie_objects)
     column = {m: i for i, m in enumerate(movie_ids)}
-    rel = relevance_matrix([world.user_states[u] for u in users], [world.movie_objects[m] for m in movie_ids])
+    rel = relevance_matrix([world.user_states[u] for u in users], [world.movie_objects[m] for m in movie_ids],
+                           taste=world.taste)
+    threshold = relevance_threshold(world.taste)
 
     totals = {k: 0.0 for k in ("served", "two_tower", "extra", "candidates", "profile", "oracle")}
     relevant = {k: [] for k in ("two_tower", "extra", "served")}
@@ -80,7 +82,7 @@ def stage_report(session, max_users=150, window=300):
         totals["oracle"] += ctr(oracle)
         for key, movies in (("two_tower", two_tower), ("extra", extra), ("served", served)):
             if movies:
-                relevant[key].append(np.mean([rel[row, column[m]] >= RELEVANCE_THRESHOLD for m in movies]))
+                relevant[key].append(np.mean([rel[row, column[m]] >= threshold for m in movies]))
 
     n = len(users)
     report = {k: v / n for k, v in totals.items()}

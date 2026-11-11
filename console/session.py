@@ -269,11 +269,15 @@ class SimSession:
         run_id=None,
         training_wait_timeout=None,
         world="static",
+        taste="genre",
     ):
         if world not in WORLDS:
             raise ActionError("world must be one of %s" % (WORLDS,))
+        if taste not in ("genre", "rich"):
+            raise ActionError('taste must be "genre" or "rich"')
         self.seed = seed
         self.world_kind = world
+        self.taste_kind = taste
         self.users_per_tick = users_per_tick
         self.settings = dict(DEFAULT_SETTINGS)
         if world == "dynamic":
@@ -300,6 +304,7 @@ class SimSession:
             # static world gets a neutral one (no RNG use outside its own).
             world_dynamics=(dict(DYNAMIC_WORLD) if world == "dynamic"
                             else {"taste_drift_every": 0}),
+            taste=taste,
         )
 
         self.sim = self.system["sim"]
@@ -1483,6 +1488,7 @@ class SimSession:
                 "open_incidents": sum(1 for i in self.incidents if i["status"] == "Open"),
                 "canary": self._canary_view(),
                 "world": self.world_kind,
+                "taste": self.taste_kind,
                 "health": dict(self.health),
                 "pending_actions": len(self._pending),
             }

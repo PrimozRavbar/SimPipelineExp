@@ -161,7 +161,8 @@ def create_app(session):
     return app
 
 
-def serve(host="127.0.0.1", port=8000, seed=42, users_per_tick=10, runs_dir="runs", world="static"):
+def serve(host="127.0.0.1", port=8000, seed=42, users_per_tick=10, runs_dir="runs", world="static",
+          taste="genre"):
     import faulthandler
     import signal
 
@@ -170,8 +171,9 @@ def serve(host="127.0.0.1", port=8000, seed=42, users_per_tick=10, runs_dir="run
     if hasattr(signal, "SIGUSR1"):
         faulthandler.register(signal.SIGUSR1)   # kill -USR1 <pid> dumps every thread's stack
 
-    print("Building the simulation (seed %d, %s world)..." % (seed, world), flush=True)
-    session = SimSession(seed=seed, users_per_tick=users_per_tick, runs_dir=runs_dir, world=world)
+    print("Building the simulation (seed %d, %s world, %s tastes)..." % (seed, world, taste), flush=True)
+    session = SimSession(seed=seed, users_per_tick=users_per_tick, runs_dir=runs_dir, world=world,
+                         taste=taste)
     session.start()
     app = create_app(session)
     shown_host = "localhost" if host in ("127.0.0.1", "0.0.0.0") else host

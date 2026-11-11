@@ -87,6 +87,20 @@ metrics, game scoring) uses that module. Don't redefine it elsewhere.
   the same RNG calls.
 - `world.relevance.relevance_matrix(user_states, movies)` is the same score vectorised
   (numpy), for evaluation code that needs every (user, movie) pair.
+- **Rich world** (`build_recommendation_system(taste="rich")`, console `--taste rich`; the
+  default `"genre"` world above is unchanged). `world/taste.py` fits a biased matrix
+  factorisation of the real MovieLens ratings once per process (ALS, 16 factors, fixed
+  settings and seed, so the true tastes are the same in every game): `rating ~ mu + b_movie +
+  p_user . q_movie`. Relevance becomes `0.4 * genre cosine + 0.6 * taste score`, with taste
+  score `clip((mu + b_movie + p . q - 1) / 4, 0, 1)` (the user bias is left out: generous raters
+  are not more interested in everything). `b_movie` is movie quality; `p . q` are hidden
+  tastes beyond genres. The threshold is calibrated (`calibrate_threshold`) so the median user
+  finds 10% of the catalog relevant (0.660; p25 5.8%, p75 16.9%). All relevance functions take
+  `taste=` (the World's `world.taste`, None in the genre world); `relevance_threshold(taste)`
+  gives the threshold. Reference CTRs: random 12.2%, oracle 68.5%. The best slate chosen by
+  genre alone reaches only 40.1%, hidden tastes alone 52.3%, one global best-quality list 34.9%:
+  there is a lot to learn beyond genres. Taste drift in the dynamic world still moves the genre
+  part only.
 
 ## Configuration switches (`build_recommendation_system`)
 
@@ -329,6 +343,12 @@ another component's random draws.
   on (static s42) served 48.8 ~ profile-ordered 48.3 < candidates 58.2 < oracle 66.9: the
   ranker uses what the system knows as well as plain profile ordering; the rest of the
   ranking loss is imperfect knowledge of users, not ranker modelling.
+- **Models in the rich world** (seed 42 unless noted, retrains at 400 and 800, CTR over ticks
+  852-1200, then the stage report at 1200): retrain only 14.7% (static) / 11.4% (dynamic); the
+  best genre-era stack (MLP ranker v3, profile candidates 30, rich profiles, onboarding, logQ)
+  37.2% static (s1 37.6%) / 19.7% dynamic. Static stage report: oracle 68.8, best of all
+  candidates 58.0, served 39.4: retrieval is now good, the ranker loses ~19 points because all
+  its features are genre-based.
 - **Experiments** (`ml_system/experiments.py`): stable hash bucketing (a new salt reshuffles
   users independently), two-proportion z-test, per-arm counting from the event stream.
 - **Registry** (`ml_system/model_registry.py`): `export_bundle` / `load_bundle` (towers with

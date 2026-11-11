@@ -20,7 +20,8 @@ class World(Service):
         outcome_model="relevance",
         user_simulator_kwargs=None,
         onboarding=None,
-        onboarding_rng=None
+        onboarding_rng=None,
+        taste=None
     ):
         super().__init__()
 
@@ -42,6 +43,10 @@ class World(Service):
         # Unique id per shown slate. It used to be the tick, which collides
         # once several users are active in the same tick.
         self.recommendation_count = 0
+
+        # Hidden tastes beyond genres (world.taste.TasteModel) in a "rich"
+        # world; None = the genre-only world. World-side only.
+        self.taste = taste
 
         # Onboarding (opt-in): the first time a user is active they pick
         # favourite genres (an OnboardingEvent, published before their first
