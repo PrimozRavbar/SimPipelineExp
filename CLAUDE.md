@@ -238,6 +238,12 @@ another component's random draws.
   `spark_failure`. Repairs: `restart_flink`, `rebuild_index`, `restart_model_server`.
 - **ModelServer** gained optional `fallback` + `retriever_down`, a `router(user_id) ->
   (retriever, ranker)` for canaries, and applies `reranker` after `ranker` (all None by default).
+- **Batched training** (`TwoTowerTrainer(batched=True)`, the default): each tower runs once
+  per batch (sampled negatives padded and masked) instead of once per example. Same loss;
+  weights match the original loop (`batched=False`) to ~1e-5 after 2 epochs
+  (`tests/test_batched_training.py`). 400 ticks of data, 5 epochs: 10.1 s -> 1.5 s on CPU.
+  The quickstart result is unchanged (seed 42: 17.2% -> 29.7%; seed 1: 13.2% -> 30.2%).
+  Console: "Batched training" switch (Pipeline > Training).
 - **Ranking** (`ml_system/ranking.py`): `Ranker`/`Reranker` ABCs. `LogisticRanker` uses
   ML-side features only (genre match from learned preferences, has-profile, log popularity,
   rating) and is trained on logged slates under the cascade (positive = click, negatives =
@@ -245,6 +251,23 @@ another component's random draws.
   position as a feature fixed at serving (position debiasing). `WatchedFilter` drops
   already-watched movies (needs `Flink.track_watched`). Seed 42, 10 users/tick, retrain at
   400: CTR over the next 300 ticks 17.9% without the ranker, 23.6% with it.
+- **MLP ranker** (`MLPRanker`): 9 features (`FEATURES_V2`: the 4 above, genre match x
+  popularity, no-profile x popularity, genre match with the last 5 watches, watched
+  recently, times shown in the last 3 slates), a 16-unit MLP plus a training-only
+  position "shallow tower" dropped at serving, seeded with `torch.random.fork_rng`.
+  `RecentHistory` defines the recent-history features once: Flink (`track_recent`) keeps
+  them in Redis for serving (`recent_watches`, `recent_slates`; it subscribes to shown
+  slates with `Kafka.subscribe(from_end=True)`), and training replays the event log so
+  each slate sees its history as of just before it. Same protocol as above:
+  static 18.0% none / 23.7% logistic / 23.4% MLP; dynamic 9.5% / 21.1% / 22.7%.
+- **Re-rankers:** `MMRReranker` (maximal marginal relevance on genre Jaccard over the top
+  30 candidates; relevance from the incoming order), `ExplorationReranker` (each visible
+  slot is, with probability `rate`, a random lower candidate; own seeded RNG
+  `"explore-<seed>"`), `RerankerChain`. Console order: watched filter -> diversity ->
+  exploration. With the MLP ranker: dynamic world baseline 22.7%, diversity 30% 24.9%,
+  diversity 60% 13.3%, exploration 10% 18.6% (catalog coverage 13.5% -> 23%); static world
+  baseline 23.4%, diversity 30% 21.2%. Variety pays when users tire of repeats, costs when
+  they don't, and too much always hurts.
 - **Experiments** (`ml_system/experiments.py`): stable hash bucketing (a new salt reshuffles
   users independently), two-proportion z-test, per-arm counting from the event stream.
 - **Registry** (`ml_system/model_registry.py`): `export_bundle` / `load_bundle` (towers with
@@ -253,6 +276,7 @@ another component's random draws.
 In the console (all live settings, applied at tick boundaries; see `console/session.py`
 `DEFAULT_SETTINGS`): `--world dynamic`, chaos (`chaos_every`: hidden seeded faults, revealed
 when they end) and drills, repair actions, `flink_capacity`, `ranker`, `filter_watched`,
+`ranker_mlp`, `diversity_pct`, `exploration_pct`, `batched_training`,
 `canary_share`/`canary_ticks` (promote unless the canary loses with 95% confidence; 50% is an
 A/B test), `eval_gate` (newest `holdout_pct`% of events held out of training; both models
 scored by Recall@20 on its clicks; a model more than `gate_tolerance_pct`% worse is
@@ -322,6 +346,9 @@ result is unstable: the model collapses to a few dozen near-global slates.
   golden queries instead (`tests/test_faults.py` has the regression test).
 - A popularity list beats the first retrained two-tower model online (~26% vs ~20%), so the
   `model_server_outage` fault can raise CTR early in a game.
+- Exploration's long-run benefit (better training data for later retrains) is not measured
+  yet, and explored slots are not logged with their propensity, so training treats them
+  like any other impression.
 - Canary statistics treat each slate as independent (users repeat), so the 95% intervals are
   somewhat too narrow. The gate's Recall@20 ignores the ranker and, like all offline recall
   here, mostly measures exposure.
