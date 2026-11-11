@@ -197,6 +197,7 @@ API (`console/server.py`; the UI uses nothing else):
 | Endpoint | |
 |---|---|
 | `GET /api/snapshot?since=T&events_since=S` | all the reads below in one response; the UI polls only this, once a second, with a 5 s timeout per request |
+| `POST /api/insight` | stage report: where clicks are lost (uses ground truth; computed on request) |
 | `GET /api/state` | tick, playing, speed, model/index version, training in flight, budget, reference CTRs |
 | `GET /api/metrics?since=T` | per-tick rows for ticks > T: shown, clicks, ctr, active_users, model_version, latency; plus deploys |
 | `GET /api/events?since=SEQ` | event log entries |
@@ -292,6 +293,42 @@ another component's random draws.
   without per-genre features 45.6%. Onboarding is what gives every user a profile, and the
   profile candidates are what put matching movies in front of the ranker; alone, each moves
   CTR only a little.
+- **Retrieval v2** (all off by default; batched training only):
+  - `TwoTowerTrainer(logq_correction=True)`: subtract log(item frequency among positives) from
+    the positive and in-batch logits (sampling-bias correction, Yi et al. 2019).
+  - `random_negatives=k` with `trainer.item_pool`: k random catalog movies per example as
+    easy negatives (seeded per training call).
+  - `graded=True` with `TrainingDatasetGenerator(graded=True)`: each click weighted by what
+    followed (`training_dataset.grade`: 0.3 if not watched, else 0.5 + completion + 0.25 per
+    star above 3).
+  - `SimpleUserTower(use_history=True, num_movies=...)`: mean of a learned embedding of the
+    last 5 watched movies (`user_features["recent_watches"]`: Redis `recent_watches` online,
+    replayed per click by `TrainingDatasetGenerator(history=True)` offline).
+  - `MLPRanker(multitask=True)`: a second head predicts watch completion given a click;
+    serving orders by p(click) x expected completion.
+  - Console `train_from_scratch` (and switching `tower_history`) builds fresh, seeded towers.
+
+  Measured on top of the personalisation features (MLP ranker v3, profile candidates 30, rich
+  profiles, onboarding), CTR over ticks 852-1200:
+
+  | | static s42 | static s1 | dynamic s42 | dynamic s1 |
+  |---|---|---|---|---|
+  | base | 48.5% | 45.5% | 27.2% | 27.8% |
+  | + logQ | 49.1% | 47.6% | 29.6% | 30.9% |
+  | all five | 51.0% | 48.5% | 28.5% | 30.4% |
+
+  logQ is the one that clearly works: the best 10 of the two-tower candidates go from 42.7 to
+  59.5 (static s42; relevant share 32% -> 46%). Random negatives, graded positives, history
+  and the multi-task ranker are each within +-2 points (noise for one seed). Why the others
+  barely help here: relevance in this World is a function of genres only, so item identity
+  and watch history add little beyond the genre profile, and noise clicks are only 2%.
+- **Stage report** (`console/insight.py`, `POST /api/insight`, Models > "Where clicks are
+  lost"): exact expected CTR (ground truth, on request, no RNG) of the served slate, the best
+  10 of the two-tower candidates, of the extra sources, of all candidates, of the candidates
+  ordered by the system's own learned profile, and of the catalog (oracle). With everything
+  on (static s42) served 48.8 ~ profile-ordered 48.3 < candidates 58.2 < oracle 66.9: the
+  ranker uses what the system knows as well as plain profile ordering; the rest of the
+  ranking loss is imperfect knowledge of users, not ranker modelling.
 - **Experiments** (`ml_system/experiments.py`): stable hash bucketing (a new salt reshuffles
   users independently), two-proportion z-test, per-arm counting from the event stream.
 - **Registry** (`ml_system/model_registry.py`): `export_bundle` / `load_bundle` (towers with
@@ -300,7 +337,9 @@ another component's random draws.
 In the console (all live settings, applied at tick boundaries; see `console/session.py`
 `DEFAULT_SETTINGS`): `--world dynamic`, chaos (`chaos_every`: hidden seeded faults, revealed
 when they end) and drills, repair actions, `flink_capacity`, `ranker`, `filter_watched`,
-`ranker_mlp`, `ranker_genre_features`, `profile_candidates`, `rich_profiles`, `onboarding`,
+`ranker_mlp`, `ranker_genre_features`, `ranker_multitask`, `profile_candidates`, `rich_profiles`,
+`onboarding`, `logq_correction`, `random_negatives`, `graded_positives`, `tower_history`,
+`train_from_scratch`,
 `diversity_pct`, `exploration_pct`, `batched_training`,
 `canary_share`/`canary_ticks` (promote unless the canary loses with 95% confidence; 50% is an
 A/B test), `eval_gate` (newest `holdout_pct`% of events held out of training; both models

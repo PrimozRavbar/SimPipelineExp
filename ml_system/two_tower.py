@@ -39,19 +39,32 @@ class SimpleUserTower(nn.Module, UserTower):
         num_users,
         embedding_dim=32,
         use_id_embedding=True,
-        use_activity_features=True
+        use_activity_features=True,
+        use_history=False,
+        num_movies=None
     ):
         super().__init__()
 
         self.use_id_embedding = use_id_embedding
         self.use_activity_features = use_activity_features
 
+        # use_history: average a learned embedding of the user's recent
+        # watches (user_features["recent_watches"], movie ids) into the
+        # input. Off by default; when off no extra parameters are created,
+        # so seeded initialisation is unchanged.
+        self.use_history = use_history
+        self.num_movies = num_movies
+        if use_history:
+            if not num_movies:
+                raise ValueError("use_history needs num_movies")
+            self.history_embedding = nn.Embedding(num_movies + 1, 16)
+
         self.user_embedding = nn.Embedding(
             num_users + 1,
             16
         )
 
-        input_dim = 16 + len(genre_names) + 5
+        input_dim = 16 + len(genre_names) + 5 + (16 if use_history else 0)
 
         self.network = nn.Sequential(
             nn.Linear(input_dim, 128),
@@ -63,6 +76,20 @@ class SimpleUserTower(nn.Module, UserTower):
 
 
     def encode_features(self, user_features):
+
+        if self.use_history:
+            watches = [m for m in (user_features.get("recent_watches") or ())
+                       if 0 < m <= self.num_movies]
+            if watches:
+                history = self.history_embedding(torch.tensor(watches, dtype=torch.long)).mean(dim=0)
+            else:
+                history = torch.zeros(16)
+            return torch.cat([self._encode_base(user_features), history])
+
+        return self._encode_base(user_features)
+
+
+    def _encode_base(self, user_features):
 
         user_id = user_features["user_id"]
 
@@ -391,6 +418,12 @@ class TwoTowerRetrieval(RetrievalService):
                 value = offline.get(name, default)
 
             features[name] = value
+
+        # Recent watches (only published when Flink tracks them; towers
+        # without use_history ignore the key).
+        watches = self.redis.get("recent_watches", user_id)
+        if watches is not None:
+            features["recent_watches"] = list(watches)
 
         return features
 

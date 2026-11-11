@@ -289,6 +289,27 @@ def feature_names(feature_set):
 FEATURE_SETS = {"v2": features_v2, "v3": features_v3}
 
 
+def _make_multitask_net():
+    import torch
+    import torch.nn as nn
+
+    class MultiTaskNet(nn.Module):
+        """Shared hidden layer, a click head (logit) and a completion head
+        (0..1, the expected watch completion given a click)."""
+
+        def __init__(self, inputs, hidden):
+            super().__init__()
+            self.trunk = nn.Sequential(nn.Linear(inputs, hidden), nn.ReLU())
+            self.click = nn.Linear(hidden, 1)
+            self.completion = nn.Linear(hidden, 1)
+
+        def forward(self, x):
+            h = self.trunk(x)
+            return self.click(h).squeeze(1), torch.sigmoid(self.completion(h)).squeeze(1)
+
+    return MultiTaskNet
+
+
 class MLPRanker(Ranker):
     """score = MLP(features) + position_bias[position] in training; the
     position term (a separate 'shallow tower') is dropped at serving, so
@@ -297,10 +318,13 @@ class MLPRanker(Ranker):
     CPU only."""
 
     def __init__(self, user_features_fn, redis, feature_store, genres_of, hidden=16, seed=0,
-                 feature_set="v2"):
+                 feature_set="v2", multitask=False):
         if feature_set not in FEATURE_SETS:
             raise ValueError("feature_set must be one of %s" % sorted(FEATURE_SETS))
         self.feature_set = feature_set
+        # multitask: a second head predicts watch completion given a click;
+        # serving orders by p(click) x expected completion.
+        self.multitask = multitask
         self.user_features_fn = user_features_fn
         self.redis = redis
         self.feature_store = feature_store
@@ -329,21 +353,38 @@ class MLPRanker(Ranker):
                             m, self.genres_of) for m in candidates]
         with torch.no_grad():
             x = (torch.tensor(rows, dtype=torch.float32) - self.mean) / self.scale
-            scores = self.model(x).squeeze(1).tolist()
+            if self.multitask:
+                click_logit, completion = self.model(x)
+                scores = (torch.sigmoid(click_logit) * completion.clamp(0.05, 1.0)).tolist()
+            else:
+                scores = self.model(x).squeeze(1).tolist()
         order = sorted(range(len(candidates)), key=lambda i: (-scores[i], i))
         return [candidates[i] for i in order]
 
     # -- training --------------------------------------------------------
 
     @staticmethod
-    def training_rows_from(events, feature_store, genres_of, feature_set="v2"):
+    def training_rows_from(events, feature_store, genres_of, feature_set="v2", with_completion=False):
         """Cascade rows (see LogisticRanker.training_rows_from) with v2
         features; recent history is replayed in event order, as of just
-        before each slate. Returns (rows, positions, labels)."""
+        before each slate. Returns (rows, positions, labels), plus
+        completions (watch completion of the clicked movie, 0 if not
+        watched; None for unclicked rows) with with_completion=True."""
         clicks = {e.recommendation_id: e.movie_id for e in events
                   if isinstance(e, RecommendationClickedEvent)}
+        completion_of = {}
+        if with_completion:
+            last_click = {}
+            for e in events:
+                if isinstance(e, RecommendationClickedEvent):
+                    last_click[(e.user_id, e.movie_id)] = e.recommendation_id
+                    completion_of[e.recommendation_id] = 0.0
+                elif type(e).__name__ == "WatchEvent":
+                    rec = last_click.get((e.user_id, e.movie_id))
+                    if rec is not None:
+                        completion_of[rec] = e.completion
         history = RecentHistory()
-        rows, positions, labels = [], [], []
+        rows, positions, labels, completions = [], [], [], []
         for event_order, event in enumerate(events):
             if isinstance(event, RecommendationShownEvent):
                 watches, slates = history.get(event.user_id)
@@ -356,10 +397,13 @@ class MLPRanker(Ranker):
                     rows.append(FEATURE_SETS[feature_set](user, watches, slates, item, movie_id, genres_of))
                     positions.append(min(position, POSITIONS - 1))
                     labels.append(1.0 if movie_id == clicked else 0.0)
+                    completions.append(completion_of.get(event.recommendation_id) if movie_id == clicked else None)
             history.observe(event)
+        if with_completion:
+            return rows, positions, labels, completions
         return rows, positions, labels
 
-    def fit(self, rows, positions, labels, epochs=8, batch_size=512, learning_rate=0.01):
+    def fit(self, rows, positions, labels, completions=None, epochs=8, batch_size=512, learning_rate=0.01):
         import torch
         import torch.nn as nn
 
@@ -377,7 +421,10 @@ class MLPRanker(Ranker):
         # Seeded init and shuffling without touching the global torch RNG.
         with torch.random.fork_rng(devices=[]):
             torch.manual_seed(self.seed)
-            model = nn.Sequential(nn.Linear(x.shape[1], self.hidden), nn.ReLU(), nn.Linear(self.hidden, 1))
+            if self.multitask:
+                model = _make_multitask_net()(x.shape[1], self.hidden)
+            else:
+                model = nn.Sequential(nn.Linear(x.shape[1], self.hidden), nn.ReLU(), nn.Linear(self.hidden, 1))
             position_bias = nn.Embedding(POSITIONS, 1)
             nn.init.zeros_(position_bias.weight)
             generator = torch.Generator().manual_seed(self.seed)
@@ -386,13 +433,26 @@ class MLPRanker(Ranker):
                                      lr=learning_rate)
         loss_fn = nn.BCEWithLogitsLoss()
         self.losses = []
+        if self.multitask:
+            if completions is None:
+                raise ValueError("multitask needs completions (training_rows_from(..., with_completion=True))")
+            has_completion = torch.tensor([c is not None for c in completions])
+            target_completion = torch.tensor([c or 0.0 for c in completions], dtype=torch.float32)
         for _ in range(epochs):
             order = torch.randperm(len(y), generator=generator)
             total, batches = 0.0, 0
             for start in range(0, len(y), batch_size):
                 idx = order[start:start + batch_size]
-                logits = model(xs[idx]).squeeze(1) + position_bias(pos[idx]).squeeze(1)
-                loss = loss_fn(logits, y[idx])
+                if self.multitask:
+                    click_logit, completion = model(xs[idx])
+                    logits = click_logit + position_bias(pos[idx]).squeeze(1)
+                    loss = loss_fn(logits, y[idx])
+                    mask = has_completion[idx]
+                    if mask.any():
+                        loss = loss + ((completion[mask] - target_completion[idx][mask]) ** 2).mean()
+                else:
+                    logits = model(xs[idx]).squeeze(1) + position_bias(pos[idx]).squeeze(1)
+                    loss = loss_fn(logits, y[idx])
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
@@ -407,7 +467,7 @@ class MLPRanker(Ranker):
         return self
 
     def summary(self):
-        return {"model": "mlp", "feature_set": self.feature_set,
+        return {"model": "mlp", "feature_set": self.feature_set, "multitask": self.multitask,
                 "features": feature_names(self.feature_set), "hidden": self.hidden,
                 "training_rows": self.training_rows,
                 "click_rate": None if self.positive_rate is None else round(self.positive_rate, 4),
