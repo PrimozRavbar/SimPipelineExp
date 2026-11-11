@@ -23,7 +23,7 @@ def client():
 def test_ui_and_state(client):
     page = client.get("/")
     assert page.status_code == 200 and "SimPipeline Console" in page.text
-    assert "/api/state" in page.text            # the UI reads the API
+    assert "/api/snapshot" in page.text         # the UI reads the API (one combined poll)
 
     state = client.get("/api/state").json()
     assert state["tick"] == 0 and state["model_version"] == 0
