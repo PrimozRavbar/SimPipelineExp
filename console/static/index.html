@@ -402,7 +402,7 @@ ol.runbook { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction:
         : p.flink.lag > 0 ? ["warn", `lag ${fmt(p.flink.lag)} events`] : ["ok", `no lag · ${fmt(p.flink.users_with_features)} users`];
       case "redis": return p.redis_skew != null && p.redis_skew * 100 > p.settings.skew_alert_pct ? ["crit", `skew ${pct(p.redis_skew, 0)} vs offline`] : ["ok", `${fmt(p.redis.keys)} keys · skew ${pct(p.redis_skew, 0)}`];
       case "server": return p.server.fallback_share > 0 ? ["crit", `${pct(p.server.fallback_share, 0)} served by fallback`] : d.mismatch ? ["warn", `serving v${p.server.model_version}, index v${p.ann.index_version}`] : ["ok", `serving v${p.server.model_version} · top ${p.server.slate_size} of ${p.server.num_candidates}`];
-      case "ann": return p.ann.self_test != null && p.ann.self_test < 0.7 ? ["crit", `self-test ${pct(p.ann.self_test, 0)} recall`] : d.mismatch ? ["crit", `embeddings v${p.ann.index_version}, model v${p.ann.model_version}`] : ["ok", `embeddings v${p.ann.index_version} · ${fmt(p.ann.items)} items`];
+      case "ann": return p.ann.self_test != null && p.ann.self_test < 0.8 ? ["crit", `self-test ${pct(p.ann.self_test, 0)} passing`] : d.mismatch ? ["crit", `embeddings v${p.ann.index_version}, model v${p.ann.model_version}`] : ["ok", `embeddings v${p.ann.index_version} · ${fmt(p.ann.items)} items`];
       case "lake": return ["ok", `${fmt(p.lake.events)} events`];
       case "spark": return p.spark.running ? ["warn", `running · done t ${fmt(p.spark.running.done_tick)}`] : p.spark.last_run_tick == null ? ["info", p.spark.every ? `first run at t ${fmt(p.spark.every)}` : "never run"] : ["ok", `last run t ${fmt(p.spark.last_run_tick)}`];
       case "ofs": return ["ok", `${fmt(p.ofs.users)} users · ${fmt(p.ofs.items)} items`];
@@ -531,7 +531,7 @@ ol.runbook { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction:
     return [
       tile("Flink lag", fmt(h.flink_lag) + '<span class="muted" style="font-size:14px"> events</span>', `Kafka events not yet processed · alert at ${fmt(cfg.lag_alert)}`, h.flink_lag > cfg.lag_alert),
       tile("Fallback share", pct(h.fallback_share, 0), "requests served by the popularity fallback, last 10 ticks", h.fallback_share > 0.5),
-      tile("Index self-test", pct(h.index_self_test, 0), "ANN recall vs exact search · alert below 70%", h.index_self_test != null && h.index_self_test < 0.7),
+      tile("Index self-test", pct(h.index_self_test, 0), "golden queries answered as when the index was built · alert below 80%", h.index_self_test != null && h.index_self_test < 0.8),
       tile("Feature skew", pct(h.feature_skew, 0), `online vs offline genre preferences · alert at ${cfg.skew_alert_pct}%`, h.feature_skew != null && h.feature_skew * 100 > cfg.skew_alert_pct),
       tile("Catalog coverage", pct(h.coverage, 1), "movies shown in the last 100 ticks", false),
       tile("Click-mix drift", h.drift_psi == null ? "–" : h.drift_psi.toFixed(2), h.drift_psi == null ? "needs 400 ticks after a deploy" : "PSI vs the first 200 ticks after the deploy · alert at 0.2", h.drift_psi != null && h.drift_psi > 0.2)
