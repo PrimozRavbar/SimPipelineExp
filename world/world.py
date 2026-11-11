@@ -4,6 +4,8 @@ from .entities import User, Movie, Rating, UserState, MovieState
 
 from uuid import uuid4
 
+from simulation.events import OnboardingEvent
+
 
 class World(Service):
 
@@ -16,7 +18,9 @@ class World(Service):
         rng=None,
         users_per_tick=1,
         outcome_model="relevance",
-        user_simulator_kwargs=None
+        user_simulator_kwargs=None,
+        onboarding=None,
+        onboarding_rng=None
     ):
         super().__init__()
 
@@ -38,6 +42,13 @@ class World(Service):
         # Unique id per shown slate. It used to be the tick, which collides
         # once several users are active in the same tick.
         self.recommendation_count = 0
+
+        # Onboarding (opt-in): the first time a user is active they pick
+        # favourite genres (an OnboardingEvent, published before their first
+        # slate). Dict {"genres": k, "noise": p}; None = off. Own RNG.
+        self.onboarding = onboarding
+        self.onboarding_rng = onboarding_rng
+        self.onboarded = set()
 
         # Users who can be active. None = everyone (the original behaviour);
         # WorldDynamics sets it when users join over time.
@@ -77,6 +88,14 @@ class World(Service):
 
     def simulate_user(self, user, sim):
 
+        if self.onboarding and user.user_id not in self.onboarded:
+            self.onboarded.add(user.user_id)
+            self.outbox.append(OnboardingEvent(
+                timestamp=sim.clock.now,
+                user_id=user.user_id,
+                genres=self.declared_genres(user.user_id),
+            ))
+
         model_server = sim.get_service("ModelServer")
 
         movie_ids = model_server.recommend(user)
@@ -91,6 +110,25 @@ class World(Service):
         )
 
         self.outbox.extend(events)
+
+    def declared_genres(self, user_id):
+        """The genres a user ticks at sign-up: their top `genres` genres by
+        true taste, each replaced by a random genre with probability
+        `noise` (people describe their taste imperfectly)."""
+        from world.dynamics import DRIFT_GENRES
+        from world.relevance import genre_share
+
+        count = int(self.onboarding.get("genres", 3))
+        noise = float(self.onboarding.get("noise", 0.3))
+        share = genre_share(self.user_states[user_id])
+        top = sorted((g for g in share if g in DRIFT_GENRES), key=lambda g: (-share[g], DRIFT_GENRES.index(g)))
+        picks = []
+        for genre in top[:count] + [None] * max(0, count - len(top)):
+            if genre is None or self.onboarding_rng.random() < noise:
+                genre = self.onboarding_rng.choice(DRIFT_GENRES)
+            if genre not in picks:
+                picks.append(genre)
+        return picks
 
     def process_events(self, events):
 

@@ -41,6 +41,9 @@ class ModelServer(Service):
       self.fallback = None
       self.retriever_down = False
       self.router = None
+      # Extra candidate sources [(source, k)] merged with the retriever's
+      # candidates (see ml_system.candidate_sources). Empty = off.
+      self.extra_sources = []
       self.requests = 0
       self.fallback_requests = 0
 
@@ -61,6 +64,14 @@ class ModelServer(Service):
           retriever, ranker = self.fallback, None
 
       candidates = retriever.retrieve(request)
+
+      if self.extra_sources and retriever is not self.fallback:
+          from ml_system.candidate_sources import merge_candidates
+          extras = [
+              source.retrieve(RetrievalRequest(user_id=user.user_id, k=k))
+              for source, k in self.extra_sources
+          ]
+          candidates = merge_candidates(candidates, extras, self.num_candidates)
 
       if ranker is not None:
           candidates = ranker.rank(

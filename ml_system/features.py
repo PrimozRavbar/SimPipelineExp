@@ -39,3 +39,53 @@ class ItemRatingFeatureComputer:
             self.rating_sum[movie_id] /
             self.rating_count[movie_id]
         )
+
+# ---------------------------------------------------------------------
+# User genre profile: one definition for Flink (online) and the offline
+# pipeline (training), so both build the same profile from the same events.
+# ---------------------------------------------------------------------
+
+PROFILE_MODES = ("watches", "rich")
+ONBOARDING_WEIGHT = 2.0      # each declared genre counts like two watches
+RICH_DECAY = 0.97            # rich mode: older signal fades with each new one
+RICH_CLICK_WEIGHT = 0.5
+
+
+def update_genre_counts(counts, kind, genres, mode="watches", value=None):
+    """Add one event's signal to a user's raw genre counts (in place).
+
+    kind: "onboarding" (declared favourite genres), "click", "watch"
+    (value = completion) or "rating" (value = 1..5).
+
+    - "watches" mode (the original): +1 per genre of each watched movie;
+      clicks and ratings are ignored.
+    - "rich" mode: existing counts decay by RICH_DECAY, then a click adds
+      0.5, a watch adds its completion (0.05..1) and a rating adds
+      (rating - 3) / 2 (negative for 1-2 stars, floored at 0).
+    - Onboarding adds ONBOARDING_WEIGHT per declared genre in both modes.
+
+    Returns True if the counts changed.
+    """
+    if kind == "onboarding":
+        weight = ONBOARDING_WEIGHT
+    elif mode == "watches":
+        if kind != "watch":
+            return False
+        weight = 1
+    elif mode == "rich":
+        if kind == "click":
+            weight = RICH_CLICK_WEIGHT
+        elif kind == "watch":
+            weight = float(value)
+        elif kind == "rating":
+            weight = (float(value) - 3.0) / 2.0
+        else:
+            return False
+        for genre in counts:
+            counts[genre] *= RICH_DECAY
+    else:
+        raise ValueError("profile mode must be one of %s" % (PROFILE_MODES,))
+
+    for genre in genres:
+        counts[genre] = max(0.0, counts.get(genre, 0) + weight)
+    return True

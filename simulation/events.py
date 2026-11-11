@@ -34,6 +34,11 @@ class RatingEvent(Event):
     rating: float
 
 @dataclass
+class OnboardingEvent(Event):
+    """A new user picked favourite genres at sign-up (opt-in feature)."""
+    genres: list[str]
+
+@dataclass
 class Session:
     session_id: int
     user_id: int

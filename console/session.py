@@ -32,6 +32,7 @@ from console import health
 from ml_system.build_recommendation_system import build_recommendation_system
 from ml_system.faults import FAULT_KINDS, FIXES, FaultInjector
 from ml_system.metrics import reference_ctrs
+from ml_system.candidate_sources import ProfileRetrieval
 from ml_system.experiments import Experiment
 from ml_system.ranking import (ExplorationReranker, LogisticRanker, MLPRanker, MMRReranker,
                                RerankerChain, WatchedFilter)
@@ -66,6 +67,11 @@ DEFAULT_SETTINGS = {
     "rebuild_index": True,     # rebuild the ANN index with the new item tower on deploy
     "ranker": False,           # train and serve a ranking stage after retrieval
     "ranker_mlp": True,        # ranker model: MLP with cross/recent-history features (off: logistic)
+    "ranker_genre_features": True,  # MLP also sees the taste match genre by genre (feature set v3)
+    # Personalisation
+    "profile_candidates": 0,   # extra candidates from the user's genre profile (0 = two-tower only)
+    "rich_profiles": False,    # profiles from clicks, watch completion and ratings, recent first
+    "onboarding": False,       # new users pick favourite genres before their first slate
     "filter_watched": False,   # drop movies the user already watched (re-ranker)
     "diversity_pct": 0,        # MMR on genres: 0 = pure relevance, 100 = most varied slates
     "exploration_pct": 0,      # share of slate slots given to random lower-ranked candidates
@@ -111,6 +117,7 @@ SETTING_LIMITS = {
     "alert_drop_pct": (1, 100),
     "alert_ticks": (10, 10000),
     "alert_window": (5, 1000),
+    "profile_candidates": (0, 100),
     "diversity_pct": (0, 100),
     "exploration_pct": (0, 50),
     "canary_share": (0, 100),
@@ -129,7 +136,8 @@ SETTING_LIMITS = {
     "rewatch_pct": (0, 100),
     "users_joining_per_100_ticks": (0, 10000),
 }
-BOOL_SETTINGS = {"rebuild_index", "ranker", "ranker_mlp", "filter_watched", "eval_gate", "batched_training"}
+BOOL_SETTINGS = {"rebuild_index", "ranker", "ranker_mlp", "filter_watched", "eval_gate", "batched_training",
+                 "ranker_genre_features", "rich_profiles", "onboarding"}
 
 WORLDS = ("static", "dynamic")
 
@@ -299,6 +307,7 @@ class SimSession:
         # Exploration draws from its own seeded RNG (never the shared stream).
         self.explore_rng = random.Random("explore-%d" % seed)
         self.explorer = None
+
         self.logger = self.system["metrics_logger"]
         self.tracker = self.system["ctr_tracker"]
         self.retriever = self.system["retriever"]
@@ -686,6 +695,7 @@ class SimSession:
             "rebuild_index": self.settings["rebuild_index"],
             "ranker": self.settings["ranker"],
             "ranker_mlp": self.settings["ranker_mlp"],
+            "ranker_features": "v3" if self.settings["ranker_genre_features"] else "v2",
             "ranker_rows": None,
             "eval_gate": self.settings["eval_gate"],
             "holdout_pct": self.settings["holdout_pct"],
@@ -751,7 +761,7 @@ class SimSession:
         items = _ItemFeatureSnapshot(self.offline.feature_pipeline.feature_store)
         if record["ranker"] and record["ranker_mlp"]:
             record["ranker_rows"] = MLPRanker.training_rows_from(
-                train_events, self.system["feature_store"], self._genres_of)
+                train_events, self.system["feature_store"], self._genres_of, record["ranker_features"])
         elif record["ranker"]:
             record["ranker_rows"] = LogisticRanker.training_rows_from(train_events, self.system["feature_store"])
 
@@ -798,7 +808,8 @@ class SimSession:
                 record["ranker_rows"] = None
                 ranker = MLPRanker(self.retriever.user_features, self.system["redis"],
                                    self.system["feature_store"], self._genres_of,
-                                   seed=self.seed * 1000 + record["version"])
+                                   seed=self.seed * 1000 + record["version"],
+                                   feature_set=record["ranker_features"])
                 ranker.fit(rows, positions, labels)
             elif record["ranker_rows"] is not None:
                 rows, labels = record["ranker_rows"]
@@ -1116,6 +1127,18 @@ class SimSession:
         self.model_server.reranker = RerankerChain(chain) if chain else None
         if s["ranker"] and s["ranker_mlp"]:
             self.flink.track_recent = True     # recent history for the MLP ranker (stays on)
+        if getattr(self, "profile_source", None) is None:
+            # Second candidate source: content-based, from the genre profile.
+            self.profile_source = ProfileRetrieval(self.retriever.user_features, self.system["feature_store"],
+                                                   self.system["world"].movie_objects)
+        self.model_server.extra_sources = (
+            [(self.profile_source, s["profile_candidates"])] if s["profile_candidates"] else [])
+        mode = "rich" if s["rich_profiles"] else "watches"
+        self.flink.profile_mode = mode
+        self.offline.feature_pipeline.profile_mode = mode
+        self.system["world"].onboarding = {"genres": 3, "noise": 0.3} if s["onboarding"] else None
+        if s["onboarding"]:
+            self.flink.track_onboarding = True    # stays on once switched on
         self.flink.max_events_per_tick = s["flink_capacity"] or None
         d = self.dynamics
         d.taste_drift_every = s["taste_drift_every"]

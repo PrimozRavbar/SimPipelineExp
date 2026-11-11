@@ -5,6 +5,8 @@ from simulation.events import (
     WatchEvent,
     RatingEvent,
 )
+from simulation.events import OnboardingEvent
+from .features import update_genre_counts
 from .features import (
     RatingFeatureComputer,
     ItemRatingFeatureComputer,
@@ -51,6 +53,14 @@ class Flink(Service):
         self.track_recent = False
         self.recent = None
 
+        # profile_mode: how user genre profiles are built ("watches" = the
+        # original, or "rich"; see features.update_genre_counts; the
+        # offline pipeline uses the same). track_onboarding: also consume
+        # OnboardingEvent (declared favourite genres).
+        self.profile_mode = "watches"
+        self.track_onboarding = False
+        self._onboarding_subscribed = False
+
     def start(self, sim):
         super().start(sim)
 
@@ -72,6 +82,11 @@ class Flink(Service):
             self.recent = RecentHistory()
             kafka.subscribe(self.consumer_name, "RecommendationShownEvent", from_end=True)
             self.topics = self.topics + ["RecommendationShownEvent"]
+
+        if self.track_onboarding and not self._onboarding_subscribed:
+            kafka.subscribe(self.consumer_name, "OnboardingEvent")
+            self.topics = self.topics + ["OnboardingEvent"]
+            self._onboarding_subscribed = True
 
         if self.paused:
             return
@@ -110,6 +125,9 @@ class Flink(Service):
 
                 elif isinstance(event, RatingEvent):
                     self.handle_rating(sim, event)
+
+                elif isinstance(event, OnboardingEvent):
+                    self.update_profile(sim, event.user_id, "onboarding", event.genres)
 
                 elif isinstance(event, RecommendationShownEvent):
                     if self.recent is not None:
@@ -156,7 +174,27 @@ class Flink(Service):
         })
 
 
+    def update_profile(self, sim, user_id, kind, genres, value=None):
+        """Apply one profile signal and publish the normalised profile
+        (onboarding in any mode; clicks and ratings in rich mode)."""
+        counts = self.state.setdefault("genre_counts", {}).setdefault(user_id, {})
+        if not update_genre_counts(counts, kind, genres, self.profile_mode, value):
+            return
+        total = sum(counts.values())
+        if total > 0:
+            sim.get_service("Redis").receive({
+                "feature": "genre_preferences",
+                "user_id": user_id,
+                "value": {genre: count / total for genre, count in counts.items()},
+            })
+
+    def movie_genres(self, sim, movie_id):
+        return sim.get_service("World").movie_objects[movie_id].genres
+
     def handle_recommendation_clicked(self, sim, event):
+
+        if self.profile_mode != "watches":
+            self.update_profile(sim, event.user_id, "click", self.movie_genres(sim, event.movie_id))
 
         user_id = event.user_id
 
@@ -181,6 +219,10 @@ class Flink(Service):
 
 
     def handle_rating(self, sim, event):
+
+        if self.profile_mode != "watches":
+            self.update_profile(sim, event.user_id, "rating",
+                                self.movie_genres(sim, event.movie_id), event.rating)
 
         self.update_activity_level(
             sim,
@@ -294,11 +336,14 @@ class Flink(Service):
 
 
         # Add new watch signal
-        for genre in movie.genres:
+        if self.profile_mode == "watches":
+            for genre in movie.genres:
 
-            counts[genre] = (
-                counts.get(genre, 0) + 1
-            )
+                counts[genre] = (
+                    counts.get(genre, 0) + 1
+                )
+        else:
+            update_genre_counts(counts, "watch", movie.genres, self.profile_mode, event.completion)
 
 
         total = sum(
