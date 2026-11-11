@@ -2,8 +2,12 @@
 dashboard would. They read only ML-system state (never World ground
 truth) and use no randomness.
 
-- index_self_test: ANN recall against exact (brute-force) search for a
-  sample of movies. A wrong id mapping fails it.
+- golden_queries / index_self_test: probe queries recorded when an index
+  is built ("golden queries"); the serving index must still return the
+  same ids. A wrong id mapping fails it; a healthy index scores 100%.
+  (An earlier version compared against exact search, which gave false
+  alarms: trained item embeddings are nearly collapsed, so a healthy HNSW
+  index matched exact search for only ~75-95% of probes.)
 - feature_skew: for recently served users, how far the online (Redis,
   what serving reads) genre preferences are from the offline ones (feature
   store, last Spark run). Total-variation distance, 0..1.
@@ -19,40 +23,30 @@ import math
 from world.external_data_loader import GENRE_NAMES
 
 
-def index_self_test(index, movie_ids, sample=40, k=5, tolerance=0.02):
-    """ANN recall check against exact search: for a sample of movies, query
-    the serving index with the movie's stored embedding and count it as a
-    pass when the best of the top k hits is (within `tolerance` cosine) as
-    close as the exact nearest neighbour. Healthy HNSW scores ~0.9-1.0; a
-    broken id mapping returns movies whose vectors don't match the query.
-    Returns the pass rate, or None if the index has no stored embeddings."""
+def golden_queries(index, movie_ids, sample=40, k=5):
+    """Probe queries with their expected answers, recorded from a freshly
+    built (trusted) index: a sample of movies' own stored embeddings and
+    the top k ids the index returns for each. Returns [] if the index
+    exposes no stored embeddings."""
     base = index
     while hasattr(base, "inner"):
         base = base.inner
     nodes = getattr(base, "nodes", None)
     if not nodes:
-        return None
+        return []
     ids = [m for m in sorted(movie_ids) if m in nodes]
-    if not ids:
-        return None
-    import numpy as np
-
-    matrix = np.array([nodes[m].unit for m in ids])
-    position = {m: i for i, m in enumerate(ids)}
     step = max(1, len(ids) // sample)
-    probe = ids[::step][:sample]
+    return [(nodes[m].embedding, index.search(nodes[m].embedding, k)) for m in ids[::step][:sample]]
 
-    hits = 0
-    for movie_id in probe:
-        row = position[movie_id]
-        scores = matrix @ matrix[row]
-        scores[row] = -np.inf
-        exact = scores.max()
-        found = [m for m in index.search(nodes[movie_id].embedding, k + 1)
-                 if m in position and m != movie_id][:k]
-        if found and max(scores[position[m]] for m in found) >= exact - tolerance:
-            hits += 1
-    return hits / len(probe)
+
+def index_self_test(index, golden):
+    """Share of golden queries for which the serving index still returns
+    exactly the recorded ids. HNSW search is deterministic, so a healthy
+    index scores 1.0; a broken id mapping scores ~0. None without probes."""
+    if not golden:
+        return None
+    k = len(golden[0][1])
+    return sum(index.search(query, k) == expected for query, expected in golden) / len(golden)
 
 
 def _normalise(preferences):

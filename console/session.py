@@ -162,7 +162,7 @@ RUNBOOKS = {
         "Restart the model server (Pipeline, Model server).",
     ],
     "index_health": [
-        "The ANN index self-test fails: its results don't match an exact search over the same vectors.",
+        "The ANN index self-test fails: golden queries recorded when the index was built now return other movies.",
         "The index's id mapping is broken. Rebuild the index (Pipeline, ANN index) or deploy a model with a fresh index.",
     ],
     "feature_skew": [
@@ -361,6 +361,7 @@ class SimSession:
                        "fallback_share": 0.0, "coverage": None, "drift_psi": None, "feature_age": 0}
         self.fallback_ticks = {}         # tick -> (requests, fallback requests)
         self.open_rules = {}             # rule -> incident
+        self.golden = {}                 # index version -> golden queries
         self.drift_reference = None      # genre mix of clicks just after the last deploy
         self._apply_live_settings()
 
@@ -1180,12 +1181,12 @@ class SimSession:
             self._ctr_rule(now)
 
         if now % 25 == 0:
-            h["index_self_test"] = health.index_self_test(self.retriever.ann_index, self.system["world"].movie_objects)
+            h["index_self_test"] = health.index_self_test(self.retriever.ann_index, self._golden())
             ok = h["index_self_test"]
-            self._rule("index_health", ok is not None and ok < 0.7, ok is not None and ok >= 0.8,
+            self._rule("index_health", ok is not None and ok < 0.8, ok is not None and ok >= 0.95,
                        "SEV2", "ANN index self-test failing",
-                       "ANN recall against exact search is %.0f%% (healthy is 85-100%%, alert below 70%%)."
-                       % ((ok or 0) * 100))
+                       "Only %.0f%% of the golden queries recorded when index v%d was built still return "
+                       "the same movies (healthy is 100%%, alert below 80%%)." % ((ok or 0) * 100, self.index_version))
 
             events = self._recent_events(50)
             users = sorted({e.user_id for e in events})
@@ -1240,6 +1241,15 @@ class SimSession:
                   if type(e).__name__ == "RecommendationClickedEvent"]
         self.health["drift_psi"] = health.genre_psi(self.drift_reference,
                                                     health.genre_distribution(recent, catalog))
+
+    def _golden(self):
+        """Golden queries for the index version that should be serving,
+        recorded once from that version's own (freshly built) index."""
+        version = self.index_version
+        if version not in self.golden:
+            self.golden[version] = health.golden_queries(self.versions[version].index,
+                                                         self.system["world"].movie_objects)
+        return self.golden[version]
 
     def _ctr_rule(self, now):
         s = self.settings

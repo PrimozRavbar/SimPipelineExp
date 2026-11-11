@@ -261,8 +261,9 @@ its Spark stage), `freshness_alert`, export to `<run_dir>/models/vN`.
 
 Health checks and incident rules (`console/health.py`, `SimSession._monitor`): CTR drop at
 any time (rolling window vs the 4 windows before) and after a deploy, Flink lag
-(`lag_alert`), fallback share > 50%, ANN self-test (recall against exact search on stored
-item embeddings, alert < 70%; healthy trained indexes score ~85%), online/offline feature
+(`lag_alert`), fallback share > 50%, ANN self-test (golden queries recorded from each
+index version when first checked must still return the same ids: healthy = 100%, alert
+< 80%), online/offline feature
 skew (`skew_alert_pct`), feature freshness, click-mix drift (PSI of the genre mix of clicks in
 the last 200 ticks vs the first 200 after the current deploy, so the model's own effect is
 not counted as drift; alert > 0.2). Each rule opens one incident with a runbook and
@@ -315,8 +316,10 @@ result is unstable: the model collapses to a few dozen near-global slates.
   Missions are still mock.
 - Trained item embeddings are nearly collapsed (every pair has cosine > 0.92, ~250 distinct
   vectors for 1682 movies: the trained item tower sees only genres). HNSW finds the exact
-  nearest neighbour for only ~85% of item queries on such an index (duplicates are pruned by
-  the neighbour heuristic); the console's index self-test threshold allows for it.
+  nearest neighbour for only ~75-95% of item queries on such an index (duplicates are pruned
+  by the neighbour heuristic). The console's index self-test first compared against exact
+  search and raised false "self-test failing" incidents after normal deploys; it now uses
+  golden queries instead (`tests/test_faults.py` has the regression test).
 - A popularity list beats the first retrained two-tower model online (~26% vs ~20%), so the
   `model_server_outage` fault can raise CTR early in a game.
 - Canary statistics treat each slate as independent (users repeat), so the 95% intervals are

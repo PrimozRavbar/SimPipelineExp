@@ -114,3 +114,27 @@ def test_outage_opens_fallback_incident_and_restart_resolves_it():
     assert s.health["fallback_share"] == 0.0
     assert all(i["status"] == "Resolved" for i in s.incidents_view() if i["rule"] == "fallback")
     s.close()
+
+
+def test_healthy_retrained_indexes_never_fail_the_self_test():
+    # Regression: the old self-test compared against exact search and
+    # scored healthy trained indexes as low as ~75% (alert at 70%), so a
+    # plain deploy could open "ANN index self-test failing".
+    from console import health
+    from ml_system.faults import RemappedIndex
+
+    s = SimSession(seed=42, users_per_tick=5, log_metrics=False, world="dynamic",
+                   settings={"deploy_delay": 10, "epochs": 1, "ranker": True})
+    movies = s.system["world"].movie_objects
+    for _ in range(3):
+        s.step(150)
+        s.submit("retrain")
+        s.step(40)
+        assert s.health["index_self_test"] == 1.0
+        golden = s._golden()
+        ids = sorted(movies)
+        broken = RemappedIndex(s.retriever.ann_index, {m: ids[(i + 7) % len(ids)] for i, m in enumerate(ids)})
+        assert health.index_self_test(broken, golden) < 0.2
+    assert s.serving_version == 3
+    assert not any(i["rule"] == "index_health" for i in s.incidents_view())
+    s.close()
