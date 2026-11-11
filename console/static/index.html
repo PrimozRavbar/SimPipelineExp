@@ -542,7 +542,7 @@ ol.runbook { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction:
           ${bar("Best possible (oracle)", r.oracle, "the 10 most relevant movies in the catalog")}
           ${bar("Best of all candidates", r.candidates, `what the ranker could pick from · retrieval loses ${(r.retrieval_loss * 100).toFixed(1)} pts`)}
           ${bar("Best of two-tower candidates", r.two_tower, `${pct(r.relevant_share.two_tower, 0)} of them relevant`)}
-          ${r.has_extra_sources ? bar("Best of profile candidates", r.extra, `${pct(r.relevant_share.extra, 0)} of them relevant`) : ""}
+          ${r.has_extra_sources ? bar("Best of extra candidates (profile, co-watch)", r.extra, `${pct(r.relevant_share.extra, 0)} of them relevant`) : ""}
           ${bar("Candidates ordered by the learned profile", r.profile, "no ground truth: the best the system could do with what it knows about each user")}
           ${bar("Served", r.served, `ranking loses ${(r.ranking_loss * 100).toFixed(1)} pts · ${pct(r.relevant_share.served, 0)} of the slate relevant`)}
           <p class="muted" style="font-size:12px; margin-top:8px">${r.users} users, measured at tick ${fmt(r.tick)}. Expected click rates under the user model.</p></div>`;
