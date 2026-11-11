@@ -225,3 +225,18 @@ def test_diversity_and_exploration_settings_build_a_reranker_chain():
     s.step(1)
     assert s.model_server.reranker is None
     s.close()
+
+
+def test_epochs_change_while_paused_reaches_the_next_model():
+    # Regression (UI): while paused, an applied setting looked reverted until
+    # the next tick. The backend contract: it applies at the next boundary,
+    # before a retrain queued after it.
+    s = make(epochs=5)
+    s.step(30)
+    s.submit("settings", epochs=2, batched_training=False)
+    assert s.settings["epochs"] == 5                  # still pending while paused
+    s.submit("retrain")
+    s.step(12)
+    assert s.settings["epochs"] == 2
+    assert s.versions[1].info["epochs"] == 2 and s.versions[1].info["batched"] is False
+    s.close()
