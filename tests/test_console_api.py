@@ -23,7 +23,7 @@ def client():
 def test_ui_and_state(client):
     page = client.get("/")
     assert page.status_code == 200 and "SimPipeline Console" in page.text
-    assert "/api/state" in page.text            # the UI reads the API
+    assert "/api/snapshot" in page.text         # the UI reads the API (one combined poll)
 
     state = client.get("/api/state").json()
     assert state["tick"] == 0 and state["model_version"] == 0
@@ -65,3 +65,11 @@ def test_settings_and_errors(client):
     assert client.post("/api/step", json={"ticks": 1}).status_code == 409
     client.post("/api/pause")
     assert client.get("/api/incidents").json() == {"incidents": []}
+
+
+def test_snapshot_bundles_every_read(client):
+    snap = client.get("/api/snapshot", params={"since": 0, "events_since": 0}).json()
+    assert set(snap) == {"state", "metrics", "events", "incidents", "models", "pipeline", "faults"}
+    assert snap["state"]["tick"] == client.get("/api/state").json()["tick"]
+    assert snap["metrics"]["rows"] == client.get("/api/metrics", params={"since": 0}).json()["rows"]
+    assert snap["events"] == client.get("/api/events").json()["events"]
