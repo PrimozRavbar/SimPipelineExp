@@ -164,7 +164,8 @@ ol.runbook { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction:
     screen: "monitoring", node: "server", alert: null, range: 600, window: 50, toast: null, toastErr: false,
     connected: false, error: null,
     st: null, rows: [], deploys: [], log: [], logSeq: 0, models: null, pipe: null, incidents: [],
-    draft: {}
+    draft: {},     // edited but not applied yet
+    pending: {}    // applied, waiting for the next tick boundary
   };
   try { const h = location.hash.slice(1); if (SCREENS.includes(h)) S.screen = h; } catch (e) {}
 
@@ -196,6 +197,11 @@ ol.runbook { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction:
       ]);
       S.faults = await get("/api/faults");
       if (S.st && st.tick < S.st.tick) { S.rows = []; S.log = []; S.logSeq = 0; } // server restarted
+      // Pending settings stay on screen until the server reports them
+      // (or until no action is queued any more, i.e. it was rejected).
+      for (const k of Object.keys(S.pending)) {
+        if (pipe.settings[k] === S.pending[k] || st.pending_actions === 0) delete S.pending[k];
+      }
       S.st = st; S.pipe = pipe; S.deploys = m.deploys; S.incidents = inc.incidents; S.models = models;
       for (const r of m.rows) if (!S.rows.length || r.tick > S.rows[S.rows.length - 1].tick) S.rows.push(r);
       for (const e of ev.events) { S.log.push(e); S.logSeq = Math.max(S.logSeq, e.seq); }
@@ -428,12 +434,13 @@ ol.runbook { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction:
 
   function pipeline(d) {
     const n = NODES[S.node], [st, txt] = nodeStatus(S.node, d), cfg = S.pipe ? S.pipe.settings : {};
-    const val = (k) => (k in S.draft ? S.draft[k] : cfg[k]);
+    const val = (k) => (k in S.draft ? S.draft[k] : k in S.pending ? S.pending[k] : cfg[k]);
+    const pendingNote = (k) => k in S.pending ? ` <span class="s-accent" style="font-size:12px">· applies at the next tick${d.st && !d.st.playing ? " (press play)" : ""}</span>` : "";
     const live = n.fields.filter((f) => f[0]);
     const fields = n.fields.map(([k, lab, help, mockv]) => k
-      ? `<div class="field"><div><label for="f-${k}">${lab}</label>${help ? `<small>${help}</small>` : ""}</div><input id="f-${k}" type="number" data-cfg="${k}" step="1" value="${val(k) == null ? "" : val(k)}"></div>`
+      ? `<div class="field"><div><label for="f-${k}">${lab}</label>${pendingNote(k)}${help ? `<small>${help}</small>` : ""}</div><input id="f-${k}" type="number" data-cfg="${k}" step="1" value="${val(k) == null ? "" : val(k)}"></div>`
       : `<div class="field notlive"><div><label for="f-m-${lab}">${lab}</label><small>${help}</small></div><input id="f-m-${lab}" type="number" value="${mockv}" disabled></div>`).join("");
-    const toggles = (n.toggles || []).map(([k, lab, help]) => `<div class="field"><div><span id="l-${k}">${lab}</span><small>${help}</small></div><button class="switch" role="switch" aria-checked="${!!cfg[k]}" aria-labelledby="l-${k}" data-act="toggle" data-v="${k}"></button></div>`).join("");
+    const toggles = (n.toggles || []).map(([k, lab, help]) => `<div class="field"><div><span id="l-${k}">${lab}</span>${pendingNote(k)}<small>${help}</small></div><button class="switch" role="switch" aria-checked="${!!val(k)}" aria-labelledby="l-${k}" data-act="toggle" data-v="${k}"></button></div>`).join("");
     const dirty = live.some(([k]) => k in S.draft && S.draft[k] !== cfg[k]);
     const apply = live.length ? `<button class="btn ${dirty ? "primary" : ""}" data-act="apply" style="margin-top:14px" ${dirty ? "" : "disabled"}>Apply at next tick</button>` : "";
     const actions = S.node === "spark" ? `<button class="btn" data-act="spark" style="margin-top:14px">Run feature job now (${d.st ? d.st.budget.spark_cost : 5} credits)</button>`
@@ -596,11 +603,13 @@ ol.runbook { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction:
   }
 
   function say(msg, err) { S.toast = msg; S.toastErr = !!err; S.toastAt = Date.now(); }
-  async function call(path, body, ok) {
+  async function call(path, body, ok, onError) {
     try { const r = await post(path, body); if (ok) say(typeof ok === "function" ? ok(r) : ok); }
-    catch (e) { say(String(e.message || e), true); }
+    catch (e) { say(String(e.message || e), true); if (onError) onError(); }
     await poll(); render(true);
   }
+  // A rejected settings change must not stay on screen as pending.
+  const dropPending = (keys) => () => { for (const k of keys) delete S.pending[k]; };
 
   function act(name, v) {
     const st = S.st;
@@ -611,14 +620,19 @@ ol.runbook { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction:
       case "step": return call("/api/step", { ticks: 10 });
       case "speed": return call("/api/speed", { speed: +v });
       case "range": S.range = +v; break;
-      case "node": S.node = v; S.draft = {}; break;
+      case "node": S.node = v; break;     // unapplied edits are kept
       case "alert": S.alert = v; break;
-      case "toggle": return call("/api/settings", { [v]: !(S.pipe && S.pipe.settings[v]) }, "Setting queued: applies at the next tick boundary.");
+      case "toggle": {
+        const now = v in S.pending ? S.pending[v] : !!(S.pipe && S.pipe.settings[v]);
+        S.pending[v] = !now;
+        return call("/api/settings", { [v]: !now }, "Setting queued: applies at the next tick boundary." + (st && !st.playing ? " Press play (or step) to apply it." : ""), dropPending([v]));
+      }
       case "apply": {
         const cfg = S.pipe ? S.pipe.settings : {}, body = {};
         for (const [k, x] of Object.entries(S.draft)) if (x !== cfg[k]) body[k] = x;
         S.draft = {};
-        return call("/api/settings", body, "Settings queued: they apply at the next tick boundary.");
+        Object.assign(S.pending, body);
+        return call("/api/settings", body, "Settings queued: they apply at the next tick boundary." + (st && !st.playing ? " Press play (or step) to apply them." : ""), dropPending(Object.keys(body)));
       }
       case "spark": return call("/api/spark", {}, "Spark feature job queued for the next tick boundary.");
       case "retrain": return call("/api/retrain", {}, (r) => `Retrain queued at tick ${fmt(r.applies_at_tick)}. Serving continues; the new model deploys ${S.pipe ? S.pipe.settings.deploy_delay : "N"} ticks after it starts.` + (st && !st.playing ? " Press play." : ""));
@@ -636,6 +650,10 @@ ol.runbook { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction:
     const k = e.target.dataset && e.target.dataset.cfg; if (!k) return;
     const n = parseInt(e.target.value, 10); if (!Number.isNaN(n)) S.draft[k] = n;
     const btn = document.querySelector('[data-act="apply"]'); if (btn) { btn.disabled = false; btn.classList.add("primary"); }
+  });
+  // Enter in a settings field applies the edits.
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && e.target.dataset && e.target.dataset.cfg) { e.preventDefault(); act("apply"); }
   });
   window.addEventListener("hashchange", () => { const h = location.hash.slice(1); if (SCREENS.includes(h) && h !== S.screen) { S.screen = h; render(true); } });
   render(true);
