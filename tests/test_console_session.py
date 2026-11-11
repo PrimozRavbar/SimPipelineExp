@@ -200,3 +200,28 @@ def test_slow_spark_job_delays_training_and_failures_abort_it():
     assert s.retrain is None and s.serving_version == 0 and s.last_spark_tick is None
     assert any("FAILED" in e["text"] for e in s.events())
     s.close()
+
+
+def test_mlp_ranker_trains_and_flink_tracks_recent_history():
+    s = make(ranker=True, ranker_mlp=True)
+    assert s.flink.track_recent
+    s.step(30)
+    s.submit("retrain")
+    s.step(12)
+    info = s.models()["versions"][0]["ranker_info"]
+    assert info["model"] == "mlp" and info["training_rows"] > 0
+    assert s.model_server.ranker is s.versions[1].ranker
+    assert any(k[0] == "recent_slates" for k in s.system["redis"].store)
+    s.close()
+
+
+def test_diversity_and_exploration_settings_build_a_reranker_chain():
+    s = make(filter_watched=True, diversity_pct=30, exploration_pct=10)
+    chain = s.model_server.reranker
+    assert [type(r).__name__ for r in chain.rerankers] == ["WatchedFilter", "MMRReranker", "ExplorationReranker"]
+    s.step(20)
+    assert s.explorer.slots == 20 * 3 * s.settings["slate_size"]
+    s.submit("settings", diversity_pct=0, exploration_pct=0, filter_watched=False)
+    s.step(1)
+    assert s.model_server.reranker is None
+    s.close()

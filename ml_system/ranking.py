@@ -185,3 +185,284 @@ class WatchedFilter(Reranker):
         if not watched:
             return list(candidates)
         return [m for m in candidates if m not in watched]
+
+
+# ---------------------------------------------------------------------
+# Richer ranker: cross and recent-history features, small MLP
+# ---------------------------------------------------------------------
+
+RECENT_WATCHES = 5      # last N watched movies per user
+RECENT_SLATES = 3       # last N shown slates per user
+
+FEATURES_V2 = (
+    "genre_match", "has_profile", "log_popularity", "item_rating",
+    "match_x_popularity",        # cross: taste match x popularity
+    "coldstart_x_popularity",    # cross: no profile yet x popularity
+    "recent_genre_match",        # match with the genres of the last watches
+    "watched_recently",          # movie among the last watches
+    "shown_recently",            # times shown in the last slates (fatigue)
+)
+
+
+class RecentHistory:
+    """Per-user recent watches and shown slates. The same class is updated
+    by Flink online (published to Redis) and replayed over the event log
+    for training, so both sides use one definition."""
+
+    def __init__(self):
+        self.watches = {}    # user_id -> list of movie ids, newest last
+        self.slates = {}     # user_id -> list of tuples of movie ids, newest last
+
+    def observe(self, event):
+        name = type(event).__name__
+        if name == "WatchEvent":
+            self.add_watch(event.user_id, event.movie_id)
+        elif name == "RecommendationShownEvent":
+            self.add_slate(event.user_id, event.movie_ids)
+
+    def add_watch(self, user_id, movie_id):
+        watches = self.watches.setdefault(user_id, [])
+        watches.append(movie_id)
+        del watches[:-RECENT_WATCHES]
+        return list(watches)
+
+    def add_slate(self, user_id, movie_ids):
+        slates = self.slates.setdefault(user_id, [])
+        slates.append(tuple(movie_ids))
+        del slates[:-RECENT_SLATES]
+        return list(slates)
+
+    def get(self, user_id):
+        return list(self.watches.get(user_id, ())), list(self.slates.get(user_id, ()))
+
+
+def features_v2(user_features, recent_watches, recent_slates, item_features, movie_id, genres_of):
+    """`genres_of(movie_id)` gives a movie's catalog genres."""
+    base = content_features(user_features, item_features)
+    match, has_profile, log_pop, _ = base
+    recent = {}
+    for watched in recent_watches:
+        for genre in genres_of(watched):
+            recent[genre] = recent.get(genre, 0.0) + 1.0
+    genres = (item_features or {}).get("genres") or genres_of(movie_id)
+    return base + [
+        match * log_pop,
+        (1.0 - has_profile) * log_pop,
+        genre_match(recent, genres),
+        1.0 if movie_id in recent_watches else 0.0,
+        float(sum(movie_id in slate for slate in recent_slates)),
+    ]
+
+
+class MLPRanker(Ranker):
+    """score = MLP(features) + position_bias[position] in training; the
+    position term (a separate 'shallow tower') is dropped at serving, so
+    the MLP learns relevance without the credit that comes from being shown
+    at the top. Trained with binary cross-entropy on cascade rows, seeded,
+    CPU only."""
+
+    def __init__(self, user_features_fn, redis, feature_store, genres_of, hidden=16, seed=0):
+        self.user_features_fn = user_features_fn
+        self.redis = redis
+        self.feature_store = feature_store
+        self.genres_of = genres_of
+        self.hidden = hidden
+        self.seed = seed
+        self.model = None
+        self.mean = None
+        self.scale = None
+        self.training_rows = 0
+        self.positive_rate = None
+        self.losses = []
+
+    # -- serving ---------------------------------------------------------
+
+    def rank(self, user, candidates):
+        if self.model is None or not candidates:
+            return list(candidates)
+        import torch
+
+        user_features = self.user_features_fn(user.user_id)
+        watches = self.redis.get("recent_watches", user.user_id) or []
+        slates = self.redis.get("recent_slates", user.user_id) or []
+        rows = [features_v2(user_features, watches, slates, self.feature_store.get_item_features(m),
+                            m, self.genres_of) for m in candidates]
+        with torch.no_grad():
+            x = (torch.tensor(rows, dtype=torch.float32) - self.mean) / self.scale
+            scores = self.model(x).squeeze(1).tolist()
+        order = sorted(range(len(candidates)), key=lambda i: (-scores[i], i))
+        return [candidates[i] for i in order]
+
+    # -- training --------------------------------------------------------
+
+    @staticmethod
+    def training_rows_from(events, feature_store, genres_of):
+        """Cascade rows (see LogisticRanker.training_rows_from) with v2
+        features; recent history is replayed in event order, as of just
+        before each slate. Returns (rows, positions, labels)."""
+        clicks = {e.recommendation_id: e.movie_id for e in events
+                  if isinstance(e, RecommendationClickedEvent)}
+        history = RecentHistory()
+        rows, positions, labels = [], [], []
+        for event_order, event in enumerate(events):
+            if isinstance(event, RecommendationShownEvent):
+                watches, slates = history.get(event.user_id)
+                user = feature_store.get_user_features_as_of(event.user_id, event.timestamp, event_order) or {}
+                clicked = clicks.get(event.recommendation_id)
+                movie_ids = list(event.movie_ids)
+                last = movie_ids.index(clicked) if clicked in movie_ids else len(movie_ids) - 1
+                for position, movie_id in enumerate(movie_ids[:last + 1]):
+                    item = feature_store.get_item_features_as_of(movie_id, event.timestamp, event_order)
+                    rows.append(features_v2(user, watches, slates, item, movie_id, genres_of))
+                    positions.append(min(position, POSITIONS - 1))
+                    labels.append(1.0 if movie_id == clicked else 0.0)
+            history.observe(event)
+        return rows, positions, labels
+
+    def fit(self, rows, positions, labels, epochs=8, batch_size=512, learning_rate=0.01):
+        import torch
+        import torch.nn as nn
+
+        if not rows or not any(labels) or all(labels):
+            raise ValueError("need both clicked and skipped examples to fit the ranker")
+
+        x = torch.tensor(rows, dtype=torch.float32)
+        y = torch.tensor(labels, dtype=torch.float32)
+        pos = torch.tensor(positions, dtype=torch.long)
+        self.mean = x.mean(dim=0)
+        self.scale = x.std(dim=0)
+        self.scale[self.scale == 0] = 1.0
+        xs = (x - self.mean) / self.scale
+
+        # Seeded init and shuffling without touching the global torch RNG.
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(self.seed)
+            model = nn.Sequential(nn.Linear(x.shape[1], self.hidden), nn.ReLU(), nn.Linear(self.hidden, 1))
+            position_bias = nn.Embedding(POSITIONS, 1)
+            nn.init.zeros_(position_bias.weight)
+            generator = torch.Generator().manual_seed(self.seed)
+
+        optimizer = torch.optim.Adam(list(model.parameters()) + list(position_bias.parameters()),
+                                     lr=learning_rate)
+        loss_fn = nn.BCEWithLogitsLoss()
+        self.losses = []
+        for _ in range(epochs):
+            order = torch.randperm(len(y), generator=generator)
+            total, batches = 0.0, 0
+            for start in range(0, len(y), batch_size):
+                idx = order[start:start + batch_size]
+                logits = model(xs[idx]).squeeze(1) + position_bias(pos[idx]).squeeze(1)
+                loss = loss_fn(logits, y[idx])
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                total += loss.item()
+                batches += 1
+            self.losses.append(total / batches)
+
+        self.model = model.eval()
+        self.position_bias = [float(v) for v in position_bias.weight.detach().squeeze(1)]
+        self.training_rows = len(y)
+        self.positive_rate = float(y.mean())
+        return self
+
+    def summary(self):
+        return {"model": "mlp", "features": list(FEATURES_V2), "hidden": self.hidden,
+                "training_rows": self.training_rows,
+                "click_rate": None if self.positive_rate is None else round(self.positive_rate, 4),
+                "final_loss": round(self.losses[-1], 4) if self.losses else None,
+                "position_bias": [round(v, 3) for v in getattr(self, "position_bias", [])]}
+
+
+# ---------------------------------------------------------------------
+# Re-rankers: diversity (MMR) and exploration, and a chain to combine them
+# ---------------------------------------------------------------------
+
+def genre_similarity(a, b):
+    """Jaccard similarity of two genre lists."""
+    a, b = set(a), set(b)
+    return len(a & b) / len(a | b) if a and b else 0.0
+
+
+class MMRReranker(Reranker):
+    """Maximal marginal relevance on genres.
+
+    Greedily rebuilds the top `pool` candidates: each step picks the
+    candidate maximising (1 - diversity) * relevance - diversity * (max
+    genre similarity to the movies already picked). Relevance comes from
+    the incoming order (1 for the first candidate, falling linearly), so it
+    works after any ranker. diversity 0 = keep the order, 1 = most varied.
+    Candidates beyond the pool keep their order after it.
+    """
+
+    def __init__(self, genres_of, diversity=0.3, pool=30):
+        if not 0.0 <= diversity <= 1.0:
+            raise ValueError("diversity must be in [0, 1]")
+        self.genres_of = genres_of
+        self.diversity = diversity
+        self.pool = pool
+
+    def rerank(self, user, candidates):
+        candidates = list(candidates)
+        if self.diversity == 0 or len(candidates) < 2:
+            return candidates
+        pool, rest = candidates[:self.pool], candidates[self.pool:]
+        n = len(pool)
+        relevance = {m: 1.0 - i / n for i, m in enumerate(pool)}
+        genres = {m: self.genres_of(m) for m in pool}
+        chosen, remaining = [], list(pool)
+        while remaining:
+            def value(m):
+                similarity = max((genre_similarity(genres[m], genres[c]) for c in chosen), default=0.0)
+                return (1 - self.diversity) * relevance[m] - self.diversity * similarity
+            best = max(remaining, key=lambda m: (value(m), relevance[m]))
+            chosen.append(best)
+            remaining.remove(best)
+        return chosen + rest
+
+
+class ExplorationReranker(Reranker):
+    """Give a share of the visible slots to candidates from further down
+    the list, so the system keeps learning about items it would not show.
+
+    Each of the first `slate_size()` slots is, with probability `rate`,
+    filled by a random candidate from below the slate. `rng` is a seeded
+    random.Random; calls happen in request order, so runs are reproducible.
+    """
+
+    def __init__(self, rate, slate_size, rng):
+        if not 0.0 <= rate <= 1.0:
+            raise ValueError("rate must be in [0, 1]")
+        self.rate = rate
+        self.slate_size = slate_size
+        self.rng = rng
+        self.explored = 0
+        self.slots = 0
+
+    def rerank(self, user, candidates):
+        candidates = list(candidates)
+        size = self.slate_size()
+        head, tail = candidates[:size], candidates[size:]
+        if not tail or self.rate == 0:
+            return candidates
+        out = []
+        for _ in range(len(head)):
+            self.slots += 1
+            if tail and self.rng.random() < self.rate:
+                out.append(tail.pop(self.rng.randrange(len(tail))))
+                self.explored += 1
+            else:
+                out.append(head.pop(0))
+        return out + head + tail
+
+
+class RerankerChain(Reranker):
+    """Apply re-rankers in order (e.g. filter -> diversity -> exploration)."""
+
+    def __init__(self, rerankers):
+        self.rerankers = list(rerankers)
+
+    def rerank(self, user, candidates):
+        for reranker in self.rerankers:
+            candidates = reranker.rerank(user, candidates)
+        return candidates

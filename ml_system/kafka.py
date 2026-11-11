@@ -17,9 +17,13 @@ class Kafka(Service):
 
         self.topics[topic].append(event)
 
-    def subscribe(self, consumer_name, topic):
+    def subscribe(self, consumer_name, topic, from_end=False):
+        """from_end=True starts at the newest message (a consumer that only
+        wants what is published from now on)."""
         self.subscribers.setdefault(topic, []).append(consumer_name)
-        self.offsets[(consumer_name, topic)] = 0
+        self.offsets[(consumer_name, topic)] = (
+            len(self.topics.get(topic, [])) if from_end else 0
+        )
 
 
     def poll(self, consumer_name, topic, max_records=None):
