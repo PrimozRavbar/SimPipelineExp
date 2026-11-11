@@ -372,3 +372,97 @@ class MLPRanker(Ranker):
                 "click_rate": None if self.positive_rate is None else round(self.positive_rate, 4),
                 "final_loss": round(self.losses[-1], 4) if self.losses else None,
                 "position_bias": [round(v, 3) for v in getattr(self, "position_bias", [])]}
+
+
+# ---------------------------------------------------------------------
+# Re-rankers: diversity (MMR) and exploration, and a chain to combine them
+# ---------------------------------------------------------------------
+
+def genre_similarity(a, b):
+    """Jaccard similarity of two genre lists."""
+    a, b = set(a), set(b)
+    return len(a & b) / len(a | b) if a and b else 0.0
+
+
+class MMRReranker(Reranker):
+    """Maximal marginal relevance on genres.
+
+    Greedily rebuilds the top `pool` candidates: each step picks the
+    candidate maximising (1 - diversity) * relevance - diversity * (max
+    genre similarity to the movies already picked). Relevance comes from
+    the incoming order (1 for the first candidate, falling linearly), so it
+    works after any ranker. diversity 0 = keep the order, 1 = most varied.
+    Candidates beyond the pool keep their order after it.
+    """
+
+    def __init__(self, genres_of, diversity=0.3, pool=30):
+        if not 0.0 <= diversity <= 1.0:
+            raise ValueError("diversity must be in [0, 1]")
+        self.genres_of = genres_of
+        self.diversity = diversity
+        self.pool = pool
+
+    def rerank(self, user, candidates):
+        candidates = list(candidates)
+        if self.diversity == 0 or len(candidates) < 2:
+            return candidates
+        pool, rest = candidates[:self.pool], candidates[self.pool:]
+        n = len(pool)
+        relevance = {m: 1.0 - i / n for i, m in enumerate(pool)}
+        genres = {m: self.genres_of(m) for m in pool}
+        chosen, remaining = [], list(pool)
+        while remaining:
+            def value(m):
+                similarity = max((genre_similarity(genres[m], genres[c]) for c in chosen), default=0.0)
+                return (1 - self.diversity) * relevance[m] - self.diversity * similarity
+            best = max(remaining, key=lambda m: (value(m), relevance[m]))
+            chosen.append(best)
+            remaining.remove(best)
+        return chosen + rest
+
+
+class ExplorationReranker(Reranker):
+    """Give a share of the visible slots to candidates from further down
+    the list, so the system keeps learning about items it would not show.
+
+    Each of the first `slate_size()` slots is, with probability `rate`,
+    filled by a random candidate from below the slate. `rng` is a seeded
+    random.Random; calls happen in request order, so runs are reproducible.
+    """
+
+    def __init__(self, rate, slate_size, rng):
+        if not 0.0 <= rate <= 1.0:
+            raise ValueError("rate must be in [0, 1]")
+        self.rate = rate
+        self.slate_size = slate_size
+        self.rng = rng
+        self.explored = 0
+        self.slots = 0
+
+    def rerank(self, user, candidates):
+        candidates = list(candidates)
+        size = self.slate_size()
+        head, tail = candidates[:size], candidates[size:]
+        if not tail or self.rate == 0:
+            return candidates
+        out = []
+        for _ in range(len(head)):
+            self.slots += 1
+            if tail and self.rng.random() < self.rate:
+                out.append(tail.pop(self.rng.randrange(len(tail))))
+                self.explored += 1
+            else:
+                out.append(head.pop(0))
+        return out + head + tail
+
+
+class RerankerChain(Reranker):
+    """Apply re-rankers in order (e.g. filter -> diversity -> exploration)."""
+
+    def __init__(self, rerankers):
+        self.rerankers = list(rerankers)
+
+    def rerank(self, user, candidates):
+        for reranker in self.rerankers:
+            candidates = reranker.rerank(user, candidates)
+        return candidates

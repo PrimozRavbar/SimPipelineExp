@@ -153,3 +153,51 @@ def test_flink_publishes_recent_history():
     slates = [k for k in redis.store if k[0] == "recent_slates"]
     assert slates and all(len(redis.store[k]) <= RECENT_SLATES for k in slates)
     assert any(k[0] == "recent_watches" for k in redis.store)
+
+
+# ---------------------------------------------------------------------
+# Diversity and exploration re-rankers
+# ---------------------------------------------------------------------
+
+import random as _random
+
+from ml_system.ranking import ExplorationReranker, MMRReranker, RerankerChain, genre_similarity
+
+CATALOG = {1: ["Drama"], 2: ["Drama"], 3: ["Drama"], 4: ["Comedy"], 5: ["Action"], 6: ["Drama", "War"]}
+
+
+def test_genre_similarity():
+    assert genre_similarity(["Drama"], ["Drama"]) == 1.0
+    assert genre_similarity(["Drama", "War"], ["Drama"]) == 0.5
+    assert genre_similarity([], ["Drama"]) == 0.0
+
+
+def test_mmr_keeps_order_at_zero_and_diversifies_above():
+    candidates = [1, 2, 3, 4, 5, 6]
+    assert MMRReranker(CATALOG.get, diversity=0.0).rerank(U(1), candidates) == candidates
+    varied = MMRReranker(CATALOG.get, diversity=0.5).rerank(U(1), candidates)
+    assert varied[0] == 1                       # the best item still leads
+    assert set(varied[:3]) == {1, 4, 5}         # then the other genres move up
+    assert sorted(varied) == candidates         # nothing lost
+
+
+def test_exploration_swaps_in_lower_candidates_reproducibly():
+    candidates = list(range(1, 101))
+
+    def run():
+        explorer = ExplorationReranker(0.3, lambda: 10, _random.Random("explore-1"))
+        return [explorer.rerank(U(1), candidates) for _ in range(50)], explorer
+
+    first, explorer = run()
+    second, _ = run()
+    assert first == second
+    assert 0.2 < explorer.explored / explorer.slots < 0.4
+    assert all(sorted(slate) == candidates for slate in first)
+    assert ExplorationReranker(0.0, lambda: 10, _random.Random(0)).rerank(U(1), candidates) == candidates
+
+
+def test_chain_applies_in_order():
+    redis = Redis()
+    redis.store[("watched_movies", 1)] = {1}
+    chain = RerankerChain([WatchedFilter(redis), MMRReranker(CATALOG.get, diversity=0.5)])
+    assert chain.rerank(U(1), [1, 2, 3, 4])[:2] == [2, 4]

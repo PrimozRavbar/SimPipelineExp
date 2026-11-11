@@ -33,7 +33,8 @@ from ml_system.build_recommendation_system import build_recommendation_system
 from ml_system.faults import FAULT_KINDS, FIXES, FaultInjector
 from ml_system.metrics import reference_ctrs
 from ml_system.experiments import Experiment
-from ml_system.ranking import LogisticRanker, MLPRanker, WatchedFilter
+from ml_system.ranking import (ExplorationReranker, LogisticRanker, MLPRanker, MMRReranker,
+                               RerankerChain, WatchedFilter)
 from ml_system.model_registry import export_bundle
 from ml_system.two_tower import USER_FEATURE_DEFAULTS, TwoTowerRetrieval
 from world.dynamics import DYNAMIC_WORLD
@@ -66,6 +67,8 @@ DEFAULT_SETTINGS = {
     "ranker": False,           # train and serve a ranking stage after retrieval
     "ranker_mlp": True,        # ranker model: MLP with cross/recent-history features (off: logistic)
     "filter_watched": False,   # drop movies the user already watched (re-ranker)
+    "diversity_pct": 0,        # MMR on genres: 0 = pure relevance, 100 = most varied slates
+    "exploration_pct": 0,      # share of slate slots given to random lower-ranked candidates
     # Canary: a new model first serves canary_share % of users for
     # canary_ticks ticks, then is promoted unless it is significantly worse.
     "canary_share": 0,
@@ -108,6 +111,8 @@ SETTING_LIMITS = {
     "alert_drop_pct": (1, 100),
     "alert_ticks": (10, 10000),
     "alert_window": (5, 1000),
+    "diversity_pct": (0, 100),
+    "exploration_pct": (0, 50),
     "canary_share": (0, 100),
     "holdout_pct": (1, 50),
     "gate_tolerance_pct": (0, 100),
@@ -291,6 +296,9 @@ class SimSession:
         self.chaos_rng = random.Random("chaos-%d" % seed)
         self.next_chaos_tick = None
         self.drills = set()
+        # Exploration draws from its own seeded RNG (never the shared stream).
+        self.explore_rng = random.Random("explore-%d" % seed)
+        self.explorer = None
         self.logger = self.system["metrics_logger"]
         self.tracker = self.system["ctr_tracker"]
         self.retriever = self.system["retriever"]
@@ -1095,7 +1103,17 @@ class SimSession:
         self.model_server.slate_size = s["slate_size"]
         self.model_server.num_candidates = s["num_candidates"]
         self.model_server.ranker = self.versions[self.serving_version].ranker if s["ranker"] else None
-        self.model_server.reranker = WatchedFilter(self.system["redis"]) if s["filter_watched"] else None
+        chain = []
+        if s["filter_watched"]:
+            chain.append(WatchedFilter(self.system["redis"]))
+        if s["diversity_pct"]:
+            chain.append(MMRReranker(self._genres_of, diversity=s["diversity_pct"] / 100.0))
+        if s["exploration_pct"]:
+            if self.explorer is None or self.explorer.rate != s["exploration_pct"] / 100.0:
+                self.explorer = ExplorationReranker(s["exploration_pct"] / 100.0,
+                                                    lambda: self.model_server.slate_size, self.explore_rng)
+            chain.append(self.explorer)
+        self.model_server.reranker = RerankerChain(chain) if chain else None
         if s["ranker"] and s["ranker_mlp"]:
             self.flink.track_recent = True     # recent history for the MLP ranker (stays on)
         self.flink.max_events_per_tick = s["flink_capacity"] or None

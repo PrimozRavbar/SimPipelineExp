@@ -213,3 +213,15 @@ def test_mlp_ranker_trains_and_flink_tracks_recent_history():
     assert s.model_server.ranker is s.versions[1].ranker
     assert any(k[0] == "recent_slates" for k in s.system["redis"].store)
     s.close()
+
+
+def test_diversity_and_exploration_settings_build_a_reranker_chain():
+    s = make(filter_watched=True, diversity_pct=30, exploration_pct=10)
+    chain = s.model_server.reranker
+    assert [type(r).__name__ for r in chain.rerankers] == ["WatchedFilter", "MMRReranker", "ExplorationReranker"]
+    s.step(20)
+    assert s.explorer.slots == 20 * 3 * s.settings["slate_size"]
+    s.submit("settings", diversity_pct=0, exploration_pct=0, filter_watched=False)
+    s.step(1)
+    assert s.model_server.reranker is None
+    s.close()
