@@ -373,7 +373,7 @@ ol.runbook { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction:
       fields: [["skew_alert_pct", "Skew alert at (%)", "Online vs offline genre preferences of recently served users"], [null, "Feature TTL (ticks)", "Not simulated", 1000]] },
     server: { name: "Model server", tool: "ModelServer", lane: "online", real: "KServe, Triton or TorchServe", desc: "Embeds the user with the user tower, retrieves candidates from the ANN index and shows the top of the list.",
       fields: [["num_candidates", "Retrieved candidates", "Pulled from the ANN index per request"], ["slate_size", "Slate size", "Movies the user actually sees"], [null, "Exploration rate", "Not simulated", 0.05]],
-      toggles: [["ranker", "Ranking stage", "Re-order the candidates with a learned ranker (trained at the next retrain; position-debiased)"], ["filter_watched", "Filter watched movies", "Drop movies the user already watched before showing the slate"]] },
+      toggles: [["ranker", "Ranking stage", "Re-order the candidates with a learned ranker (trained at the next retrain; position-debiased)"], ["ranker_mlp", "MLP ranker", "On: small neural net with cross and recent-history features (recent watches, recently shown). Off: logistic regression on 4 features"], ["filter_watched", "Filter watched movies", "Drop movies the user already watched before showing the slate"]] },
     ann: { name: "ANN index", tool: "HNSW", lane: "online", real: "FAISS, ScaNN or a vector database", desc: "Holds one embedding per movie, produced by the item tower. It must come from the same model version as the user tower, or user and movie vectors stop being comparable.",
       fields: [[null, "M (links per node)", "Not adjustable yet", 16], [null, "efSearch", "Not adjustable yet", 64]], toggles: [["rebuild_index", "Rebuild index on deploy", "Re-embed all movies with the new item tower. Off: the new user tower is served against the old index."]] },
     lake: { name: "Data lake", tool: "DataLake", lane: "offline", real: "S3 with Parquet or Delta Lake", desc: "Long-term store of every event. Training data comes from here.",
@@ -469,7 +469,9 @@ ol.runbook { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction:
       fmt(v.training_examples), v.epochs == null ? "–" : `${v.epochs} / ${v.negatives}`,
       v.train_seconds == null ? "–" : v.train_seconds.toFixed(1) + " s", pct(v.online_ctr), v.stage,
       v.gate ? `${pct(v.gate.recall_at_20)} <span class="muted">vs v${v.gate.production_version} ${pct(v.gate.production_recall_at_20)}</span>` : '<span class="muted">pending</span>',
-      v.ranker_info ? `${fmt(v.ranker_info.training_rows)} rows · genre ${v.ranker_info.weights.genre_match} · pop ${v.ranker_info.weights.log_popularity}` : "–"]);
+      !v.ranker_info ? "–" : v.ranker_info.model === "mlp"
+        ? `MLP · ${fmt(v.ranker_info.training_rows)} rows · loss ${v.ranker_info.final_loss}`
+        : `logistic · ${fmt(v.ranker_info.training_rows)} rows · genre ${v.ranker_info.weights.genre_match} · pop ${v.ranker_info.weights.log_popularity}`]);
     if (tr) rows.unshift([`run-${String(tr.version).padStart(2, "0")}`, `v${tr.version}`, fmt(tr.started_tick), `due t ${fmt(tr.deploy_tick)}`, fmt(tr.training_examples), `${tr.epochs} / ${tr.negatives}`, tr.stage === "features" ? "Spark" : tr.done ? "done" : "running", "–", "Training", "–", "–"]);
     return `${toastHtml()}
       <div class="head"><div><h1>Models</h1><p>Every model version stays in memory with its towers and ANN index. Retraining runs in the background while the current model keeps serving; the new one deploys a fixed number of ticks after training starts.</p></div></div>

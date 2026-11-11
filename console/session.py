@@ -33,7 +33,7 @@ from ml_system.build_recommendation_system import build_recommendation_system
 from ml_system.faults import FAULT_KINDS, FIXES, FaultInjector
 from ml_system.metrics import reference_ctrs
 from ml_system.experiments import Experiment
-from ml_system.ranking import LogisticRanker, WatchedFilter
+from ml_system.ranking import LogisticRanker, MLPRanker, WatchedFilter
 from ml_system.model_registry import export_bundle
 from ml_system.two_tower import USER_FEATURE_DEFAULTS, TwoTowerRetrieval
 from world.dynamics import DYNAMIC_WORLD
@@ -64,6 +64,7 @@ DEFAULT_SETTINGS = {
     "num_candidates": 100,
     "rebuild_index": True,     # rebuild the ANN index with the new item tower on deploy
     "ranker": False,           # train and serve a ranking stage after retrieval
+    "ranker_mlp": True,        # ranker model: MLP with cross/recent-history features (off: logistic)
     "filter_watched": False,   # drop movies the user already watched (re-ranker)
     # Canary: a new model first serves canary_share % of users for
     # canary_ticks ticks, then is promoted unless it is significantly worse.
@@ -123,7 +124,7 @@ SETTING_LIMITS = {
     "rewatch_pct": (0, 100),
     "users_joining_per_100_ticks": (0, 10000),
 }
-BOOL_SETTINGS = {"rebuild_index", "ranker", "filter_watched", "eval_gate", "batched_training"}
+BOOL_SETTINGS = {"rebuild_index", "ranker", "ranker_mlp", "filter_watched", "eval_gate", "batched_training"}
 
 WORLDS = ("static", "dynamic")
 
@@ -676,6 +677,7 @@ class SimSession:
             "batched": self.settings["batched_training"],
             "rebuild_index": self.settings["rebuild_index"],
             "ranker": self.settings["ranker"],
+            "ranker_mlp": self.settings["ranker_mlp"],
             "ranker_rows": None,
             "eval_gate": self.settings["eval_gate"],
             "holdout_pct": self.settings["holdout_pct"],
@@ -739,7 +741,10 @@ class SimSession:
             self._log("train", "Retrain v%d aborted: no usable training examples." % version, cls="s-warn")
             return
         items = _ItemFeatureSnapshot(self.offline.feature_pipeline.feature_store)
-        if record["ranker"]:
+        if record["ranker"] and record["ranker_mlp"]:
+            record["ranker_rows"] = MLPRanker.training_rows_from(
+                train_events, self.system["feature_store"], self._genres_of)
+        elif record["ranker"]:
             record["ranker_rows"] = LogisticRanker.training_rows_from(train_events, self.system["feature_store"])
 
         # A slow Spark job pushes the deploy back (deterministically): the
@@ -780,7 +785,14 @@ class SimSession:
             index.build(embeddings)
 
             ranker = None
-            if record["ranker_rows"] is not None:
+            if record["ranker_rows"] is not None and record["ranker_mlp"]:
+                rows, positions, labels = record["ranker_rows"]
+                record["ranker_rows"] = None
+                ranker = MLPRanker(self.retriever.user_features, self.system["redis"],
+                                   self.system["feature_store"], self._genres_of,
+                                   seed=self.seed * 1000 + record["version"])
+                ranker.fit(rows, positions, labels)
+            elif record["ranker_rows"] is not None:
                 rows, labels = record["ranker_rows"]
                 record["ranker_rows"] = None
                 ranker = LogisticRanker(self.retriever.user_features, self.system["feature_store"])
@@ -833,7 +845,8 @@ class SimSession:
             recall_at_20=None if gate is None else gate["recall_at_20"],
             gate=gate,
             note="",
-            ranker_info=None if ranker is None else {
+            ranker_info=None if ranker is None else ranker.summary() if isinstance(ranker, MLPRanker) else {
+                "model": "logistic",
                 "training_rows": ranker.training_rows,
                 "click_rate": round(ranker.positive_rate, 4),
                 "weights": ranker.content_weights(),
@@ -1083,6 +1096,8 @@ class SimSession:
         self.model_server.num_candidates = s["num_candidates"]
         self.model_server.ranker = self.versions[self.serving_version].ranker if s["ranker"] else None
         self.model_server.reranker = WatchedFilter(self.system["redis"]) if s["filter_watched"] else None
+        if s["ranker"] and s["ranker_mlp"]:
+            self.flink.track_recent = True     # recent history for the MLP ranker (stays on)
         self.flink.max_events_per_tick = s["flink_capacity"] or None
         d = self.dynamics
         d.taste_drift_every = s["taste_drift_every"]
@@ -1245,6 +1260,9 @@ class SimSession:
                   if type(e).__name__ == "RecommendationClickedEvent"]
         self.health["drift_psi"] = health.genre_psi(self.drift_reference,
                                                     health.genre_distribution(recent, catalog))
+
+    def _genres_of(self, movie_id):
+        return self.system["world"].movie_objects[movie_id].genres
 
     def _golden(self):
         """Golden queries for the index version that should be serving,

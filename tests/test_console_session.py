@@ -200,3 +200,16 @@ def test_slow_spark_job_delays_training_and_failures_abort_it():
     assert s.retrain is None and s.serving_version == 0 and s.last_spark_tick is None
     assert any("FAILED" in e["text"] for e in s.events())
     s.close()
+
+
+def test_mlp_ranker_trains_and_flink_tracks_recent_history():
+    s = make(ranker=True, ranker_mlp=True)
+    assert s.flink.track_recent
+    s.step(30)
+    s.submit("retrain")
+    s.step(12)
+    info = s.models()["versions"][0]["ranker_info"]
+    assert info["model"] == "mlp" and info["training_rows"] > 0
+    assert s.model_server.ranker is s.versions[1].ranker
+    assert any(k[0] == "recent_slates" for k in s.system["redis"].store)
+    s.close()

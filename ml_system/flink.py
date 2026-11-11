@@ -1,5 +1,6 @@
 from simulation.service import Service
 from simulation.events import (
+    RecommendationShownEvent,
     RecommendationClickedEvent,
     WatchEvent,
     RatingEvent,
@@ -44,6 +45,12 @@ class Flink(Service):
         self.track_watched = False
         self.processed_last_tick = 0
 
+        # track_recent: publish each user's recent watches and shown slates
+        # ("recent_watches", "recent_slates") for the ranker. Subscribes to
+        # shown slates from the current end of the topic when switched on.
+        self.track_recent = False
+        self.recent = None
+
     def start(self, sim):
         super().start(sim)
 
@@ -59,6 +66,12 @@ class Flink(Service):
 
         kafka = sim.get_service("Kafka")
         self.processed_last_tick = 0
+
+        if self.track_recent and self.recent is None:
+            from ml_system.ranking import RecentHistory
+            self.recent = RecentHistory()
+            kafka.subscribe(self.consumer_name, "RecommendationShownEvent", from_end=True)
+            self.topics = self.topics + ["RecommendationShownEvent"]
 
         if self.paused:
             return
@@ -97,6 +110,12 @@ class Flink(Service):
 
                 elif isinstance(event, RatingEvent):
                     self.handle_rating(sim, event)
+
+                elif isinstance(event, RecommendationShownEvent):
+                    if self.recent is not None:
+                        sim.get_service("Redis").set(
+                            "recent_slates", event.user_id,
+                            self.recent.add_slate(event.user_id, event.movie_ids))
 
 
     def update_activity_level(self, sim, user_id):
@@ -242,6 +261,9 @@ class Flink(Service):
             "value": self.state["watch_count"][user_id]
         })
 
+
+        if self.recent is not None:
+            redis.set("recent_watches", user_id, self.recent.add_watch(user_id, movie_id))
 
         if self.track_watched:
             watched = redis.store.setdefault(("watched_movies", user_id), set())
