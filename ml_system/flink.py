@@ -73,6 +73,12 @@ class Flink(Service):
         self.track_onboarding = False
         self._onboarding_subscribed = False
 
+        # preferences: a live ml_system.online_model.PreferenceModel (set by
+        # its owner; None = off). Learns online from every event Flink
+        # consumes (slates, clicks, watches, ratings, onboarding) and is
+        # published to Redis as ("preference_model", "all").
+        self.preferences = None
+
     def start(self, sim):
         super().start(sim)
 
@@ -98,6 +104,12 @@ class Flink(Service):
         if self.track_engagement:
             self.track_recent = True
 
+        if self.preferences is not None:
+            self.track_recent = True       # needs the shown slates
+            redis = sim.get_service("Redis")
+            if redis.get("preference_model", "all") is not self.preferences:
+                redis.set("preference_model", "all", self.preferences)
+
         if self.track_recent and self.recent is None:
             from ml_system.ranking import RecentHistory
             self.recent = RecentHistory()
@@ -106,7 +118,7 @@ class Flink(Service):
             kafka.subscribe(self.consumer_name, "RecommendationShownEvent", from_tick=sim.clock.now)
             self.topics = self.topics + ["RecommendationShownEvent"]
 
-        if self.track_onboarding and not self._onboarding_subscribed:
+        if (self.track_onboarding or self.preferences is not None) and not self._onboarding_subscribed:
             kafka.subscribe(self.consumer_name, "OnboardingEvent")
             self.topics = self.topics + ["OnboardingEvent"]
             self._onboarding_subscribed = True
@@ -140,7 +152,7 @@ class Flink(Service):
 
             self.processed_last_tick += len(events)
 
-            if self.signals is not None:
+            if self.signals is not None or self.preferences is not None:
                 signal_events.extend(events)
 
             for event in events:
@@ -157,7 +169,7 @@ class Flink(Service):
                 elif isinstance(event, RatingEvent):
                     self.handle_rating(sim, event)
 
-                elif isinstance(event, OnboardingEvent):
+                elif isinstance(event, OnboardingEvent) and self.track_onboarding:
                     self.update_profile(sim, event.user_id, "onboarding", event.genres)
 
                 elif isinstance(event, RecommendationShownEvent):
@@ -169,6 +181,11 @@ class Flink(Service):
 
         if self.signals is not None and signal_events:
             self.apply_signals(signal_events)
+        if self.preferences is not None:
+            self.preferences.observe_tick(signal_events)
+            # Every reaction to this tick's slates is in: learn from them now,
+            # before the next tick is served.
+            self.preferences.flush(sim.clock.now + 1)
 
     # Movie signals depend on event order (a click needs its slate first),
     # so each tick's events are applied in the data lake's topic order,
