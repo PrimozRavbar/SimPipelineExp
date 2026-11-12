@@ -60,20 +60,33 @@ def test_same_events_same_model_and_install_replays_new_rows():
     assert all((fa.params[k] == fb.params[k]).all() for k in fa.params)
 
     # Install a fit made on a snapshot, after more events arrived: the same
-    # as installing first and then learning the new events online.
-    late = replay(PreferenceModel(movies, users, seed=1, epochs=50), events[:40])
+    # as installing first and then learning the new events online. (Pair
+    # offsets are learned once, as rows arrive, so they are left out here.)
+    late = replay(PreferenceModel(movies, users, seed=1, epochs=50, pair_lr=0), events[:40])
     fitted = late.snapshot().fit()
     for e in events[40:]:
         late.observe(e)
     late.flush()
     late.install(fitted)
 
-    early = replay(PreferenceModel(movies, users, seed=1, epochs=50), events[:40])
+    early = replay(PreferenceModel(movies, users, seed=1, epochs=50, pair_lr=0), events[:40])
     early.install(early.snapshot().fit())
     for e in events[40:]:
         early.observe(e)
     early.flush()
     assert all(abs(late.params[k] - early.params[k]).max() < 1e-9 for k in ("b", "W"))
+
+
+def test_pair_evidence_sinks_a_movie_the_user_keeps_skipping():
+    movies, users = catalog()
+    model = replay(PreferenceModel(movies, users, seed=1), game_events())
+    # User 1 skips 2 and 4 above every click of 3; user 2 never saw them.
+    assert model.pair[(1, 2)] < 0 and model.pair[(1, 3)] > 0
+    assert (2, 2) not in model.pair
+    install = model.snapshot().fit(epochs=20)
+    before = dict(model.pair)
+    model.install(install)
+    assert model.pair == before                     # installing never replays pair updates
 
 
 def test_ranker_falls_back_until_first_fit():
