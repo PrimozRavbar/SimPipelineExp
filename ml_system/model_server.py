@@ -44,6 +44,12 @@ class ModelServer(Service):
       # Extra candidate sources [(source, k)] merged with the retriever's
       # candidates (see ml_system.candidate_sources). Empty = off.
       self.extra_sources = []
+      # Feature logging (off by default): score_logger(tick, user,
+      # slate, retriever) is called with every served slate and the
+      # retriever that produced it, so features can be logged as they were
+      # at serving time (and later joined to the training data).
+      self.score_logger = None
+      self.sim = None
       self.requests = 0
       self.fallback_requests = 0
 
@@ -85,5 +91,12 @@ class ModelServer(Service):
               candidates
           )
 
-      return list(candidates)[:self.slate_size]
+      slate = list(candidates)[:self.slate_size]
+      if self.score_logger is not None and self.sim is not None:
+          self.score_logger(self.sim.clock.now, user, slate, retriever)
+      return slate
+
+  def start(self, sim):
+      super().start(sim)
+      self.sim = sim
 

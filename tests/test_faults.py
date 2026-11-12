@@ -74,7 +74,7 @@ def test_rotate_genres_moves_weight():
 
 
 def chaos_run(seed):
-    s = SimSession(seed=seed, users_per_tick=2, log_metrics=False, settings={"chaos_every": 40})
+    s = SimSession(preset="plain", seed=seed, users_per_tick=2, log_metrics=False, settings={"chaos_every": 40})
     s.step(200)
     s.close()
     return [(f.kind, f.start, f.status) for f in s.faults.faults]
@@ -86,7 +86,7 @@ def test_chaos_schedule_is_seeded():
 
 
 def test_index_fault_opens_incident_and_rebuild_fixes_it():
-    s = SimSession(seed=4, users_per_tick=3, log_metrics=False, settings={"spark_every": 0})
+    s = SimSession(preset="plain", seed=4, users_per_tick=3, log_metrics=False, settings={"spark_every": 0})
     s.step(20)
     s.submit("fault", kind="index_id_mismatch", duration=None)
     s.step(10)                                     # self-test runs at tick 25
@@ -103,7 +103,7 @@ def test_index_fault_opens_incident_and_rebuild_fixes_it():
 
 
 def test_outage_opens_fallback_incident_and_restart_resolves_it():
-    s = SimSession(seed=4, users_per_tick=3, log_metrics=False, settings={"spark_every": 0})
+    s = SimSession(preset="plain", seed=4, users_per_tick=3, log_metrics=False, settings={"spark_every": 0})
     s.step(5)
     s.submit("fault", kind="model_server_outage", duration=None)
     s.step(11)                                     # the share is over the last 10 ticks
@@ -123,7 +123,7 @@ def test_healthy_retrained_indexes_never_fail_the_self_test():
     from console import health
     from ml_system.faults import RemappedIndex
 
-    s = SimSession(seed=42, users_per_tick=5, log_metrics=False, world="dynamic",
+    s = SimSession(preset="plain", seed=42, users_per_tick=5, log_metrics=False, world="dynamic",
                    settings={"deploy_delay": 10, "epochs": 1, "ranker": True})
     movies = s.system["world"].movie_objects
     for _ in range(3):

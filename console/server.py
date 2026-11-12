@@ -162,7 +162,7 @@ def create_app(session):
 
 
 def serve(host="127.0.0.1", port=8000, seed=42, users_per_tick=10, runs_dir="runs", world="static",
-          taste="genre"):
+          taste="genre", preset="best"):
     import faulthandler
     import signal
 
@@ -173,7 +173,7 @@ def serve(host="127.0.0.1", port=8000, seed=42, users_per_tick=10, runs_dir="run
 
     print("Building the simulation (seed %d, %s world, %s tastes)..." % (seed, world, taste), flush=True)
     session = SimSession(seed=seed, users_per_tick=users_per_tick, runs_dir=runs_dir, world=world,
-                         taste=taste)
+                         taste=taste, preset=preset)
     session.start()
     app = create_app(session)
     shown_host = "localhost" if host in ("127.0.0.1", "0.0.0.0") else host

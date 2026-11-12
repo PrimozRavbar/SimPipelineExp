@@ -435,7 +435,7 @@ class MLPRanker(Ranker):
                     item = feature_store.get_item_features_as_of(movie_id, event.timestamp, event_order)
                     rows.append(_build_row(feature_set, user, watches, slates, item, movie_id, genres_of, signals))
                     if inputs is not None:
-                        inputs.append((event.user_id, user, tuple(watches), movie_id))
+                        inputs.append((event.user_id, event.timestamp, user, tuple(watches), movie_id))
                     positions.append(min(position, POSITIONS - 1))
                     labels.append(1.0 if movie_id == clicked else 0.0)
                     completions.append(completion_of.get(event.recommendation_id) if movie_id == clicked else None)
@@ -532,12 +532,27 @@ class MLPRanker(Ranker):
         """Training: set each row's tower_score from its point-in-time user
         features and recent watches."""
         cache = {}
-        for row, (user_id, user, watches, movie_id) in zip(rows, inputs):
+        for row, (user_id, _tick, user, watches, movie_id) in zip(rows, inputs):
             key = (user_id, id(user), watches)
             if key not in cache:
                 cache[key] = self.tower_user_vector({**user, "user_id": user_id,
                                                      "recent_watches": list(watches)})
             row[-1] = self.tower_score(cache[key], movie_id)
+
+    @staticmethod
+    def fill_tower_scores_from_log(rows, inputs, score_log):
+        """Training without leakage: each row gets the retrieval score that
+        was logged when its slate was served ((tick, user, movie) ->
+        score, computed by the model serving at the time, which had not
+        seen these clicks). Rows with no logged score get 0. Returns the
+        share of rows found in the log."""
+        found = 0
+        for row, (user_id, tick, _user, _watches, movie_id) in zip(rows, inputs):
+            score = score_log.get((tick, user_id, movie_id))
+            if score is not None:
+                found += 1
+            row[-1] = 0.0 if score is None else score
+        return found / len(rows) if rows else 0.0
 
     def summary(self):
         return {"model": "mlp", "feature_set": self.feature_set, "multitask": self.multitask,

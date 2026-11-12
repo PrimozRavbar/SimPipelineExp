@@ -119,3 +119,21 @@ def test_v5_tower_score_feature():
     assert rows[0][-1] == pytest.approx(expected, abs=1e-5)
     ranker.fit(rows, positions, labels, epochs=5)
     assert sorted(ranker.rank(type("U", (), {"user_id": 1})(), [1, 2, 3, 4])) == [1, 2, 3, 4]
+
+
+def test_v5_ranker_trains_on_scores_logged_at_serving():
+    """The fix for the v5 leak: training rows use the retrieval score that
+    was logged when the slate was served, by the model serving then."""
+    from console.session import SimSession
+
+    s = SimSession(preset="plain", seed=3, users_per_tick=4, log_metrics=False, settings={
+        "deploy_delay": 10, "epochs": 1, "spark_every": 0, "ranker": True, "ranker_mlp": True,
+        "ranker_signals": True, "ranker_tower_score": True})
+    s.step(40)
+    assert len(s.score_log) == 40 * 4 * 10          # every shown movie of every slate
+    s.submit("retrain")
+    s.step(12)
+    info = s.versions[1].info["ranker_info"]
+    assert info["feature_set"] == "v5" and info["logged_share"] == 1.0
+    assert all(isinstance(v, float) for v in s.score_log.values())
+    s.close()

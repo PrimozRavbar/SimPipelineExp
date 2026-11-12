@@ -14,7 +14,7 @@ FAST = {"deploy_delay": 10, "epochs": 1, "spark_every": 0}
 
 
 def make(seed=3, **settings):
-    return SimSession(seed=seed, users_per_tick=3, settings={**FAST, **settings}, log_metrics=False)
+    return SimSession(preset="plain", seed=seed, users_per_tick=3, settings={**FAST, **settings}, log_metrics=False)
 
 
 def signature(session):
@@ -239,4 +239,19 @@ def test_epochs_change_while_paused_reaches_the_next_model():
     s.step(12)
     assert s.settings["epochs"] == 2
     assert s.versions[1].info["epochs"] == 2 and s.versions[1].info["batched"] is False
+    s.close()
+
+
+def test_best_preset_is_the_default_and_a_small_game_still_retrains():
+    from console.session import BEST_SETTINGS, PLAIN_SETTINGS, SimSession
+
+    s = SimSession(seed=3, users_per_tick=3, log_metrics=False,
+                   settings={"deploy_delay": 10, "epochs": 1, "spark_every": 0})
+    assert s.preset == "best"
+    assert all(s.settings[k] == v for k, v in BEST_SETTINGS.items() if k not in ("deploy_delay", "epochs", "spark_every"))
+    assert BEST_SETTINGS != PLAIN_SETTINGS and not PLAIN_SETTINGS["ranker"]
+    s.step(30)
+    s.submit("retrain")
+    s.step(12)
+    assert s.serving_version == 1            # towers ship even if the ranker could not be fitted yet
     s.close()

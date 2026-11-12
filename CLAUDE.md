@@ -377,11 +377,24 @@ another component's random draws.
   42.5 / 22.3, all three 39.4 / 24.2. They raise the quality of the two-tower candidates (best
   10 up to 60.1 vs ~55) but not served CTR: in the rich world the ranker is the bottleneck.
 - **Retrieval score as a ranker feature** (`MLPRanker(feature_set="v5")`, console
-  `ranker_tower_score`, experimental, off): v4 + user vector . movie vector. Known label
-  leakage: training rows are scored by towers trained on those same clicks, so the score looks
-  far more predictive in training than at serving. Alone 41.7 / 25.3 (vs 43.8 / 26.0); with
-  the richer towers (which memorise more) 29.0 / 15.2. The fix is to log the score at serving
-  time and train the ranker on logged values (not built yet).
+  `ranker_tower_score`): v4 + user vector . movie vector. A first version scored the training
+  rows with the freshly trained towers: label leakage (those towers were trained on the same
+  clicks), CTR 29.0 / 15.2 with the richer towers. Fixed with **feature logging**:
+  `ModelServer.score_logger(tick, user, slate, retriever)` is called for every served slate,
+  and the console logs each shown movie's score from the retriever that served it
+  (`SimSession.score_log`, (tick, user, movie) -> score); training rows join the logged scores
+  (`MLPRanker.fill_tower_scores_from_log`; Models shows `logged_share`). Rich world, s42:
+  v5 44.2 / 23.3 (vs 43.8 / 26.0 without), with the richer towers 43.4 / 27.9 (was 29.0 / 15.2).
+  A ranker that cannot be fitted yet (no clicks) no longer fails the retrain: the towers ship
+  without it.
+- **Default setup** (console `preset="best"`, `--preset best`, the default; `"plain"` = every
+  model feature off, the original console): MLP ranker v5 (genre features, movie signals,
+  logged retrieval score), profile candidates 30, co-watch candidates 30, rich profiles,
+  onboarding, logQ, diversity 15%. Chosen over the alternatives by CTR after the second
+  retrain (ticks 852-1200), averaged over static/dynamic and two seeds in the rich world:
+  this setup 34.5% vs 33.6% (no retrieval score / diversity) and lower with the tower inputs
+  (engagement + demographics + shared IDs: 36.0% static s1). Genre world s42: 49.6% static,
+  31.9% dynamic. Players can change every setting; tests pin `preset="plain"`.
 - **Experiments** (`ml_system/experiments.py`): stable hash bucketing (a new salt reshuffles
   users independently), two-proportion z-test, per-arm counting from the event stream.
 - **Registry** (`ml_system/model_registry.py`): `export_bundle` / `load_bundle` (towers with
@@ -390,7 +403,7 @@ another component's random draws.
 In the console (all live settings, applied at tick boundaries; see `console/session.py`
 `DEFAULT_SETTINGS`): `--world dynamic`, chaos (`chaos_every`: hidden seeded faults, revealed
 when they end) and drills, repair actions, `flink_capacity`, `ranker`, `filter_watched`,
-`ranker_mlp`, `ranker_genre_features`, `ranker_multitask`, `ranker_signals`, `ranker_tower_score`,
+`--preset best|plain`, `ranker_mlp`, `ranker_genre_features`, `ranker_multitask`, `ranker_signals`, `ranker_tower_score`,
 `tower_engagement`, `tower_demographics`, `tower_shared_ids`, `profile_candidates`,
 `cowatch_candidates`, `rich_profiles`,
 `onboarding`, `logq_correction`, `random_negatives`, `graded_positives`, `tower_history`,

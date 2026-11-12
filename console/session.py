@@ -119,6 +119,21 @@ DEFAULT_SETTINGS = {
     "users_joining_per_100_ticks": 0,
 }
 
+# Presets. "plain": every model feature off (the original console). "best":
+# the setup with the best measured CTR (see CLAUDE.md, "Default setup");
+# the default. Players can change any setting afterwards.
+PLAIN_SETTINGS = dict(DEFAULT_SETTINGS)
+BEST_SETTINGS = {
+    **PLAIN_SETTINGS,
+    "ranker": True, "ranker_mlp": True, "ranker_genre_features": True,
+    "ranker_signals": True, "ranker_tower_score": True,
+    "profile_candidates": 30, "cowatch_candidates": 30,
+    "rich_profiles": True, "onboarding": True, "logq_correction": True,
+    "diversity_pct": 15,
+}
+PRESETS = {"plain": PLAIN_SETTINGS, "best": BEST_SETTINGS}
+DEFAULT_SETTINGS = dict(BEST_SETTINGS)
+
 # (min, max) for numeric settings; bools are listed in BOOL_SETTINGS.
 SETTING_LIMITS = {
     "spark_every": (0, 100000),
@@ -278,6 +293,7 @@ class SimSession:
         training_wait_timeout=None,
         world="static",
         taste="genre",
+        preset="best",
     ):
         if world not in WORLDS:
             raise ActionError("world must be one of %s" % (WORLDS,))
@@ -287,7 +303,10 @@ class SimSession:
         self.world_kind = world
         self.taste_kind = taste
         self.users_per_tick = users_per_tick
-        self.settings = dict(DEFAULT_SETTINGS)
+        if preset not in PRESETS:
+            raise ActionError("preset must be one of %s" % sorted(PRESETS))
+        self.preset = preset
+        self.settings = dict(PRESETS[preset])
         if world == "dynamic":
             self.settings.update(DYNAMIC_SETTINGS)
         if settings:
@@ -405,6 +424,10 @@ class SimSession:
         self.fallback_ticks = {}         # tick -> (requests, fallback requests)
         self.open_rules = {}             # rule -> incident
         self.golden = {}                 # index version -> golden queries
+        # Feature log: the retrieval score of every served (tick, user,
+        # movie), computed by the model that served it (for the v5 ranker).
+        self.score_log = {}
+        self.model_server.score_logger = self._log_scores
         self.drift_reference = None      # genre mix of clicks just after the last deploy
         self._apply_live_settings()
 
@@ -801,6 +824,10 @@ class SimSession:
             record["ranker_rows"] = MLPRanker.training_rows_from(
                 train_events, self.system["feature_store"], self._genres_of, record["ranker_features"],
                 with_completion=record["ranker_multitask"], inputs=record["ranker_inputs"])
+            if record["ranker_features"] == "v5":
+                # Join the logged serving-time scores (no leakage).
+                record["logged_share"] = MLPRanker.fill_tower_scores_from_log(
+                    record["ranker_rows"][0], record.pop("ranker_inputs"), self.score_log)
         elif record["ranker"]:
             record["ranker_rows"] = LogisticRanker.training_rows_from(train_events, self.system["feature_store"])
 
@@ -851,24 +878,28 @@ class SimSession:
             index.build(embeddings)
 
             ranker = None
-            if record["ranker_rows"] is not None and record["ranker_mlp"]:
-                rows, positions, labels, *rest = record["ranker_rows"]
-                record["ranker_rows"] = None
-                ranker = MLPRanker(self.retriever.user_features, self.system["redis"],
-                                   self.system["feature_store"], self._genres_of,
-                                   seed=self.seed * 1000 + record["version"],
-                                   feature_set=record["ranker_features"],
-                                   multitask=record["ranker_multitask"])
-                if record["ranker_features"] == "v5":
-                    ranker.set_towers(user_tower, embeddings)
-                    ranker.fill_tower_scores(rows, record.pop("ranker_inputs"))
-                ranker.fit(rows, positions, labels, rest[0] if rest else None)
-            elif record["ranker_rows"] is not None:
-                rows, labels = record["ranker_rows"]
-                record["ranker_rows"] = None
-                ranker = LogisticRanker(self.retriever.user_features, self.system["feature_store"])
-                ranker.fit(rows, labels)
+            try:
+                if record["ranker_rows"] is not None and record["ranker_mlp"]:
+                    rows, positions, labels, *rest = record["ranker_rows"]
+                    record["ranker_rows"] = None
+                    ranker = MLPRanker(self.retriever.user_features, self.system["redis"],
+                                       self.system["feature_store"], self._genres_of,
+                                       seed=self.seed * 1000 + record["version"],
+                                       feature_set=record["ranker_features"],
+                                       multitask=record["ranker_multitask"])
+                    if record["ranker_features"] == "v5":
+                        ranker.set_towers(user_tower, embeddings)
+                    ranker.fit(rows, positions, labels, rest[0] if rest else None)
+                elif record["ranker_rows"] is not None:
+                    rows, labels = record["ranker_rows"]
+                    record["ranker_rows"] = None
+                    ranker = LogisticRanker(self.retriever.user_features, self.system["feature_store"])
+                    ranker.fit(rows, labels)
 
+            except ValueError as error:
+                # Not enough clicks to fit a ranker yet: ship the towers.
+                ranker = None
+                record["ranker_error"] = str(error)
             if record["holdout"]:
                 production = record["production"]
                 record["recall"] = (
@@ -916,7 +947,8 @@ class SimSession:
             recall_at_20=None if gate is None else gate["recall_at_20"],
             gate=gate,
             note="",
-            ranker_info=None if ranker is None else ranker.summary() if isinstance(ranker, MLPRanker) else {
+            ranker_info=None if ranker is None else {**ranker.summary(), "logged_share": record.get("logged_share")}
+            if isinstance(ranker, MLPRanker) else {
                 "model": "logistic",
                 "training_rows": ranker.training_rows,
                 "click_rate": round(ranker.positive_rate, 4),
@@ -926,6 +958,8 @@ class SimSession:
         if self.logger is not None:
             self.logger.log_event("retrain", now, model_version=version,
                                   training_examples=record["training_examples"])
+        if record.get("ranker_error"):
+            self._log("train", "v%d ships without a ranker: %s." % (version, record["ranker_error"]), cls="s-warn")
         self._log("train", "Training v%d finished (%d examples, %.1f s wall time)."
                   % (version, record["training_examples"], record.get("train_seconds") or 0), cls="s-accent")
         by = "auto" if record["by"] == "schedule" else record["by"]
@@ -1395,6 +1429,25 @@ class SimSession:
         trainer.tower_signature = self._tower_signature(record)
         return trainer
 
+    def _log_scores(self, tick, user, slate, retriever):
+        """Feature logging at serving time: user vector . movie vector of the
+        retriever that served this slate (not the fallback)."""
+        user_tower = getattr(retriever, "user_tower", None)
+        index = getattr(retriever, "ann_index", None)
+        if user_tower is None or index is None:
+            return
+        base = index
+        while hasattr(base, "inner"):
+            base = base.inner
+        nodes = getattr(base, "nodes", None)
+        if not nodes:
+            return
+        vector = user_tower.embed(retriever.user_features(user.user_id))
+        for movie_id in slate:
+            node = nodes.get(movie_id)
+            if node is not None:
+                self.score_log[(tick, user.user_id, movie_id)] = sum(a * b for a, b in zip(vector, node.unit))
+
     def _genres_of(self, movie_id):
         return self.system["world"].movie_objects[movie_id].genres
 
@@ -1531,6 +1584,7 @@ class SimSession:
                 "canary": self._canary_view(),
                 "world": self.world_kind,
                 "taste": self.taste_kind,
+                "preset": self.preset,
                 "health": dict(self.health),
                 "pending_actions": len(self._pending),
             }
