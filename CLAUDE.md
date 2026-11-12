@@ -387,6 +387,43 @@ another component's random draws.
   v5 44.2 / 23.3 (vs 43.8 / 26.0 without), with the richer towers 43.4 / 27.9 (was 29.0 / 15.2).
   A ranker that cannot be fitted yet (no clicks) no longer fails the retrain: the towers ship
   without it.
+- **Preference model** (`ml_system/online_model.py:PreferenceModel`, console `preference_model`):
+  one model that learns from every logged signal, online every tick and refitted at every
+  retrain. Score `s(u, m) = b_m + decade_m + g_m . (w0 + a * onboarding_u + w_u) + q_m . p_u +
+  r(u, m) + h . history(u, m)`; click logit = `c + pos[i] + s` (learned position term), grade =
+  `sigmoid(c2 + kappa * s)`. Rows: clicked movie (positive), movies above it (negatives), an
+  unclicked slate (negatives, weight 0.5); grades: watch completion, rating, click without a
+  watch (0.3). `r(u, m)`: a per-pair offset moved online by surprising clicks and skips (unseen
+  pairs stay 0). History (`preference_history`): times shown (a count; it learns -0.148 per
+  impression in the dynamic world vs the true log(0.85) = -0.16) and already watched (it learns
+  -2.06 vs log(0.1) = -2.3; +0.36 in the static world, where rewatching is allowed).
+  Flink (`Flink.preferences`) applies each tick's events in data-lake order and learns from
+  that tick's slates before the next tick; a retrain snapshots it at the boundary, refits it
+  in the background (full-batch Adam, 300 epochs, seeded) and `install()`s it at the deploy
+  tick, replaying the rows logged since the snapshot. Serving: `PreferenceRanker` orders the
+  candidates (the version's own ranker until the first fit) and `PreferenceRetrieval` adds its
+  catalog-wide top `preference_candidates` (50). Options: `preference_factors` (0),
+  `preference_half_life` (0: rows weigh the same whatever their age).
+  Why: the stage report showed the system's knowledge of users and movies, not model capacity,
+  was the limit. With perfect knowledge of genre taste and movie quality (no hidden factors) a
+  rich-world slate reaches 61.6% (oracle 68.5%); the logged data is small (by tick 1200: ~12k
+  slates, ~13 per user, ~5 clicks per user), and a batch fit of this model on a recorded game
+  scores 37% / 48% / 52% at ticks 400 / 800 / 1200 (it keeps rising with data).
+  Leaks found on the way (tests in `tests/test_preference_model.py`): rating rows carrying
+  "already watched" (taught "watched means liked"), and slate rows written after their own
+  watch (taught "watched means clicked", weight +5 even where rewatches are rare; rows now take
+  their history when the slate is shown). A "times shown" feature looked harmful (-16 points)
+  only because of the second leak.
+  Protocol (CTR ticks 852-1200 after retrains at 400 and 800), old default -> with it:
+  rich static s42 44.8 -> 49.7, s1 40.9 -> 44.7; rich dynamic s42 27.6 -> 27.0, s1 24.5 -> 28.7;
+  genre static s42 49.6 -> 56.2, dynamic 31.9 -> 34.8. Stage report (rich static s42): two-tower
+  + other candidates now reach 64.6 of the 68.8 oracle; the ranking step loses the rest.
+  Long games (rich s42, retrain every 400 ticks, CTR per 400 ticks): static, it gets there much
+  faster (40.4 at 800 vs 23.0) but plateaus at ~52-53 while the old stack reaches 55.4 by 4000
+  (factors k=16 do not help: 52.4); dynamic, everything decays (old 25.1 at 1200 -> 13.2 at
+  4000, preference model 29.0 -> 14.5) because fatigue never recovers: a learner that knows
+  genre taste and quality exhausts its best picks per user, while the oracle (still ~55) knows
+  the remaining hidden tastes. A half-life (400 / 1000 ticks) gives only +1.5 / +2.6 at 2800.
 - **Default setup** (console `preset="best"`, `--preset best`, the default; `"plain"` = every
   model feature off, the original console): MLP ranker v5 (genre features, movie signals,
   logged retrieval score), profile candidates 30, co-watch candidates 30, rich profiles,
