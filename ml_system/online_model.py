@@ -66,7 +66,7 @@ class PreferenceModel:
 
     def __init__(self, movie_objects, user_objects=None, factors=0, reg=0.01, seed=0,
                  online_lr=0.05, unclicked_weight=0.5, grade_weight=1.0, epochs=300,
-                 history=True, demographics=False):
+                 history=False, demographics=False):
         from world.external_data_loader import GENRE_NAMES
 
         self.genre_names = [g for g in GENRE_NAMES if g != "unknown"]

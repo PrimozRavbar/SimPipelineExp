@@ -88,6 +88,7 @@ DEFAULT_SETTINGS = {
     # the candidates and adds its own best movies from the whole catalog.
     "preference_model": False,
     "preference_candidates": 50,
+    "preference_history": False,   # it also learns from times shown / already watched (repeat fatigue)
     # Personalisation
     "profile_candidates": 0,   # extra candidates from the user's genre profile (0 = two-tower only)
     "rich_profiles": False,    # profiles from clicks, watch completion and ratings, recent first
@@ -178,7 +179,8 @@ BOOL_SETTINGS = {"rebuild_index", "ranker", "ranker_mlp", "filter_watched", "eva
                  "ranker_genre_features", "rich_profiles", "onboarding",
                  "logq_correction", "graded_positives", "tower_history", "train_from_scratch",
                  "ranker_multitask", "ranker_signals", "tower_engagement", "tower_demographics",
-                 "tower_shared_ids", "ranker_tower_score", "preference_model"}
+                 "tower_shared_ids", "ranker_tower_score", "preference_model",
+                 "preference_history"}
 
 WORLDS = ("static", "dynamic")
 
@@ -1219,8 +1221,11 @@ class SimSession:
         self.model_server.num_candidates = s["num_candidates"]
         if s["preference_model"] and self.flink.preferences is None:
             world = self.system["world"]
-            self.flink.preferences = PreferenceModel(world.movie_objects, world.user_objects, seed=self.seed)
+            self.flink.preferences = PreferenceModel(world.movie_objects, world.user_objects, seed=self.seed,
+                                                     history=s["preference_history"])
             self.preference_source = PreferenceRetrieval(lambda: self.flink.preferences)
+        if self.flink.preferences is not None:
+            self.flink.preferences.use_history = s["preference_history"]
         self.model_server.ranker = self._serving_ranker(self.versions[self.serving_version])
         chain = []
         if s["filter_watched"]:
