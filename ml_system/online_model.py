@@ -18,15 +18,20 @@ Signals, all from the event log or the account/catalog:
 - onboarding genres (a learned prior weight on the declared genres) and
   demographics (age bracket, gender, occupation: shared genre offsets);
 - the catalog: genres and release decade;
-- per (user, movie) history at the time of the slate: times already shown
-  and already watched (repeat impressions and rewatches are learned). Only
+- per (user, movie) evidence: a small offset r(u, m) per pair, moved by
+  every click (up) and examined skip (down) of that pair, by how surprising
+  it was, so a movie the user keeps skipping sinks for that user only
+  (fatigue, dislikes). Pairs never shown stay at 0: being shown is not
+  itself a penalty (a "times shown" feature was: it pushed every seen movie
+  below unknown ones and cost 16 points);
+- `history`: "already watched" as a feature (rewatches are learned). Only
   slate rows carry it: a rating arrives after its watch, so a grade row
-  with "already watched" set would teach "watched means liked" (a leak).
+  with it set would teach "watched means liked" (a leak).
 
 Relevance score of movie m for user u:
 
     s(u, m) = b_m + y[decade_m] + g_m . (w0 + sum_j D[demo_j] + a * o_u + w_u)
-              + q_m . p_u + h1 * log(1 + shown(u, m)) + h2 * watched(u, m)
+              + q_m . p_u + r(u, m) + h * watched(u, m)
 
 Click logit = c + pos[i] + s; grade = sigmoid(c2 + kappa * s).
 
@@ -66,7 +71,7 @@ class PreferenceModel:
 
     def __init__(self, movie_objects, user_objects=None, factors=0, reg=0.01, seed=0,
                  online_lr=0.05, unclicked_weight=0.5, grade_weight=1.0, epochs=300,
-                 history=False, demographics=False):
+                 history=False, demographics=False, pair_lr=0.3, pair_reg=0.05):
         from world.external_data_loader import GENRE_NAMES
 
         self.genre_names = [g for g in GENRE_NAMES if g != "unknown"]
@@ -98,6 +103,8 @@ class PreferenceModel:
         self.unclicked_weight, self.grade_weight = unclicked_weight, grade_weight
         self.epochs = epochs
         self.use_history, self.use_demographics = history, demographics
+        self.pair_lr, self.pair_reg = pair_lr, pair_reg
+        self.pair = {}            # (user, movie) -> offset r(u, m), learned online only
         self.params = self._initial_params(self.num_users)
 
         # The model's own log of the evidence (rows are what fit() trains on).
@@ -151,10 +158,10 @@ class PreferenceModel:
         s = P["b"][movies] + P["y"][self.decade[movies]] + self.genres[movies] @ self._taste(user_id)
         if self.factors:
             s = s + P["q"][movies] @ P["p"][user_id]
-        if P["h"][0] or P["h"][1]:
-            shown = np.array([math.log1p(self.shown.get((user_id, int(m)), 0)) for m in movies])
-            watched = np.array([1.0 if (user_id, int(m)) in self.watched else 0.0 for m in movies])
-            s = s + P["h"][0] * shown + P["h"][1] * watched
+        if P["h"][1]:
+            s = s + P["h"][1] * np.array([1.0 if (user_id, int(m)) in self.watched else 0.0 for m in movies])
+        if self.pair:
+            s = s + np.array([self.pair.get((user_id, int(m)), 0.0) for m in movies])
         return s
 
     def top(self, user_id, k):
@@ -167,13 +174,14 @@ class PreferenceModel:
     def _history(self, user_id, movie_id):
         if not self.use_history:
             return (0.0, 0.0)
-        return (math.log1p(self.shown.get((user_id, movie_id), 0)),
-                1.0 if (user_id, movie_id) in self.watched else 0.0)
+        return (0.0, 1.0 if (user_id, movie_id) in self.watched else 0.0)
 
     def _add_row(self, row, grade=False):
         target = self.grades if grade else self.rows
         target.append(row)
         self.sequence.append((grade, len(target) - 1))
+        if not grade and self.pair_lr:
+            self._pair_step(row)
         if self.online_lr:
             self._online_step(row, grade)
 
@@ -241,10 +249,20 @@ class PreferenceModel:
     def _row_score(self, u, m, shown, watched):
         P = self.params
         s = (P["b"][m] + P["y"][self.decade[m]] + self.genres[m] @ self._taste(u)
-             + P["h"][0] * shown + P["h"][1] * watched)
+             + P["h"][0] * shown + P["h"][1] * watched + self.pair.get((u, m), 0.0))
         if self.factors:
             s += P["q"][m] @ P["p"][u]
         return s
+
+    def _pair_step(self, row):
+        """Per-(user, movie) evidence, updated once per slate row as it
+        arrives (never replayed: install() keeps the pairs)."""
+        u, m, position, target, weight, shown, watched = row
+        P = self.params
+        z = P["c"][0] + P["pos"][min(position, POSITIONS - 1)] + self._row_score(u, m, shown, watched)
+        err = weight * (1.0 / (1.0 + math.exp(-z)) - target)
+        r = self.pair.get((u, m), 0.0)
+        self.pair[(u, m)] = r - self.pair_lr * (err + self.pair_reg * r)
 
     def _online_step(self, row, grade):
         """One SGD step on a single row. Only the user's and the movie's own
