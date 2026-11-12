@@ -19,7 +19,9 @@ Signals, all from the event log or the account/catalog:
   demographics (age bracket, gender, occupation: shared genre offsets);
 - the catalog: genres and release decade;
 - per (user, movie) history at the time of the slate: times already shown
-  and already watched (repeat impressions and rewatches are learned).
+  and already watched (repeat impressions and rewatches are learned). Only
+  slate rows carry it: a rating arrives after its watch, so a grade row
+  with "already watched" set would teach "watched means liked" (a leak).
 
 Relevance score of movie m for user u:
 
@@ -64,7 +66,7 @@ class PreferenceModel:
 
     def __init__(self, movie_objects, user_objects=None, factors=0, reg=0.01, seed=0,
                  online_lr=0.05, unclicked_weight=0.5, grade_weight=1.0, epochs=300,
-                 history=False, demographics=True):
+                 history=True, demographics=False):
         from world.external_data_loader import GENRE_NAMES
 
         self.genre_names = [g for g in GENRE_NAMES if g != "unknown"]
@@ -197,7 +199,7 @@ class PreferenceModel:
         for (u, m), tick in sorted(self.open_clicks.items()):
             if before_tick is None or tick < before_tick:
                 del self.open_clicks[(u, m)]          # clicked, not watched
-                self._add_row((u, m, 0.3, 0.5 * self.grade_weight) + self._history(u, m), grade=True)
+                self._add_row((u, m, 0.3, 0.5 * self.grade_weight) + (0.0, 0.0), grade=True)
 
     def observe_tick(self, events):
         """Apply a batch of events in canonical order (Flink and replays
@@ -221,11 +223,11 @@ class PreferenceModel:
             u, m = event.user_id, event.movie_id
             self.open_clicks.pop((u, m), None)
             grade = min(1.0, max(0.0, (event.completion - 0.1) / 0.85))
-            self._add_row((u, m, grade, self.grade_weight) + self._history(u, m), grade=True)
+            self._add_row((u, m, grade, self.grade_weight) + (0.0, 0.0), grade=True)
             self.watched.add((u, m))
         elif name == "RatingEvent":
             u, m = event.user_id, event.movie_id
-            self._add_row((u, m, (event.rating - 1.0) / 4.0, self.grade_weight) + self._history(u, m), grade=True)
+            self._add_row((u, m, (event.rating - 1.0) / 4.0, self.grade_weight) + (0.0, 0.0), grade=True)
         elif name == "OnboardingEvent":
             vec = np.zeros(len(self.genre_names))
             for g in event.genres:
