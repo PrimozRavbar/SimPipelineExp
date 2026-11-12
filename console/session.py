@@ -1222,10 +1222,12 @@ class SimSession:
         if s["preference_model"] and self.flink.preferences is None:
             world = self.system["world"]
             self.flink.preferences = PreferenceModel(world.movie_objects, world.user_objects, seed=self.seed,
-                                                     history=s["preference_history"])
+                                                     history=s["preference_history"],
+                                                     shown_feature=s["preference_history"])
             self.preference_source = PreferenceRetrieval(lambda: self.flink.preferences)
         if self.flink.preferences is not None:
             self.flink.preferences.use_history = s["preference_history"]
+            self.flink.preferences.shown_feature = s["preference_history"]
         self.model_server.ranker = self._serving_ranker(self.versions[self.serving_version])
         chain = []
         if s["filter_watched"]:
