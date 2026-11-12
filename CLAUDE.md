@@ -429,7 +429,8 @@ another component's random draws.
   rows like the tower score. A v6 version serves its own MLP once at least half its rows had a
   logged score; otherwise (first retrain) the preference model ranks. It combines the fast start
   of the preference model with the collaborative signals of the old stack: long static game
-  (s42) 40.7 at 800, 55.9 at 4000 (vs 53.1 preference ranker, 55.4 old stack). Protocol: rich
+  (s42) 40.7 at 800, 55.9 at 4000 (vs 53.1 preference ranker, 55.4 old stack; s1 39.3 at 800,
+  53.6 at 4000). Protocol: rich
   static s42 49.4, s1 46.9; rich dynamic s42 29.4, s1 27.9; genre static 53.9, dynamic 35.3
   (average 40.5 vs 40.2 preference ranker vs 36.6 old default).
 - **Default setup** (console `preset="best"`, `--preset best`, the default; `"plain"` = every
