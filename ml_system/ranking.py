@@ -297,21 +297,28 @@ def feature_names(feature_set):
     if feature_set == "v2":
         return list(FEATURES_V2)
     names = list(FEATURES_V2) + ["profile_cosine"] + ["genre_%s" % g for g in _v3_genres()]
-    if feature_set in ("v4", "v5"):
+    if feature_set in ("v4", "v5", "v6"):
         names += ["item_click_rate", "item_completion", "item_rating", "item_log_impressions",
                   "item_coec", "cowatch_score"]
-    if feature_set == "v5":
+    if feature_set in ("v5", "v6"):
         names += ["tower_score"]
+    if feature_set == "v6":
+        names += ["preference_score"]
     return names
 
 
 # v5 = v4 + the two-tower retrieval score (user vector . movie vector),
 # filled in by MLPRanker (it needs the towers): the ranker can build on
 # what retrieval learned about hidden tastes.
-FEATURE_SETS = {"v2": features_v2, "v3": features_v3, "v4": features_v4, "v5": features_v4}
+# v6 = v5 + the preference model's score (ml_system.online_model), set at
+# serving from the live model and in training from the scores logged when
+# each slate was served.
+FEATURE_SETS = {"v2": features_v2, "v3": features_v3, "v4": features_v4, "v5": features_v4, "v6": features_v4}
 
 
 def _build_row(feature_set, user, watches, slates, item, movie_id, genres_of, signals):
+    if feature_set == "v6":
+        return features_v4(user, watches, slates, item, movie_id, genres_of, signals=signals) + [0.0, 0.0]
     if feature_set == "v5":
         return features_v4(user, watches, slates, item, movie_id, genres_of, signals=signals) + [0.0]
     if feature_set == "v4":
@@ -367,6 +374,7 @@ class MLPRanker(Ranker):
         self.training_rows = 0
         self.positive_rate = None
         self.losses = []
+        self.preference_fn = None        # v6: returns the live preference model
 
     # -- serving ---------------------------------------------------------
 
@@ -378,13 +386,19 @@ class MLPRanker(Ranker):
         user_features = self.user_features_fn(user.user_id)
         watches = self.redis.get("recent_watches", user.user_id) or []
         slates = self.redis.get("recent_slates", user.user_id) or []
-        signals = self.redis.get("item_signals", "all") if self.feature_set in ("v4", "v5") else None
+        signals = self.redis.get("item_signals", "all") if self.feature_set in ("v4", "v5", "v6") else None
         rows = [_build_row(self.feature_set, user_features, watches, slates, self.feature_store.get_item_features(m),
                             m, self.genres_of, signals) for m in candidates]
-        if self.feature_set == "v5":
+        if self.feature_set in ("v5", "v6"):
+            column = -1 if self.feature_set == "v5" else -2
             user_vector = self.tower_user_vector({**user_features, "recent_watches": list(watches)})
             for row, m in zip(rows, candidates):
-                row[-1] = self.tower_score(user_vector, m)
+                row[column] = self.tower_score(user_vector, m)
+        if self.feature_set == "v6":
+            model = self.preference_fn() if self.preference_fn is not None else None
+            if model is not None:
+                for row, score in zip(rows, model.scores(user.user_id, list(candidates))):
+                    row[-1] = float(score)
         with torch.no_grad():
             x = (torch.tensor(rows, dtype=torch.float32) - self.mean) / self.scale
             if self.multitask:
@@ -420,7 +434,7 @@ class MLPRanker(Ranker):
                         completion_of[rec] = e.completion
         history = RecentHistory()
         signals = None
-        if feature_set in ("v4", "v5"):
+        if feature_set in ("v4", "v5", "v6"):
             from ml_system.item_signals import ItemSignals
             signals = ItemSignals()
         rows, positions, labels, completions = [], [], [], []
@@ -540,7 +554,7 @@ class MLPRanker(Ranker):
             row[-1] = self.tower_score(cache[key], movie_id)
 
     @staticmethod
-    def fill_tower_scores_from_log(rows, inputs, score_log):
+    def fill_tower_scores_from_log(rows, inputs, score_log, column=-1):
         """Training without leakage: each row gets the retrieval score that
         was logged when its slate was served ((tick, user, movie) ->
         score, computed by the model serving at the time, which had not
@@ -551,7 +565,7 @@ class MLPRanker(Ranker):
             score = score_log.get((tick, user_id, movie_id))
             if score is not None:
                 found += 1
-            row[-1] = 0.0 if score is None else score
+            row[column] = 0.0 if score is None else score
         return found / len(rows) if rows else 0.0
 
     def summary(self):

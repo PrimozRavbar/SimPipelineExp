@@ -90,7 +90,8 @@ DEFAULT_SETTINGS = {
     "preference_candidates": 50,
     "preference_factors": 0,       # hidden taste factors per user and movie (0 = genres and quality only)
     "preference_history": False,   # it also learns from times shown / already watched (repeat fatigue)
-    "preference_half_life": 0,     # refits weight a row half as much every N ticks of age (0 = all equal)
+    "preference_half_life": 0,
+    "ranker_preference_score": False,  # MLP ranker also sees the preference model's score (v6; logged at serving)     # refits weight a row half as much every N ticks of age (0 = all equal)
     # Personalisation
     "profile_candidates": 0,   # extra candidates from the user's genre profile (0 = two-tower only)
     "rich_profiles": False,    # profiles from clicks, watch completion and ratings, recent first
@@ -185,7 +186,7 @@ BOOL_SETTINGS = {"rebuild_index", "ranker", "ranker_mlp", "filter_watched", "eva
                  "logq_correction", "graded_positives", "tower_history", "train_from_scratch",
                  "ranker_multitask", "ranker_signals", "tower_engagement", "tower_demographics",
                  "tower_shared_ids", "ranker_tower_score", "preference_model",
-                 "preference_history"}
+                 "preference_history", "ranker_preference_score"}
 
 WORLDS = ("static", "dynamic")
 
@@ -442,6 +443,7 @@ class SimSession:
         # Feature log: the retrieval score of every served (tick, user,
         # movie), computed by the model that served it (for the v5 ranker).
         self.score_log = {}
+        self.preference_log = {}         # (tick, user, movie) -> preference model score at serving
         self.model_server.score_logger = self._log_scores
         self.drift_reference = None      # genre mix of clicks just after the last deploy
         self._apply_live_settings()
@@ -757,7 +759,9 @@ class SimSession:
             "rebuild_index": self.settings["rebuild_index"],
             "ranker": self.settings["ranker"],
             "ranker_mlp": self.settings["ranker_mlp"],
-            "ranker_features": ("v5" if self.settings["ranker_signals"] and self.settings["ranker_tower_score"] else
+            "ranker_features": ("v6" if self.settings["ranker_signals"] and self.settings["ranker_tower_score"]
+                                and self.settings["ranker_preference_score"] and self.settings["preference_model"] else
+                                "v5" if self.settings["ranker_signals"] and self.settings["ranker_tower_score"] else
                                 "v4" if self.settings["ranker_signals"] else
                                 "v3" if self.settings["ranker_genre_features"] else "v2"),
             "ranker_multitask": self.settings["ranker_multitask"],
@@ -840,14 +844,19 @@ class SimSession:
             # (a copy; the live one keeps learning online meanwhile).
             record["preferences"] = self.flink.preferences.snapshot()
         if record["ranker"] and record["ranker_mlp"]:
-            record["ranker_inputs"] = [] if record["ranker_features"] == "v5" else None
+            record["ranker_inputs"] = [] if record["ranker_features"] in ("v5", "v6") else None
             record["ranker_rows"] = MLPRanker.training_rows_from(
                 train_events, self.system["feature_store"], self._genres_of, record["ranker_features"],
                 with_completion=record["ranker_multitask"], inputs=record["ranker_inputs"])
-            if record["ranker_features"] == "v5":
+            if record["ranker_features"] in ("v5", "v6"):
                 # Join the logged serving-time scores (no leakage).
+                inputs = record.pop("ranker_inputs")
+                v6 = record["ranker_features"] == "v6"
                 record["logged_share"] = MLPRanker.fill_tower_scores_from_log(
-                    record["ranker_rows"][0], record.pop("ranker_inputs"), self.score_log)
+                    record["ranker_rows"][0], inputs, self.score_log, column=-2 if v6 else -1)
+                if v6:
+                    record["preference_logged_share"] = MLPRanker.fill_tower_scores_from_log(
+                        record["ranker_rows"][0], inputs, self.preference_log)
         elif record["ranker"]:
             record["ranker_rows"] = LogisticRanker.training_rows_from(train_events, self.system["feature_store"])
 
@@ -907,8 +916,11 @@ class SimSession:
                                        seed=self.seed * 1000 + record["version"],
                                        feature_set=record["ranker_features"],
                                        multitask=record["ranker_multitask"])
-                    if record["ranker_features"] == "v5":
+                    if record["ranker_features"] in ("v5", "v6"):
                         ranker.set_towers(user_tower, embeddings)
+                    if record["ranker_features"] == "v6":
+                        ranker.preference_fn = lambda: self.flink.preferences
+                        ranker.preference_logged_share = record.get("preference_logged_share")
                     ranker.fit(rows, positions, labels, rest[0] if rest else None)
                 elif record["ranker_rows"] is not None:
                     rows, labels = record["ranker_rows"]
@@ -1287,6 +1299,9 @@ class SimSession:
         """The ranker a model version serves with: the preference model when
         it is on (the version's own ranker until its first fit)."""
         own = model.ranker if self.settings["ranker"] else None
+        if (own is not None and getattr(own, "feature_set", None) == "v6"
+                and (getattr(own, "preference_logged_share", 0) or 0) >= 0.5):
+            return own          # the MLP already combines the preference score with everything else
         if self.settings["preference_model"] and self.flink.preferences is not None:
             return PreferenceRanker(lambda: self.flink.preferences, fallback=own)
         return own
@@ -1477,7 +1492,12 @@ class SimSession:
 
     def _log_scores(self, tick, user, slate, retriever):
         """Feature logging at serving time: user vector . movie vector of the
-        retriever that served this slate (not the fallback)."""
+        retriever that served this slate (not the fallback), and the live
+        preference model's score once it has been fitted (v6 ranker)."""
+        model = self.flink.preferences
+        if model is not None and model.fits:
+            for movie_id, score in zip(slate, model.scores(user.user_id, list(slate))):
+                self.preference_log[(tick, user.user_id, movie_id)] = float(score)
         user_tower = getattr(retriever, "user_tower", None)
         index = getattr(retriever, "ann_index", None)
         if user_tower is None or index is None:

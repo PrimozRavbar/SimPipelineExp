@@ -147,3 +147,30 @@ def test_a_slate_row_never_sees_its_own_watch():
     model.observe(RecommendationShownEvent(2, 1, 2, [3]))
     model.flush()
     assert model.rows[-1][6] == 1.0                 # the next slate does know
+
+
+def test_v6_ranker_learns_from_logged_preference_scores():
+    from console.session import SimSession
+    from ml_system.ranking import MLPRanker
+
+    s = SimSession(preset="plain", seed=3, users_per_tick=5, log_metrics=False,
+                   settings={"deploy_delay": 10, "epochs": 1, "spark_every": 0, "preference_model": True,
+                             "ranker": True, "ranker_signals": True, "ranker_tower_score": True,
+                             "ranker_preference_score": True})
+    s.step(40)
+    s.submit("retrain")
+    s.step(12)
+    # First retrain: nothing logged yet (the preference model was unfitted),
+    # so the preference model ranks.
+    assert isinstance(s.model_server.ranker, PreferenceRanker)
+    assert s.preference_log                           # logged from now on
+    s.step(60)
+    s.submit("retrain")
+    s.step(12)
+    v2 = s.versions[2].ranker
+    assert isinstance(v2, MLPRanker) and v2.feature_set == "v6"
+    assert 0 < v2.preference_logged_share
+    # Every logged score came from the model live at serving time.
+    tick, user, movie = next(iter(s.preference_log))
+    assert tick > 50                                 # first fit deployed at the tick-50 boundary
+    s.close()
