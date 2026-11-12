@@ -71,7 +71,8 @@ class PreferenceModel:
 
     def __init__(self, movie_objects, user_objects=None, factors=0, reg=0.01, seed=0,
                  online_lr=0.05, unclicked_weight=0.5, grade_weight=1.0, epochs=300,
-                 history=False, demographics=False, pair_lr=0.3, pair_reg=0.05, shown_feature=False):
+                 history=False, demographics=False, pair_lr=0.3, pair_reg=0.05, shown_feature=False,
+                 half_life=0):
         from world.external_data_loader import GENRE_NAMES
 
         self.genre_names = [g for g in GENRE_NAMES if g != "unknown"]
@@ -105,6 +106,7 @@ class PreferenceModel:
         self.use_history, self.use_demographics = history, demographics
         self.pair_lr, self.pair_reg = pair_lr, pair_reg
         self.shown_feature = shown_feature
+        self.half_life = half_life      # fit(): a row's weight halves every half_life ticks (0 = all equal)
         self.pair = {}            # (user, movie) -> offset r(u, m), learned online only
         self.params = self._initial_params(self.num_users)
 
@@ -112,6 +114,7 @@ class PreferenceModel:
         self.rows = []            # (user, movie, position, target, weight, shown, watched)
         self.grades = []          # (user, movie, target, weight, shown, watched)
         self.sequence = []        # (is_grade, index): the order rows arrived in
+        self.row_ticks = {False: [], True: []}   # tick each row was logged at
         self.onboarding = {}      # user -> unit vector over genres
         self.shown = {}           # (user, movie) -> impressions so far
         self.watched = set()
@@ -160,7 +163,7 @@ class PreferenceModel:
         if self.factors:
             s = s + P["q"][movies] @ P["p"][user_id]
         if P["h"][0]:
-            s = s + P["h"][0] * np.array([math.log1p(self.shown.get((user_id, int(m)), 0)) for m in movies])
+            s = s + P["h"][0] * np.array([min(self.shown.get((user_id, int(m)), 0), 30) for m in movies])
         if P["h"][1]:
             s = s + P["h"][1] * np.array([1.0 if (user_id, int(m)) in self.watched else 0.0 for m in movies])
         if self.pair:
@@ -177,12 +180,13 @@ class PreferenceModel:
     def _history(self, user_id, movie_id):
         if not self.use_history:
             return (0.0, 0.0)
-        shown = math.log1p(self.shown.get((user_id, movie_id), 0)) if self.shown_feature else 0.0
+        shown = min(self.shown.get((user_id, movie_id), 0), 30) if self.shown_feature else 0.0
         return (shown, 1.0 if (user_id, movie_id) in self.watched else 0.0)
 
     def _add_row(self, row, grade=False):
         target = self.grades if grade else self.rows
         target.append(row)
+        self.row_ticks[grade].append(self.last_tick or 0)
         self.sequence.append((grade, len(target) - 1))
         if not grade and self.pair_lr:
             self._pair_step(row)
@@ -342,6 +346,11 @@ class PreferenceModel:
             gy, gw, gs, gwa = T(grades[:, 2]), T(grades[:, 3]), T(grades[:, 4]), T(grades[:, 5])
             bce = torch.nn.functional.binary_cross_entropy_with_logits
             optimizer = torch.optim.Adam(P.values(), lr=learning_rate)
+            if self.half_life:
+                now = float(self.last_tick or 0)
+                decay = lambda ticks: T(0.5 ** ((now - np.asarray(ticks, dtype=float)) / self.half_life))
+                rw = rw * decay(self.row_ticks[False])
+                gw = gw * decay(self.row_ticks[True])
             total = rw.sum()
             for _ in range(epochs):
                 optimizer.zero_grad()

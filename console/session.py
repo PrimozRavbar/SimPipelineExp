@@ -88,7 +88,9 @@ DEFAULT_SETTINGS = {
     # the candidates and adds its own best movies from the whole catalog.
     "preference_model": False,
     "preference_candidates": 50,
+    "preference_factors": 0,       # hidden taste factors per user and movie (0 = genres and quality only)
     "preference_history": False,   # it also learns from times shown / already watched (repeat fatigue)
+    "preference_half_life": 0,     # refits weight a row half as much every N ticks of age (0 = all equal)
     # Personalisation
     "profile_candidates": 0,   # extra candidates from the user's genre profile (0 = two-tower only)
     "rich_profiles": False,    # profiles from clicks, watch completion and ratings, recent first
@@ -137,6 +139,7 @@ BEST_SETTINGS = {
     "profile_candidates": 30, "cowatch_candidates": 30,
     "rich_profiles": True, "onboarding": True, "logq_correction": True,
     "diversity_pct": 15,
+    "preference_model": True, "preference_history": True,
 }
 PRESETS = {"plain": PLAIN_SETTINGS, "best": BEST_SETTINGS}
 DEFAULT_SETTINGS = dict(BEST_SETTINGS)
@@ -157,6 +160,8 @@ SETTING_LIMITS = {
     "random_negatives": (0, 20),
     "cowatch_candidates": (0, 100),
     "preference_candidates": (0, 500),
+    "preference_factors": (0, 64),
+    "preference_half_life": (0, 100000),
     "diversity_pct": (0, 100),
     "exploration_pct": (0, 50),
     "canary_share": (0, 100),
@@ -1223,9 +1228,11 @@ class SimSession:
             world = self.system["world"]
             self.flink.preferences = PreferenceModel(world.movie_objects, world.user_objects, seed=self.seed,
                                                      history=s["preference_history"],
-                                                     shown_feature=s["preference_history"])
+                                                     shown_feature=s["preference_history"],
+                                                     factors=s["preference_factors"])
             self.preference_source = PreferenceRetrieval(lambda: self.flink.preferences)
         if self.flink.preferences is not None:
+            self.flink.preferences.half_life = s["preference_half_life"]
             self.flink.preferences.use_history = s["preference_history"]
             self.flink.preferences.shown_feature = s["preference_history"]
         self.model_server.ranker = self._serving_ranker(self.versions[self.serving_version])
