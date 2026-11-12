@@ -140,7 +140,7 @@ BEST_SETTINGS = {
     "profile_candidates": 30, "cowatch_candidates": 30,
     "rich_profiles": True, "onboarding": True, "logq_correction": True,
     "diversity_pct": 15,
-    "preference_model": True, "preference_history": True,
+    "preference_model": True, "preference_history": True, "ranker_preference_score": True,
 }
 PRESETS = {"plain": PLAIN_SETTINGS, "best": BEST_SETTINGS}
 DEFAULT_SETTINGS = dict(BEST_SETTINGS)

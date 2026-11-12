@@ -424,9 +424,18 @@ another component's random draws.
   4000, preference model 29.0 -> 14.5) because fatigue never recovers: a learner that knows
   genre taste and quality exhausts its best picks per user, while the oracle (still ~55) knows
   the remaining hidden tastes. A half-life (400 / 1000 ticks) gives only +1.5 / +2.6 at 2800.
+- **Ranker v6** (`ranker_preference_score`): MLP v5 + the preference model's score, logged at
+  serving time from the live fitted model (`SimSession.preference_log`) and joined to training
+  rows like the tower score. A v6 version serves its own MLP once at least half its rows had a
+  logged score; otherwise (first retrain) the preference model ranks. It combines the fast start
+  of the preference model with the collaborative signals of the old stack: long static game
+  (s42) 40.7 at 800, 55.9 at 4000 (vs 53.1 preference ranker, 55.4 old stack). Protocol: rich
+  static s42 49.4, s1 46.9; rich dynamic s42 29.4, s1 27.9; genre static 53.9, dynamic 35.3
+  (average 40.5 vs 40.2 preference ranker vs 36.6 old default).
 - **Default setup** (console `preset="best"`, `--preset best`, the default; `"plain"` = every
-  model feature off, the original console): MLP ranker v5 (genre features, movie signals,
-  logged retrieval score), profile candidates 30, co-watch candidates 30, rich profiles,
+  model feature off, the original console): preference model with repeat effects, MLP ranker
+  v6 (genre features, movie signals, logged retrieval and preference scores), preference
+  candidates 50, profile candidates 30, co-watch candidates 30, rich profiles,
   onboarding, logQ, diversity 15%. Chosen over the alternatives by CTR after the second
   retrain (ticks 852-1200), averaged over static/dynamic and two seeds in the rich world:
   this setup 34.5% vs 33.6% (no retrieval score / diversity) and lower with the tower inputs
