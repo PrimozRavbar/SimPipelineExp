@@ -71,7 +71,7 @@ class PreferenceModel:
 
     def __init__(self, movie_objects, user_objects=None, factors=0, reg=0.01, seed=0,
                  online_lr=0.05, unclicked_weight=0.5, grade_weight=1.0, epochs=300,
-                 history=False, demographics=False, pair_lr=0.3, pair_reg=0.05):
+                 history=False, demographics=False, pair_lr=0.3, pair_reg=0.05, shown_feature=False):
         from world.external_data_loader import GENRE_NAMES
 
         self.genre_names = [g for g in GENRE_NAMES if g != "unknown"]
@@ -104,6 +104,7 @@ class PreferenceModel:
         self.epochs = epochs
         self.use_history, self.use_demographics = history, demographics
         self.pair_lr, self.pair_reg = pair_lr, pair_reg
+        self.shown_feature = shown_feature
         self.pair = {}            # (user, movie) -> offset r(u, m), learned online only
         self.params = self._initial_params(self.num_users)
 
@@ -158,6 +159,8 @@ class PreferenceModel:
         s = P["b"][movies] + P["y"][self.decade[movies]] + self.genres[movies] @ self._taste(user_id)
         if self.factors:
             s = s + P["q"][movies] @ P["p"][user_id]
+        if P["h"][0]:
+            s = s + P["h"][0] * np.array([math.log1p(self.shown.get((user_id, int(m)), 0)) for m in movies])
         if P["h"][1]:
             s = s + P["h"][1] * np.array([1.0 if (user_id, int(m)) in self.watched else 0.0 for m in movies])
         if self.pair:
@@ -174,7 +177,8 @@ class PreferenceModel:
     def _history(self, user_id, movie_id):
         if not self.use_history:
             return (0.0, 0.0)
-        return (0.0, 1.0 if (user_id, movie_id) in self.watched else 0.0)
+        shown = math.log1p(self.shown.get((user_id, movie_id), 0)) if self.shown_feature else 0.0
+        return (shown, 1.0 if (user_id, movie_id) in self.watched else 0.0)
 
     def _add_row(self, row, grade=False):
         target = self.grades if grade else self.rows
