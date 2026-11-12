@@ -115,7 +115,7 @@ class PreferenceModel:
         self.shown = {}           # (user, movie) -> impressions so far
         self.watched = set()
         self.impressions = np.zeros(self.num_movies)
-        self.pending = {}         # recommendation id -> [tick, user, movies, clicked index]
+        self.pending = {}         # recommendation id -> [tick, user, movies, clicked index, history]
         self.open_clicks = {}     # (user, movie) -> tick, until its watch (or not) is known
         self.last_tick = None
         self.fitted_rows = 0      # length of `sequence` when last fitted
@@ -185,14 +185,14 @@ class PreferenceModel:
         if self.online_lr:
             self._online_step(row, grade)
 
-    def _finish_slate(self, user_id, movies, clicked):
+    def _finish_slate(self, user_id, movies, clicked, history):
         last = len(movies) - 1 if clicked is None else clicked
         for i in range(last + 1):
             if clicked is None:
                 target, weight = 0.0, self.unclicked_weight
             else:
                 target, weight = (1.0 if i == clicked else 0.0), 1.0
-            self._add_row((user_id, movies[i], i, target, weight) + self._history(user_id, movies[i]))
+            self._add_row((user_id, movies[i], i, target, weight) + history[i])
         for m in movies:
             self.shown[(user_id, m)] = self.shown.get((user_id, m), 0) + 1
             self.impressions[m] += 1
@@ -200,10 +200,10 @@ class PreferenceModel:
     def flush(self, before_tick=None):
         """Learn from pending slates shown before `before_tick` (all if None)."""
         for rid in sorted(self.pending):
-            tick, user_id, movies, clicked = self.pending[rid]
+            tick, user_id, movies, clicked, history = self.pending[rid]
             if before_tick is None or tick < before_tick:
                 del self.pending[rid]
-                self._finish_slate(user_id, movies, clicked)
+                self._finish_slate(user_id, movies, clicked, history)
         for (u, m), tick in sorted(self.open_clicks.items()):
             if before_tick is None or tick < before_tick:
                 del self.open_clicks[(u, m)]          # clicked, not watched
@@ -221,7 +221,10 @@ class PreferenceModel:
         self.last_tick = event.timestamp
         name = type(event).__name__
         if name == "RecommendationShownEvent":
-            self.pending[event.recommendation_id] = [event.timestamp, event.user_id, list(event.movie_ids), None]
+            # History as of the moment the slate is shown (its own click and
+            # watch arrive later in the tick and must not leak into its rows).
+            history = [self._history(event.user_id, m) for m in event.movie_ids]
+            self.pending[event.recommendation_id] = [event.timestamp, event.user_id, list(event.movie_ids), None, history]
         elif name == "RecommendationClickedEvent":
             slate = self.pending.get(event.recommendation_id)
             if slate is not None and event.movie_id in slate[2]:

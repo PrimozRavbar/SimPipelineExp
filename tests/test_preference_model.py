@@ -129,3 +129,21 @@ def test_console_flink_copy_matches_a_replay_of_the_data_lake():
     assert replayed.rows == live.rows and replayed.grades == live.grades
     assert replayed.onboarding.keys() == live.onboarding.keys()
     s.close()
+
+
+def test_a_slate_row_never_sees_its_own_watch():
+    # Regression: rows were written at the end of the tick, after the
+    # slate's own watch, so the clicked row said "already watched" and the
+    # model learned "watched => clicked" (weight ~5, even where rewatches
+    # are rare).
+    movies, users = catalog()
+    model = PreferenceModel(movies, users, history=True)
+    model.observe(RecommendationShownEvent(1, 1, 1, [2, 3]))
+    model.observe(RecommendationClickedEvent(1, 1, 1, 3))
+    model.observe(WatchEvent(1, 1, 3, 100.0, 0.9))
+    model.flush()
+    clicked_row = [r for r in model.rows if r[1] == 3][0]
+    assert clicked_row[6] == 0.0
+    model.observe(RecommendationShownEvent(2, 1, 2, [3]))
+    model.flush()
+    assert model.rows[-1][6] == 1.0                 # the next slate does know
