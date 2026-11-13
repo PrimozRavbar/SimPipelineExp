@@ -96,7 +96,6 @@ DEFAULT_SETTINGS = {
     "preference_history": False,   # it also learns from times shown / already watched (repeat fatigue)
     "preference_half_life": 0,
     "preference_optimism_pct": 0,
-    "preference_repeat_skip_pct": 100,
     "preference_taste_half_life": 0,  # user tastes follow recent behaviour: rows halve every N ticks (0 = off)  # weight of a skip per earlier impression of the movie (100 = all skips equal)  # exploration bonus for rarely shown movies (UCB-style), x0.01 logits
     "ranker_preference_score": False,  # MLP ranker also sees the preference model's score (v6; logged at serving)     # refits weight a row half as much every N ticks of age (0 = all equal)
     # Personalisation
@@ -190,7 +189,6 @@ SETTING_LIMITS = {
     "preference_factors": (0, 64),
     "preference_half_life": (0, 100000),
     "preference_optimism_pct": (0, 500),
-    "preference_repeat_skip_pct": (0, 100),
     "preference_taste_half_life": (0, 100000),
     "diversity_pct": (0, 100),
     "exploration_pct": (0, 50),
@@ -1352,7 +1350,6 @@ class SimSession:
         if self.flink.preferences is not None:
             self.flink.preferences.half_life = s["preference_half_life"]
             self.flink.preferences.optimism = s["preference_optimism_pct"] / 100.0
-            self.flink.preferences.repeat_skip_weight = s["preference_repeat_skip_pct"] / 100.0
             self.flink.preferences.taste_half_life = s["preference_taste_half_life"]
             self.flink.preferences.use_history = s["preference_history"]
             self.flink.preferences.shown_feature = s["preference_history"]
