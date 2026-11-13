@@ -90,3 +90,48 @@ def test_fatigue_wears_off_with_recovery():
 def test_unknown_dynamics_key_is_rejected():
     with pytest.raises(ValueError):
         build({"taste_drift": 1})
+
+
+def test_gradual_drift_moves_taste_in_steps_towards_a_related_genre():
+    system = build({"taste_drift_every": 20, "taste_drift_share": 0.1, "taste_drift_strength": 0.6,
+                    "taste_drift_mode": "gradual", "taste_drift_steps": 4})
+    dynamics = system["world_dynamics"]
+    system["sim"].run(20, verbose=False)
+    started = list(dynamics.drift_log)
+    assert started and len(dynamics.journeys) == len(started)
+    _, user_id, genre = started[0]
+    prefs = system["world"].user_states[user_id].genre_preferences
+    first = prefs[genre] / sum(prefs.values())
+    system["sim"].run(20, verbose=False)               # the remaining 3 steps
+    prefs = system["world"].user_states[user_id].genre_preferences
+    final = prefs[genre] / sum(prefs.values())
+    assert first < final and final >= 0.6               # gradual, and the same total shift
+    assert user_id not in dynamics.journeys or dynamics.journeys[user_id][1] < 4
+    # Targets follow the catalog's genre co-occurrence: a pure Comedy fan
+    # never drifts to a genre that never appears with Comedy.
+    R = dynamics.relatedness()
+    from world.dynamics import DRIFT_GENRES
+    comedy = DRIFT_GENRES.index("Comedy")
+    targets = {dynamics.related_target({"Comedy": 1.0}) for _ in range(200)}
+    assert all(R[comedy][DRIFT_GENRES.index(g)] > 0 for g in targets)
+
+
+def test_browsing_emits_events_from_current_taste_and_profiles_count_them():
+    from ml_system.build_recommendation_system import build_recommendation_system
+    from world.external_data_loader import load_movielens
+
+    d = load_movielens()
+    system = build_recommendation_system(d["movie_objects"], d["user_objects"], d["user_states"], d["movie_states"],
+                                         seed=5, users_per_tick=5, log_metrics=False, browsing={"rate": 1.0})
+    flink = system["sim"].get_service("Flink")
+    flink.track_browsing = True
+    flink.profile_mode = "rich"
+    system["sim"].run(10, verbose=False)
+    browses = [e for e in system["datalake"].events if type(e).__name__ == "BrowseEvent"]
+    assert len(browses) == 50                                   # every visit browses at rate 1
+    world = system["world"]
+    from world.relevance import genre_share
+    assert all(genre_share(world.user_states[e.user_id]).get(e.genre, 0) > 0 for e in browses)
+    e = browses[-1]
+    profile = system["redis"].get("genre_preferences", e.user_id)
+    assert profile and profile.get(e.genre, 0) > 0

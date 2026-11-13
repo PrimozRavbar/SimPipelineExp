@@ -4,7 +4,7 @@ from .entities import User, Movie, Rating, UserState, MovieState
 
 from uuid import uuid4
 
-from simulation.events import OnboardingEvent
+from simulation.events import BrowseEvent, OnboardingEvent
 
 
 class World(Service):
@@ -21,7 +21,9 @@ class World(Service):
         user_simulator_kwargs=None,
         onboarding=None,
         onboarding_rng=None,
-        taste=None
+        taste=None,
+        browsing=None,
+        browsing_rng=None
     ):
         super().__init__()
 
@@ -53,6 +55,10 @@ class World(Service):
         # slate). Dict {"genres": k, "noise": p}; None = off. Own RNG.
         self.onboarding = onboarding
         self.onboarding_rng = onboarding_rng
+        # browsing: {"rate": p}: on each visit, with probability p, the user
+        # browses a genre first (BrowseEvent). None = off (the original).
+        self.browsing = browsing
+        self.browsing_rng = browsing_rng
         self.onboarded = set()
 
         # Users who can be active. None = everyone (the original behaviour);
@@ -101,6 +107,14 @@ class World(Service):
                 genres=self.declared_genres(user.user_id),
             ))
 
+        if self.browsing and self.browsing.get("rate", 0) > 0 \
+                and self.browsing_rng.random() < self.browsing["rate"]:
+            self.outbox.append(BrowseEvent(
+                timestamp=sim.clock.now,
+                user_id=user.user_id,
+                genre=self.browsed_genre(user.user_id),
+            ))
+
         model_server = sim.get_service("ModelServer")
 
         movie_ids = model_server.recommend(user)
@@ -115,6 +129,23 @@ class World(Service):
         )
 
         self.outbox.extend(events)
+
+    def browsed_genre(self, user_id):
+        """The genre a user browses: drawn from their current true genre
+        share (tastes that drifted show up here at once)."""
+        from world.dynamics import DRIFT_GENRES
+        from world.relevance import genre_share
+
+        share = genre_share(self.user_states[user_id])
+        genres = [g for g in DRIFT_GENRES if share.get(g, 0) > 0]
+        if not genres:
+            return self.browsing_rng.choice(DRIFT_GENRES)
+        pick = self.browsing_rng.random() * sum(share[g] for g in genres)
+        for genre in genres:
+            pick -= share[genre]
+            if pick <= 0:
+                return genre
+        return genres[-1]
 
     def declared_genres(self, user_id):
         """The genres a user ticks at sign-up: their top `genres` genres by

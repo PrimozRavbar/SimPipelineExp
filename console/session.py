@@ -42,6 +42,7 @@ from ml_system.feast import MODES as FEAST_MODES
 from ml_system.redis import EVICTION_POLICIES
 from console.economy import ONE_OFF, PRICES, Economy
 from ml_system.online_model import PreferenceModel, PreferenceRanker, PreferenceRetrieval
+from ml_system.exploration import POLICIES as EXPLORE_POLICIES, SlotExplorer
 from ml_system.training import TwoTowerTrainer
 from ml_system.two_tower import USER_FEATURE_DEFAULTS, SimpleItemTower, SimpleUserTower, TwoTowerRetrieval
 from world.dynamics import DYNAMIC_WORLD
@@ -106,6 +107,12 @@ DEFAULT_SETTINGS = {
     "filter_watched": False,   # drop movies the user already watched (re-ranker)
     "diversity_pct": 0,        # MMR on genres: 0 = pure relevance, 100 = most varied slates
     "exploration_pct": 0,      # share of slate slots given to random lower-ranked candidates
+    # Targeted exploration (ml_system/exploration.py; needs the preference model)
+    "explore_slots": 0,        # slots per slate an exploration pick may take (0 = off)
+    "explore_rate_pct": 10,    # share of slates that explore
+    "explore_boost_pct": 50,   # ... for users the drift detector flags
+    "explore_policy": "thompson",  # or "uniform"
+    "explore_ips": True,       # train on explored picks with inverse propensity weights
     # Canary: a new model first serves canary_share % of users for
     # canary_ticks ticks, then is promoted unless it is significantly worse.
     "canary_share": 0,
@@ -149,6 +156,8 @@ DEFAULT_SETTINGS = {
     # World (simulated users)
     "taste_drift_every": 0,    # every N ticks some users' taste drifts (0 = off)
     "taste_drift_share_pct": 5,
+    "taste_drift_mode": "abrupt",  # "gradual": small steps towards a related genre (the dynamic world's default)
+    "browse_pct": 30,          # share of visits where the user first browses a genre (BrowseEvent)
     "fatigue_pct": 0,          # click probability lost per repeat impression
     "fatigue_recovery_ticks": 0,  # fatigue halves every N ticks since the last impression (0 = never)
     "rewatch_pct": 100,        # click probability kept for an already-watched movie
@@ -169,6 +178,12 @@ BEST_SETTINGS = {
     "preference_model": True, "preference_history": True, "ranker_preference_score": True,
 }
 PRESETS = {"plain": PLAIN_SETTINGS, "best": BEST_SETTINGS}
+
+# The best setup in the dynamic world adds targeted exploration (drifting
+# users; measured in CLAUDE.md "Exploration"). In the static world, where
+# tastes never move, exploration only costs clicks, so it stays off.
+BEST_DYNAMIC_EXTRAS = {"explore_slots": 1, "explore_rate_pct": 10, "explore_boost_pct": 50,
+                       "explore_policy": "thompson", "explore_ips": True}
 DEFAULT_SETTINGS = dict(BEST_SETTINGS)
 
 # (min, max) for numeric settings; bools are listed in BOOL_SETTINGS.
@@ -206,6 +221,10 @@ SETTING_LIMITS = {
     "freshness_alert": (10, 100000),
     "taste_drift_every": (0, 100000),
     "taste_drift_share_pct": (1, 100),
+    "browse_pct": (0, 100),
+    "explore_slots": (0, 5),
+    "explore_rate_pct": (0, 100),
+    "explore_boost_pct": (0, 100),
     "fatigue_pct": (0, 90),
     "fatigue_recovery_ticks": (0, 100000),
     "kafka_partitions": (1, 64),
@@ -231,10 +250,11 @@ BOOL_SETTINGS = {"rebuild_index", "ranker", "ranker_mlp", "filter_watched", "eva
                  "logq_correction", "graded_positives", "tower_history", "train_from_scratch",
                  "ranker_multitask", "ranker_signals", "tower_engagement", "tower_demographics",
                  "tower_shared_ids", "ranker_tower_score", "preference_model",
-                 "preference_history", "ranker_preference_score"}
+                 "preference_history", "ranker_preference_score", "explore_ips"}
 
 # Settings that take one of a few strings.
-CHOICE_SETTINGS = {"redis_eviction": EVICTION_POLICIES, "feast_mode": FEAST_MODES}
+CHOICE_SETTINGS = {"redis_eviction": EVICTION_POLICIES, "feast_mode": FEAST_MODES,
+                   "taste_drift_mode": ("abrupt", "gradual"), "explore_policy": EXPLORE_POLICIES}
 
 # User features that expire with redis_ttl_ticks.
 TTL_FEATURES = ("genre_preferences", "activity_level", "interactions", "average_rating",
@@ -246,6 +266,7 @@ WORLDS = ("static", "dynamic")
 DYNAMIC_SETTINGS = {
     "taste_drift_every": DYNAMIC_WORLD["taste_drift_every"],
     "taste_drift_share_pct": round(DYNAMIC_WORLD["taste_drift_share"] * 100),
+    "taste_drift_mode": DYNAMIC_WORLD["taste_drift_mode"],
     "fatigue_pct": round(DYNAMIC_WORLD["fatigue"] * 100),
     "fatigue_recovery_ticks": DYNAMIC_WORLD["fatigue_recovery"],
     "rewatch_pct": round(DYNAMIC_WORLD["rewatch"] * 100),
@@ -393,6 +414,8 @@ class SimSession:
         self.settings = dict(PRESETS[preset])
         if world == "dynamic":
             self.settings.update(DYNAMIC_SETTINGS)
+            if preset == "best":
+                self.settings.update(BEST_DYNAMIC_EXTRAS)
         if settings:
             self._check_settings(settings)
             self.settings.update(settings)
@@ -1367,6 +1390,17 @@ class SimSession:
                 self.explorer = ExplorationReranker(s["exploration_pct"] / 100.0,
                                                     lambda: self.model_server.slate_size, self.explore_rng)
             chain.append(self.explorer)
+        if s["explore_slots"] and self.flink.preferences is not None:
+            if getattr(self, "slot_explorer", None) is None:
+                self.slot_explorer = SlotExplorer(lambda: self.flink.preferences, lambda: self.model_server.slate_size,
+                                                  random.Random("explorer-%d" % self.seed), sim_fn=lambda: self.sim)
+            e = self.slot_explorer
+            e.slots, e.policy = s["explore_slots"], s["explore_policy"]
+            e.rate, e.boosted_rate = s["explore_rate_pct"] / 100.0, s["explore_boost_pct"] / 100.0
+            chain.append(e)
+            self.flink.preferences.propensities = e.propensities if s["explore_ips"] else None
+        elif self.flink.preferences is not None:
+            self.flink.preferences.propensities = None
         self.model_server.reranker = RerankerChain(chain) if chain else None
         if (s["ranker"] and s["ranker_mlp"]) or s["tower_history"]:
             self.flink.track_recent = True     # recent history for the MLP ranker / user tower (stays on)
@@ -1390,6 +1424,9 @@ class SimSession:
         self.flink.profile_mode = mode
         self.offline.feature_pipeline.profile_mode = mode
         self.system["world"].onboarding = {"genres": 3, "noise": 0.3} if s["onboarding"] else None
+        self.system["world"].browsing = {"rate": s["browse_pct"] / 100.0} if s["browse_pct"] else None
+        if s["browse_pct"]:
+            self.flink.track_browsing = True       # stays on once switched on
         if s["onboarding"]:
             self.flink.track_onboarding = True    # stays on once switched on
         self.flink.max_events_per_tick = s["flink_capacity"] or None
@@ -1397,6 +1434,7 @@ class SimSession:
         d = self.dynamics
         d.taste_drift_every = s["taste_drift_every"]
         d.taste_drift_share = s["taste_drift_share_pct"] / 100.0
+        d.taste_drift_mode = s["taste_drift_mode"]
         d.users_joining_per_tick = s["users_joining_per_100_ticks"] / 100.0
         self.simulator.fatigue = s["fatigue_pct"] / 100.0
         self.simulator.fatigue_recovery = s["fatigue_recovery_ticks"]
@@ -1979,6 +2017,7 @@ class SimSession:
                           "lag": kafka.lag("Flink"), "processed_last_tick": self.flink.processed_last_tick,
                           "capacity": self.flink.max_events_per_tick},
                 "redis": {"keys": len(redis.store)},
+                "exploration": self._exploration_view(),
                 "server": {"model_version": self.serving_version, "slate_size": self.model_server.slate_size,
                            "num_candidates": self.model_server.num_candidates,
                            "slates_last_50_ticks": sum(recent),
@@ -2013,6 +2052,20 @@ class SimSession:
                               for name, options in self.SWAPPABLE.items()},
                 "settings": dict(self.settings),
             }
+
+    def _exploration_view(self):
+        e = getattr(self, "slot_explorer", None)
+        if e is None or not self.settings["explore_slots"]:
+            return None
+        model = self.flink.preferences
+        active = self.system["world"].active_user_ids or list(self.system["world"].user_objects)
+        clicks = {(ev.timestamp, ev.user_id): ev.movie_id for ev in self._recent_events(300)
+                  if type(ev).__name__ == "RecommendationClickedEvent"}
+        since = self.tick - 300
+        explored = [k for k in list(e.explored)[-3000:] if k[0] > since]
+        clicked = sum(1 for tick, user, movie in explored if clicks.get((tick, user)) == movie)
+        return {**e.summary(), "drifting_users": sum(1 for u in active if model.drifting(u)) if model else 0,
+                "explored_click_rate": clicked / len(explored) if explored else None}
 
     def _index_view(self):
         index = self.retriever.ann_index

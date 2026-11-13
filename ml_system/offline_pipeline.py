@@ -159,6 +159,9 @@ class OfflineFeaturePipeline:
             if isinstance(event, OnboardingEvent):
                 update_genre_counts(user["genre_preferences"], "onboarding", event.genres)
 
+            if type(event).__name__ == "BrowseEvent":
+                update_genre_counts(user["genre_preferences"], "browse", [event.genre], self.profile_mode)
+
             if self.engagement:
                 kind = {"RecommendationShownEvent": "shown", "RecommendationClickedEvent": "click",
                         "WatchEvent": "watch", "OnboardingEvent": "onboarding"}.get(type(event).__name__)

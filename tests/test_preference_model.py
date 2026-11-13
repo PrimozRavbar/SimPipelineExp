@@ -199,3 +199,15 @@ def test_rollback_to_v0_also_rolls_back_the_preference_model():
     s.step(1)
     assert s.serving_version == 1 and s.flink.preferences.fits == 1
     s.close()
+
+
+def test_browsing_feeds_the_preference_model():
+    from simulation.events import BrowseEvent
+
+    movies, users = catalog()
+    model = PreferenceModel(movies, users)
+    model.observe(BrowseEvent(0, 1, "Comedy"))
+    model.observe(RecommendationShownEvent(1, 1, 1, [2, 3]))     # 2 Drama, 3 Comedy
+    model.flush()
+    match = {r[1]: r[7] for r in model.rows}
+    assert match[3] > match[2] == 0.0
