@@ -72,7 +72,7 @@ class PreferenceModel:
     def __init__(self, movie_objects, user_objects=None, factors=0, reg=0.01, seed=0,
                  online_lr=0.05, unclicked_weight=0.5, grade_weight=1.0, epochs=300,
                  history=False, demographics=False, pair_lr=0.3, pair_reg=0.05, shown_feature=False,
-                 half_life=0):
+                 half_life=0, optimism=0.0, taste_half_life=0, genre_optimism=0.0):
         from world.external_data_loader import GENRE_NAMES
 
         self.genre_names = [g for g in GENRE_NAMES if g != "unknown"]
@@ -107,6 +107,24 @@ class PreferenceModel:
         self.pair_lr, self.pair_reg = pair_lr, pair_reg
         self.shown_feature = shown_feature
         self.half_life = half_life      # fit(): a row's weight halves every half_life ticks (0 = all equal)
+        # optimism: when choosing (scores(), not training), a movie gets a
+        # bonus optimism / sqrt(1 + impressions / 10): rarely shown movies,
+        # whose quality is still uncertain, get tried (UCB-style
+        # exploration, deterministic); the bonus fades as evidence comes in.
+        self.optimism = optimism
+        # taste_half_life: after the fit on all rows, re-fit only each user's
+        # taste deviation w_u on rows weighted by age (halving every
+        # taste_half_life ticks), anchored to the full-history w_u: tastes
+        # follow recent behaviour (drift), movie quality and everything
+        # shared still learn from all the data. 0 = off.
+        self.taste_half_life = taste_half_life
+        # genre_optimism: per-user exploration of genres. A user's taste for
+        # a genre can only be learned from slates that show it; a genre this
+        # user has rarely been shown gets a bonus that fades as it is shown
+        # (genre_optimism / sqrt(1 + impressions of that genre / 5), summed
+        # over the movie's genres). Deterministic. 0 = off.
+        self.genre_optimism = genre_optimism
+        self.user_genre_shown = {}      # user -> genre impressions (normalised genre vectors)
         self.pair = {}            # (user, movie) -> offset r(u, m), learned online only
         self.params = self._initial_params(self.num_users)
 
@@ -168,6 +186,12 @@ class PreferenceModel:
             s = s + P["h"][1] * np.array([1.0 if (user_id, int(m)) in self.watched else 0.0 for m in movies])
         if self.pair:
             s = s + np.array([self.pair.get((user_id, int(m)), 0.0) for m in movies])
+        if self.optimism:
+            s = s + self.optimism / np.sqrt(1.0 + self.impressions[movies] / 10.0)
+        if self.genre_optimism:
+            seen = self.user_genre_shown.get(user_id)
+            seen = np.zeros(len(self.genre_names)) if seen is None else seen
+            s = s + self.genre_optimism * (self.genres[movies] @ (1.0 / np.sqrt(1.0 + seen / 5.0)))
         return s
 
     def top(self, user_id, k):
@@ -201,9 +225,13 @@ class PreferenceModel:
             else:
                 target, weight = (1.0 if i == clicked else 0.0), 1.0
             self._add_row((user_id, movies[i], i, target, weight) + history[i])
+        seen = self.user_genre_shown.get(user_id)
+        if seen is None:
+            seen = self.user_genre_shown[user_id] = np.zeros(len(self.genre_names))
         for m in movies:
             self.shown[(user_id, m)] = self.shown.get((user_id, m), 0) + 1
             self.impressions[m] += 1
+            seen += self.genres[m]
 
     def flush(self, before_tick=None):
         """Learn from pending slates shown before `before_tick` (all if None)."""
@@ -363,6 +391,36 @@ class PreferenceModel:
                                           + P["p"].pow(2).sum() + P["q"].pow(2).sum()) / 100.0
                 loss.backward()
                 optimizer.step()
+            if self.taste_half_life:
+                now = float(self.last_tick or 0)
+                recent = lambda ticks: T(0.5 ** ((now - np.asarray(ticks, dtype=float)) / self.taste_half_life))
+                rw2 = rw * recent(self.row_ticks[False])
+                gw2 = gw * recent(self.row_ticks[True])
+                anchor = P["W"].detach().clone()
+                fixed = {k: v.detach() for k, v in P.items()}
+                W = anchor.clone().requires_grad_(True)
+
+                def score2(u, m, shown, watched):
+                    taste = fixed["w0"] + W[u] + fixed["a"] * onb[u] + dem[u] @ fixed["D"]
+                    s2 = (fixed["b"][m] + fixed["y"][dec[m]] + (gen[m] * taste).sum(-1)
+                          + fixed["h"][0] * shown + fixed["h"][1] * watched)
+                    if self.factors:
+                        s2 = s2 + (fixed["p"][u] * fixed["q"][m]).sum(-1)
+                    return s2
+
+                optimizer2 = torch.optim.Adam([W], lr=learning_rate)
+                total2 = rw2.sum()
+                for _ in range(max(1, epochs // 2)):
+                    optimizer2.zero_grad()
+                    z = fixed["c"] + fixed["pos"][rp] + score2(ru, rm, rs, rwa)
+                    loss2 = (bce(z, ry, reduction="none") * rw2).sum() / total2
+                    if len(grades):
+                        zg = fixed["c2"] + fixed["kappa"] * score2(gu, gm, gs, gwa)
+                        loss2 = loss2 + (bce(zg, gy, reduction="none") * gw2).sum() / total2
+                    loss2 = loss2 + self.reg * (W - anchor).pow(2).sum() / 100.0
+                    loss2.backward()
+                    optimizer2.step()
+                P["W"] = W
             self.params = {k: v.detach().numpy().astype(float) for k, v in P.items()}
         self.fit_loss = float(loss.item())
         self.fitted_rows = len(self.sequence)

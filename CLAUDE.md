@@ -408,7 +408,12 @@ another component's random draws.
   tick, replaying the rows logged since the snapshot. Serving: `PreferenceRanker` orders the
   candidates (the version's own ranker until the first fit) and `PreferenceRetrieval` adds its
   catalog-wide top `preference_candidates` (50). Options: `preference_factors` (0),
-  `preference_half_life` (0: rows weigh the same whatever their age).
+  `preference_half_life` (0: rows weigh the same whatever their age), `preference_optimism_pct`
+  (UCB-style bonus for rarely shown movies, fading with impressions), `preference_genre_optimism_pct`
+  (per-user bonus for genres the user has rarely been shown), `preference_taste_half_life` (a
+  second fit stage re-learns each user's taste deviation on age-weighted rows, anchored to the
+  full-history taste; shared parameters keep all data); all off by default (see Known issues
+  for their measured effect).
   Why: the stage report showed the system's knowledge of users and movies, not model capacity,
   was the limit. With perfect knowledge of genre taste and movie quality (no hidden factors) a
   rich-world slate reaches 61.6% (oracle 68.5%); the logged data is small (by tick 1200: ~12k
@@ -589,6 +594,24 @@ result is unstable: the model collapses to a few dozen near-global slates.
   20 users a tick climbs 44.2 -> 50.3 -> 56.3. In the dynamic world a user is shown more than
   half the catalog by tick 4000 and every candidate source keeps proposing the same tired
   movies (best 10 of all candidates 21.6 vs oracle 51.2): retrieval needs to be exposure-aware.
+- Why long dynamic games decay (diagnosed; rich s42, 20 users a tick, default setup). A system
+  that knew genre taste and movie quality perfectly and avoided tired/watched movies would
+  still reach 55.4% at tick 2000 (61.2% oracle), so the world is not exhausted. Swapping the
+  preference model's learned parts for the truth at tick 2000: true quality 14.3 -> 19.3, true
+  genre taste -> 35.1, both 45.9 (static: no gap). The missing knowledge is the genre taste of
+  users whose taste drifted: learned-vs-true correlation 0.76 for users who never drifted but
+  0.15 for drifted ones (39% of users by tick 2000), equally for those who drifted before tick
+  1000. Drift moves 60% of a user's genre taste to a random genre at once, usually one they
+  are rarely shown, so no evidence ever arrives. One mechanic off at a time (CTR at 2000,
+  baseline 19.5): no fatigue 28.0, no rewatch penalty 21.0, no drift 23.1; all three off 53.4.
+  Opt-in levers measured (CTR at tick 2000): movie optimism (`preference_optimism_pct` 50 /
+  100 / 200) 19.4 / 21.1 / 21.2 (static 100: 55.1 vs 54.5); taste recency
+  (`preference_taste_half_life` 300 / 150) 20.1 / 21.4; genre exploration
+  (`preference_genre_optimism_pct` 100) 20.9 (17.1 when the preference model ranks directly);
+  broader candidates (preference 100, co-watch 60, 200 retrieved) 20.8; factors 16 19.9;
+  exploration 10% 19.8. Down-weighting repeated skips (tried, removed) collapsed CTR to ~5%:
+  it hid the evidence the model needs to learn fatigue. The remaining lever is the World:
+  gradual drift towards related genres, or user signals beyond slates (search, browsing).
 - Demographics (age, gender, occupation) are still unused by the models.
 - Exploration's long-run benefit (better training data for later retrains) is not measured
   yet, and explored slots are not logged with their propensity, so training treats them
