@@ -328,6 +328,9 @@ The **dynamic** world adds:
 | Rewatch (%) | 10 | A watched movie keeps 10% of its appeal. |
 | New users per 100 ticks | 30 | 30% of users join later, with no history (cold start). |
 | Onboarding | on (best) | New users name 3 favourite genres (imperfectly) before their first slate. |
+| Saves / not interested (%) | 100 / 50 (both worlds) | Users who look at a movie they'd like but don't click sometimes save it (more often the better it fits); movies that don't fit them sometimes get "not interested". The strongest signal the system gets besides clicks. |
+| Ratings (% of watches) | 10 | How often a user rates a movie they watched. |
+| Slates per visit | 1 | Rows a user scrolls per visit: more clicks per visit, but each row is second-best and users tire faster. |
 | Browsing (% of visits) | 30 (both worlds) | Users sometimes browse or search a genre before their slate: explicit evidence of their current taste, which the profiles and the preference model learn from. |
 
 ## Strategies that work

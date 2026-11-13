@@ -264,6 +264,25 @@ another component's random draws.
   the original `"watches"` mode ignores it). The preference model keeps a per-user browse vector
   (decay 0.8 per browse) and learns a weight `kb` on "browse match" (movie genres . recent
   browsing share), taken when the slate is shown (it learns ~0.8).
+- **Richer user signals** (world, console Users node; the build default is off, so the golden
+  fingerprint holds):
+  - *Interest signals* (`interest_save_pct` 100, `interest_dismiss_pct` 50 by default in both
+    worlds; own RNG `"interest-<seed>"`, so clicks are unchanged): every movie the user examined
+    in the cascade but did not click (`UserSimulator.examined`, recorded without extra draws) is
+    saved with probability save x relevance lift (relevant movies only) or marked "not
+    interested" with probability dismiss (irrelevant movies only): `InterestEvent(movie_id,
+    kind)`. Data lake topic; rich profiles count saves (`features.update_genre_counts` kind
+    `"save"`, `SAVE_WEIGHT` 0.4; Flink `track_interest` and Spark); the preference model takes a
+    save as a grade row with target 0.85 and a dismissal with target 0 (`interest_weight` 1).
+  - *Ratings* (`rating_pct`, `UserSimulator.rating_probability`, 10 = the original).
+  - *Sessions* (`session_slates`, 1 = the original): slates per visit; the model server skips
+    movies already shown to the user earlier in the same tick (`ModelServer._session`).
+  Measured (rich, 20 users a tick, default setup, mean CTR ticks 800-2000; dynamic s42 baseline
+  26.3): ratings 50% 25.3; interest 50/20 28.5 (s1 28.2; static s42 50.7 vs 50.0); interest
+  100/50 **29.7**; interest 50/20 + ratings 50% 28.4; two slates per visit 22.4 per slate (the
+  second row holds second-best picks and users tire twice as fast; about 0.45 clicks per visit
+  vs 0.26); everything 24.4. Signals on examined-but-unclicked movies are the evidence the
+  click alone never gave. Defaults: interest 100/50, ratings 10%, one slate.
 - **Targeted exploration** (`ml_system/exploration.py:SlotExplorer`, the last re-ranker; needs the
   preference model): at `explore_rate_pct` of slates (`explore_boost_pct` for users
   `PreferenceModel.drifting()` flags: recent click rate below half their long-run rate, or recent

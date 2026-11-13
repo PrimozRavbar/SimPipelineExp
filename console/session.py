@@ -167,8 +167,8 @@ DEFAULT_SETTINGS = {
     "taste_drift_mode": "abrupt",  # "gradual": small steps towards a related genre (the dynamic world's default)
     "browse_pct": 30,          # share of visits where the user first browses a genre (BrowseEvent)
     "rating_pct": 10,          # share of watched movies the user rates
-    "interest_save_pct": 0,    # an examined, unclicked relevant movie gets saved (x its relevance lift)
-    "interest_dismiss_pct": 0, # an examined irrelevant movie gets "not interested"
+    "interest_save_pct": 100,  # an examined, unclicked relevant movie gets saved (x its relevance lift)
+    "interest_dismiss_pct": 50, # an examined irrelevant movie gets "not interested"
     "session_slates": 1,       # slates per visit (the next row; later slates skip movies already shown)
     "fatigue_pct": 0,          # click probability lost per repeat impression
     "fatigue_recovery_ticks": 0,  # fatigue halves every N ticks since the last impression (0 = never)
