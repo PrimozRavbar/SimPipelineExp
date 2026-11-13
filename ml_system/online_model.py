@@ -72,7 +72,7 @@ class PreferenceModel:
     def __init__(self, movie_objects, user_objects=None, factors=0, reg=0.01, seed=0,
                  online_lr=0.05, unclicked_weight=0.5, grade_weight=1.0, epochs=300,
                  history=False, demographics=False, pair_lr=0.3, pair_reg=0.05, shown_feature=False,
-                 half_life=0, optimism=0.0, repeat_skip_weight=1.0):
+                 half_life=0, optimism=0.0, repeat_skip_weight=1.0, taste_half_life=0):
         from world.external_data_loader import GENRE_NAMES
 
         self.genre_names = [g for g in GENRE_NAMES if g != "unknown"]
@@ -119,6 +119,12 @@ class PreferenceModel:
         # it, and would teach the model that the user dislikes the genres
         # they love most (they are shown those the most).
         self.repeat_skip_weight = repeat_skip_weight
+        # taste_half_life: after the fit on all rows, re-fit only each user's
+        # taste deviation w_u on rows weighted by age (halving every
+        # taste_half_life ticks), anchored to the full-history w_u: tastes
+        # follow recent behaviour (drift), movie quality and everything
+        # shared still learn from all the data. 0 = off.
+        self.taste_half_life = taste_half_life
         self.pair = {}            # (user, movie) -> offset r(u, m), learned online only
         self.params = self._initial_params(self.num_users)
 
@@ -381,6 +387,36 @@ class PreferenceModel:
                                           + P["p"].pow(2).sum() + P["q"].pow(2).sum()) / 100.0
                 loss.backward()
                 optimizer.step()
+            if self.taste_half_life:
+                now = float(self.last_tick or 0)
+                recent = lambda ticks: T(0.5 ** ((now - np.asarray(ticks, dtype=float)) / self.taste_half_life))
+                rw2 = rw * recent(self.row_ticks[False])
+                gw2 = gw * recent(self.row_ticks[True])
+                anchor = P["W"].detach().clone()
+                fixed = {k: v.detach() for k, v in P.items()}
+                W = anchor.clone().requires_grad_(True)
+
+                def score2(u, m, shown, watched):
+                    taste = fixed["w0"] + W[u] + fixed["a"] * onb[u] + dem[u] @ fixed["D"]
+                    s2 = (fixed["b"][m] + fixed["y"][dec[m]] + (gen[m] * taste).sum(-1)
+                          + fixed["h"][0] * shown + fixed["h"][1] * watched)
+                    if self.factors:
+                        s2 = s2 + (fixed["p"][u] * fixed["q"][m]).sum(-1)
+                    return s2
+
+                optimizer2 = torch.optim.Adam([W], lr=learning_rate)
+                total2 = rw2.sum()
+                for _ in range(max(1, epochs // 2)):
+                    optimizer2.zero_grad()
+                    z = fixed["c"] + fixed["pos"][rp] + score2(ru, rm, rs, rwa)
+                    loss2 = (bce(z, ry, reduction="none") * rw2).sum() / total2
+                    if len(grades):
+                        zg = fixed["c2"] + fixed["kappa"] * score2(gu, gm, gs, gwa)
+                        loss2 = loss2 + (bce(zg, gy, reduction="none") * gw2).sum() / total2
+                    loss2 = loss2 + self.reg * (W - anchor).pow(2).sum() / 100.0
+                    loss2.backward()
+                    optimizer2.step()
+                P["W"] = W
             self.params = {k: v.detach().numpy().astype(float) for k, v in P.items()}
         self.fit_loss = float(loss.item())
         self.fitted_rows = len(self.sequence)
