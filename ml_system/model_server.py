@@ -55,6 +55,10 @@ class ModelServer(Service):
       self.admission = None
       self.overflow_fallback = None
       self.sim = None
+      # Movies already shown to a user earlier in the same tick (a session
+      # with several slates: the next row shows different movies).
+      self._session = {}
+      self._session_tick = None
       self.requests = 0
       self.fallback_requests = 0
 
@@ -101,7 +105,15 @@ class ModelServer(Service):
               candidates
           )
 
+      now = self.sim.clock.now if self.sim is not None else None
+      if now != self._session_tick:
+          self._session, self._session_tick = {}, now
+      seen = self._session.get(user.user_id)
+      if seen:
+          candidates = [m for m in candidates if m not in seen]
       slate = list(candidates)[:self.slate_size]
+      if self.sim is not None and getattr(getattr(self.sim, "services", {}).get("World"), "session_slates", 1) > 1:
+          self._session.setdefault(user.user_id, set()).update(slate)
       if self.score_logger is not None and self.sim is not None:
           self.score_logger(self.sim.clock.now, user, slate, retriever)
       return slate
