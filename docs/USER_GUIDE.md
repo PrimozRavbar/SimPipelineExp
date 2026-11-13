@@ -204,6 +204,8 @@ Builds each slate: retrieve candidates, rank them, re-rank, show the top.
 | Ranking stage, MLP ranker, per-genre features, movie signals, retrieval score | on | The learned ranker and its inputs (trained at the next retrain). |
 | Multi-task ranker | off | Also predicts watch completion. |
 | Filter watched movies | off | Never show a movie the user already watched. |
+| Movie / genre exploration bonus | 0 / 0 | The preference model tries movies rarely shown to anyone / genres this user has rarely seen. Costs clicks now; can find tastes that moved. |
+| Taste memory (ticks) | 0 | Each user's taste follows their recent behaviour; older evidence halves every N ticks. |
 
 Action: **Restart model server**.
 
@@ -365,7 +367,9 @@ untrained model showed; give it data and retrain again. Check that the index mat
 (top bar) and look at *Where clicks are lost*.
 
 **Why does CTR drop in the dynamic world over long games?** Users tire of movies they've seen
-repeatedly and some tastes drift. Diversity and the preference model's repeat effects help.
+repeatedly, and some users' taste suddenly moves to a genre they are rarely shown: the system
+can't learn a taste it never sees evidence for. The exploration bonuses and taste memory help a
+little; finding drifted users is one of the open challenges of the dynamic world.
 
 **Why is latency different on my machine?** Latency is the real time your computer takes to
 build a slate; it never affects the simulation.
