@@ -2,6 +2,7 @@
 online and in batch; Flink's live copy matches a replay of the data lake;
 the console fits it at retrains and ranks with it."""
 
+import numpy as np
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -211,3 +212,40 @@ def test_browsing_feeds_the_preference_model():
     model.flush()
     match = {r[1]: r[7] for r in model.rows}
     assert match[3] > match[2] == 0.0
+
+
+def test_collaborative_filtering_is_fitted_at_retrain_logged_into_rows_and_versioned():
+    from console.session import SimSession
+    from ml_system.cf_model import ImplicitMF
+
+    s = SimSession(preset="plain", seed=3, users_per_tick=10, log_metrics=False, taste="personal",
+                   settings={"deploy_delay": 10, "epochs": 1, "spark_every": 0, "preference_model": True,
+                             "cf_model": True, "cf_candidates": 10})
+    s.step(80)
+    s.submit("retrain")
+    s.step(12)
+    assert isinstance(s.cf_live, ImplicitMF) and s.cf_live is s.versions[1].cf
+    s.step(40)
+    # Rows logged after the deploy carry the deployed CF model's score.
+    assert any(r[8] != 0.0 for r in s.flink.preferences.rows)
+    s.submit("rollback")
+    s.step(1)
+    assert s.cf_live is None                       # v0 had no CF model
+    s.close()
+
+
+def test_implicit_mf_learns_who_likes_what():
+    from ml_system.cf_model import ImplicitMF
+
+    # Users 0-9 click movies 0-4, users 10-19 click movies 5-9; each user has
+    # clicked only some of their group's movies.
+    inter = {}
+    for u in range(20):
+        group = range(0, 5) if u < 10 else range(5, 10)
+        for m in group:
+            if (u + m) % 3:
+                inter[(u, m)] = [1, 0.8, 0.0, 0]
+    mf = ImplicitMF(20, 10, factors=4, iterations=15).fit(inter)
+    unseen_same = [mf.scores(u, [m])[0] for u in range(10) for m in range(5) if (u, m) not in inter]
+    other = [mf.scores(u, [m])[0] for u in range(10) for m in range(5, 10)]
+    assert np.mean(unseen_same) > np.mean(other) + 0.1

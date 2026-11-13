@@ -101,6 +101,11 @@ metrics, game scoring) uses that module. Don't redefine it elsewhere.
   genre alone reaches only 40.1%, hidden tastes alone 52.3%, one global best-quality list 34.9%:
   there is a lot to learn beyond genres. Taste drift in the dynamic world still moves the genre
   part only.
+- **Personal world** (`taste="personal"`, console `--taste personal`): the rich world with hidden
+  tastes counting `PERSONAL_HIDDEN_SCALE` = 3 times (`TasteModel.scaled()`, threshold recalibrated
+  to 0.691). Per user, relevance varies about as much with hidden taste (0.080) as with the genre
+  match (0.085) instead of 0.029, and a slate chosen by genre and quality alone holds 82% relevant
+  movies (rich: 98%). Oracle ~78% (rich ~69%). The rich world is unchanged.
 
 ## Configuration switches (`build_recommendation_system`)
 
@@ -652,6 +657,21 @@ result is unstable: the model collapses to a few dozen near-global slates.
   exploration 10% 19.8. Down-weighting repeated skips (tried, removed) collapsed CTR to ~5%:
   it hid the evidence the model needs to learn fatigue. The remaining lever is the World:
   gradual drift towards related genres, or user signals beyond slates (search, browsing).
+- **Collaborative filtering** (`ml_system/cf_model.py`, console `cf_model`, `cf_candidates`,
+  `cf_factors`; off by default): `ImplicitMF`, weighted ALS on implicit feedback (clicks with
+  confidence from completion and rating, skips above a click as weak negatives, unseen pairs as
+  low-confidence zeros; ALS-WR regularisation, so users without clicks get no vector), refitted at
+  every retrain in the background and versioned with deploys and rollbacks. The preference model's
+  rows carry the deployed CF model's score as of when the slate was shown (fitted at the previous
+  retrain: no leak), with a learned weight; `CFRetrieval` adds the best-matching unwatched movies
+  from the whole catalog. Measured in the personal world (s42, 20 users a tick, mean CTR ticks
+  800-2000): static 53.8 -> 54.3 (60.4 vs 59.2 at tick 2000), dynamic 26.8 -> 26.7. Even there the
+  CF factors learn little of the true hidden taste (learning curve on a recorded personal static
+  game, correlation 0.039 / 0.065 / 0.078 at ticks 800 / 1600 / 2400), so it stays off.
+- **Precision levers measured** (rich dynamic s42, mean CTR ticks 800-2000, default 26.3):
+  `preference_grade_weight_pct` 300 (watch completion and ratings x3) 26.5,
+  `preference_browse_memory_pct` 95 (keep ~20 browses instead of ~5) 26.4, both 26.8: within
+  noise. Defaults stay 100 / 80.
 - **Hidden-taste factors do not pay in this World (measured).** Learning curve on a recorded
   6000-tick static game (rich s42, default setup, 20 users a tick), offline, vs ground truth,
   at ticks 1000 / 2000 / 4000 / 6000 (7 / 18 / 42 / 66 clicks per user): correlation of learned

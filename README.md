@@ -135,7 +135,7 @@ python -m console --taste rich
 ```
 
 Open <http://localhost:8000>, press play, and retrain when you're ready. Add `--world dynamic`
-for changing users, `--seed 7` for a different game, `--preset plain` to start from the
+for changing users, `--taste personal` for users whose tastes go well beyond genres, `--seed 7` for a different game, `--preset plain` to start from the
 original bare-bones stack and build it up yourself.
 
 **On Colab:** open `SimPipExp_console.ipynb` and run it top to bottom; the console opens in a

@@ -32,7 +32,7 @@ Then open <http://localhost:8000>. Options:
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--taste` | `genre` | `rich`: users have hidden tastes and movies have a quality beyond their genres (recommended). `genre`: taste is genres only (easier). |
+| `--taste` | `genre` | `rich`: users have hidden tastes and movies have a quality beyond their genres (recommended). `genre`: taste is genres only (easier). `personal`: hidden personal tastes count three times as much (hardest; more to gain). |
 | `--world` | `static` | `dynamic`: tastes drift, users tire of repeats, new users sign up over time. |
 | `--preset` | `best` | `best`: the strongest measured setup. `plain`: every model feature off, so you build the stack up yourself. |
 | `--seed` | `42` | Same seed and same actions at the same ticks give the same game. |
@@ -206,6 +206,7 @@ Builds each slate: retrieve candidates, rank them, re-rank, show the top.
 | Filter watched movies | off | Never show a movie the user already watched. |
 | Movie / genre exploration bonus | 0 / 0 | The preference model tries movies rarely shown to anyone / genres this user has rarely seen. Costs clicks now; can find tastes that moved. |
 | Taste memory (ticks) | 0 | Each user's taste follows their recent behaviour; older evidence halves every N ticks. |
+| Collaborative filtering, CF candidates, CF factors | off, 0, 16 | "People with clicks like yours liked these": hidden taste numbers learned from everyone's clicks at each retrain, used by the preference model and as a candidate source. Needs a lot of clicks per user; helps a little in the personal world. |
 | Exploration slots / rate / rate for drifting users | 1 / 10% / 50% in the dynamic world (off in the static one) | Targeted exploration: a slot shows a well-rated movie from a genre the model is unsure about for this user, from the whole catalog. Users whose clicks dropped or whose browsing moved explore more. |
 | Which genre to explore | thompson | `thompson` samples from what the model believes and how unsure it is; `uniform` favours genres the user has seen least. |
 | Learn from exploration (IPS) | on | Explored picks are weighted by 1 / the probability they were shown, so the model learns what users think of them. |
