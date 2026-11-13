@@ -652,6 +652,20 @@ result is unstable: the model collapses to a few dozen near-global slates.
   exploration 10% 19.8. Down-weighting repeated skips (tried, removed) collapsed CTR to ~5%:
   it hid the evidence the model needs to learn fatigue. The remaining lever is the World:
   gradual drift towards related genres, or user signals beyond slates (search, browsing).
+- **Hidden-taste factors do not pay in this World (measured).** Learning curve on a recorded
+  6000-tick static game (rich s42, default setup, 20 users a tick), offline, vs ground truth,
+  at ticks 1000 / 2000 / 4000 / 6000 (7 / 18 / 42 / 66 clicks per user): correlation of learned
+  personal factors with the true hidden taste p.q, preference-model factors (k=16) 0.040 /
+  0.053 / 0.059 / 0.065, implicit-feedback ALS (`ml_system/cf_model.py:ImplicitMF`, weighted
+  ALS with confidence from clicks/completion/ratings/skips, ALS-WR regularisation; not wired
+  in) 0.033 / 0.048 / 0.056 / 0.060; catalog top 10 by the preference model 51.8 / 54.3 / 56.5 /
+  57.3 with or without factors, lower with CF mixed in at any weight. Why: per user, relevance
+  varies 0.085 with genre fit, 0.057 with movie quality and only 0.029 with the hidden part
+  (the taste MF is fitted with strong regularisation), and dropping the hidden part changes the
+  relevant/not label of only 4% of (user, movie) pairs; learning it from cascade clicks needs
+  far more data. The levers are genre-taste and quality precision (dynamic-world swap test),
+  or a World with stronger hidden tastes. Recorded games also show static CTR levelling off at
+  ~57% from tick ~3000 and dynamic at ~22-24% from tick ~2400 (no collapse).
 - Demographics (age, gender, occupation) are still unused by the models.
 - Exploration's long-run benefit (better training data for later retrains) is not measured
   yet, and explored slots are not logged with their propensity, so training treats them
