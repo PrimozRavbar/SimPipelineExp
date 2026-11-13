@@ -157,3 +157,74 @@ def test_kserve_overflow_goes_to_the_fallback_and_the_autoscaler_adds_replicas()
     kserve.process(sim_at(3))                                      # cold start done
     assert kserve.ready == 3
     assert [server.recommend(user) for _ in range(5)][-1] == [1, 2, 3]
+
+
+# -- console: operating the components, money, swapping the ANN index ---------------
+
+def _session(**settings):
+    from console.session import SimSession
+    return SimSession(preset="plain", seed=3, users_per_tick=5, log_metrics=False,
+                      settings={"deploy_delay": 10, "epochs": 1, "spark_every": 0, **settings})
+
+
+def test_console_swaps_the_ann_index_and_charges_the_migration():
+    pytest.importorskip("torch")
+    from ml_system.ann_indexes import ExactIndex, IVFIndex
+
+    s = _session()
+    s.step(30)
+    cash = s.economy.cash
+    s.submit("swap", component="ann_index", to="ivf")
+    s.step(1)
+    assert isinstance(s.retriever.ann_index, IVFIndex) and s.index_kind == "ivf"
+    assert s.economy.ledger[-1][1] == 500 and s.economy.cash < cash - 500 + 50
+    s.submit("retrain")
+    s.step(12)
+    assert isinstance(s.versions[1].index, IVFIndex)              # new models use the new type
+    s.submit("swap", component="ann_index", to="exact")
+    s.step(1)
+    assert isinstance(s.retriever.ann_index, ExactIndex)
+    with pytest.raises(Exception):
+        s.submit("swap", component="kafka", to="pulsar")
+    s.submit("swap", component="ann_index", to="exact")          # already in use: rejected at the boundary
+    s.step(1)
+    assert any("already" in e["text"] for e in s.events())
+    s.close()
+
+
+def test_console_infra_settings_reach_the_components_and_cost_money():
+    pytest.importorskip("torch")
+    s = _session()
+    s.step(5)
+    base = s.economy.last_tick["cost"]
+    s.submit("settings", kafka_brokers=5, kafka_replication=2, flink_parallelism=3, redis_max_keys=500,
+             redis_eviction="volatile-ttl", redis_ttl_ticks=50, feast_mode="materialized",
+             feast_materialize_every=10, kserve_max_replicas=3, kserve_replica_capacity=2)
+    s.step(20)
+    assert s.kafka.brokers == 5 and s.kafka.replication_factor == 2
+    assert s.flink.parallelism == 3 and s.system["redis"].max_keys == 500
+    assert len(s.system["redis"].store) <= 500 + 2               # + pinned shared objects
+    assert s.feast.mode == "materialized" and s.feast.materializations >= 2
+    assert s.kserve.max_replicas == 3 and s.kserve.ready >= 2    # scaled up for 5 requests a tick
+    assert s.economy.last_tick["cost"] > base
+    assert any("Flink rescale to 3" in r for _, _, r in s.economy.ledger)
+    with pytest.raises(Exception):
+        s.submit("settings", kafka_replication=9)               # more copies than brokers
+    with pytest.raises(Exception):
+        s.submit("settings", redis_eviction="random")
+    s.close()
+
+
+def test_console_broker_drill_stalls_unreplicated_partitions_and_the_repair_ends_it():
+    pytest.importorskip("torch")
+    s = _session()
+    s.step(5)
+    s.submit("fault", kind="kafka_broker_down", duration=200)
+    s.step(5)
+    assert s.kafka.unavailable_partitions() == [0]
+    assert any(i["rule"] == "kafka_partitions" for i in s.incidents_view())
+    assert s.kafka.lag("Flink") > 0
+    s.submit("restart_kafka_broker")
+    s.step(2)
+    assert s.kafka.unavailable_partitions() == [] and s.kafka.lag("Flink") == 0
+    s.close()

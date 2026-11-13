@@ -38,9 +38,9 @@ Run notebooks from the repo root. `SimPipExp_quickstart.ipynb` is the reference 
 |-------------|-------------------------------------------------------------|
 | World       | `world/*`                                                   |
 | Metrics     | `ml_system/evaluation.py`, `ml_system/metrics.py`, `dashboard/` |
-| Features    | `ml_system/flink.py`, `ml_system/offline_*`, `ml_system/features.py`, `TwoTowerRetrieval.retrieve` |
-| Performance | `ml_system/ann.py`, `ml_system/training.py`, `ml_system/ranking.py` |
-| Ops         | `ml_system/faults.py`, `ml_system/fallback.py`, `ml_system/experiments.py`, `ml_system/model_registry.py` |
+| Features    | `ml_system/flink.py`, `ml_system/offline_*`, `ml_system/features.py`, `ml_system/feast.py`, `TwoTowerRetrieval.retrieve` |
+| Performance | `ml_system/ann.py`, `ml_system/ann_indexes.py`, `ml_system/training.py`, `ml_system/ranking.py` |
+| Ops         | `ml_system/faults.py`, `ml_system/fallback.py`, `ml_system/experiments.py`, `ml_system/model_registry.py`, `ml_system/kafka.py`, `ml_system/redis.py`, `ml_system/kserve.py` |
 | Console     | `console/` (SimSession, API server, live UI), `SimPipExp_console.ipynb` |
 | Orchestrator| `pyproject.toml`, `tests/`, notebooks, this file; merges branches |
 
@@ -171,7 +171,7 @@ On Colab, `SimPipExp_console.ipynb` starts the server in the background and open
 `google.colab.output.serve_kernel_port_as_window`.
 
 - `console/session.py:SimSession` has no web code. It wraps `build_recommendation_system`
-  (default 10 users per tick), runs the clock on a background thread (speed 1×/10×/100× =
+  (default 20 users per tick; the CLI and notebook too), runs the clock on a background thread (speed 1×/10×/100× =
   2/20/200 ticks per second, as fast as possible when ticks are slower) and exposes
   JSON-ready views. `step(n)` advances synchronously (tests, scripts).
 - **Determinism.** `submit(name, **params)` queues an action (`retrain`, `rollback`, `spark`,
@@ -223,6 +223,8 @@ API (`console/server.py`; the UI uses nothing else):
 | `GET /api/faults` | faults so far (hidden chaos faults only counted while active), fault kinds, repairs |
 | `POST /api/fault {kind, duration}`, `/api/repair/{restart_flink\|rebuild_index\|restart_model_server}` | drills and repairs, next tick boundary |
 | `POST /api/canary/promote`, `/api/canary/abort`, `/api/models/{v}/export` | canary control, model export |
+| `POST /api/swap {component, to}` | swap a component for another (`ann_index`: `hnsw`, `ivf`, `exact`); costs money; next tick boundary |
+| `POST /api/repair/restart_kafka_broker` | ends a `kafka_broker_down` fault |
 
 `GET /api/state` also carries `health` (lag, fallback share, index self-test, skew, coverage,
 drift PSI, feature age), `canary` (per-arm counts and the test) and `spark_job`.
@@ -239,7 +241,10 @@ another component's random draws.
   (every N ticks a share of users moves part of its taste to one genre), users joining over
   time (`World.active_user_ids`, cold start), fatigue (each repeat impression of a movie
   multiplies its click probability by `1 - fatigue`), no rewatching (`rewatch` multiplier for
-  movies watched in the simulation). `expected_click_rate` applies the same factors.
+  movies watched in the simulation), fatigue wearing off (`fatigue_recovery=H`: a (user,
+  movie) impression count halves every H ticks since its last impression; the dynamic world
+  uses 1000, console `fatigue_recovery_ticks`; 0 = never, the original). `expected_click_rate`
+  applies the same factors.
   `reference_ctrs` is computed at build time and goes stale once tastes drift.
 - **Pipeline infra:** `OfflineFeatureStore` binary-search point-in-time lookups and
   `clear_history()` (the offline pipeline clears before recomputing, so repeated Spark runs
@@ -442,6 +447,56 @@ another component's random draws.
   this setup 34.5% vs 33.6% (no retrieval score / diversity) and lower with the tower inputs
   (engagement + demographics + shared IDs: 36.0% static s1). Genre world s42: 49.6% static,
   31.9% dynamic. Players can change every setting; tests pin `preset="plain"`.
+- **Infrastructure components** (all pass-throughs with their defaults: the golden fingerprint
+  is unchanged; `tests/test_infra.py`). Each has `describe()` (shown in `GET /api/pipeline`
+  under `infra`) and console settings on its Pipeline node:
+  - *Kafka* (`ml_system/kafka.py`): partitions keyed by user (`kafka_partitions`, 3), brokers
+    (3) and replication factor (1): partition p is led by broker p % brokers, replicated on the
+    next ones; a partition with no live replica is unavailable and a consumer's poll stops at
+    its first message (the topic's order is kept, so it waits and lag builds up). Retention
+    (`kafka_retention_ticks`, 0 = forever): older messages are deleted each tick; a consumer
+    that is further behind loses them (`lost`). Offsets are logical. Drill
+    `kafka_broker_down` (broker 0; not in the chaos pool), repair `restart_kafka_broker`.
+    The data lake and the CTR tracker are Kafka consumers too.
+  - *Flink*: `parallelism` x `slot_capacity` events per tick (0 = unlimited; `flink_capacity`
+    stays as a hard cap); changing the parallelism is a savepoint + restart (2 ticks without
+    processing, $20); backpressure = lag that grew for 10 ticks.
+  - *Redis* (`ml_system/redis.py`): `redis_max_keys` (0 = unlimited) with `allkeys-lru`,
+    `volatile-ttl` or `noeviction` (writes refused); shared objects (`item_signals`,
+    `preference_model`) are pinned; `redis_ttl_ticks` expires user features after their last
+    write (serving then uses the defaults); hit/miss/eviction/expiration stats.
+  - *Feast* (`ml_system/feast.py`, new): serving reads features through it (retriever,
+    rankers, profile candidates, canary arm); training keeps reading the offline store point in
+    time. A registry of stream views (Flink -> Redis) and batch views (Spark -> offline store).
+    `feast_mode="direct"` (default) reads batch features from the offline store per request, as
+    before; `"materialized"` serves them from an online copy refreshed every
+    `feast_materialize_every` ticks ($2 per run), stale in between.
+  - *KServe* (`ml_system/kserve.py`, new): replicas in front of the ModelServer
+    (`ModelServer.admission`). `kserve_replica_capacity` requests per replica per tick (0 =
+    unlimited); requests beyond the ready replicas go to the popularity fallback (overflow);
+    a Knative-style autoscaler sizes for last tick's traffic at `kserve_target_pct` between min
+    and max replicas, with `kserve_cold_start_ticks`; estimated latency 5 ms / (1 - utilisation).
+  - New incident rules: `budget` (cash < 0), `kafka_partitions` (offline partitions),
+    `serving_capacity` (> 10% overflow), each with a runbook.
+- **Swappable component: the ANN index** (`ml_system/ann_indexes.py`). `ExactIndex` (brute
+  force, perfect recall) and `IVFIndex` (FAISS-style inverted file: seeded spherical k-means into
+  32 cells, searches the `ann_nprobe` nearest) implement `ANNIndex` next to `HNSWIndex`, and
+  expose `nodes` like it (feature logging, the self-test). `POST /api/swap
+  {"component": "ann_index", "to": ...}` (action `swap`): at the next boundary the serving
+  model's index is rebuilt with the new type from its own movie vectors, golden queries are
+  re-recorded, a broken index is replaced, the $500 migration is charged, and later retrains
+  build the new type (older versions keep theirs, so a rollback restores its index). Simulated
+  search cost (vectors touched per query; 1 µs each): HNSW `ef_search + M log2 n` (~370 here),
+  IVF centroids + the nprobe largest cells (~380 at nprobe 4), exact n (1682). Running price
+  per tick: HNSW $0.60, IVF $0.30, exact $1.50. `SimSession.SWAPPABLE` lists swappable
+  components; the next one plugs in there.
+- **Money** (`console/economy.py`, separate from the compute credits that pay for retrains and
+  Spark): start with $10,000; every click earns $1; every tick the configuration costs money
+  (Kafka $0.50/broker + $0.05/partition, Flink $0.80/slot, Redis $0.20 + $0.10/1000 keys,
+  KServe $1/replica, the ANN index type, Feast $0.30 + $2/materialization); one-off charges:
+  index swap $500, Flink rescale $20, Kafka repartition $50. The default setup costs ~$4.5 a
+  tick, so at 20 users a tick an untrained model loses money and a good one earns it. Cash in
+  the top bar; Pipeline > Costs shows the bill per component and the one-off ledger.
 - **Experiments** (`ml_system/experiments.py`): stable hash bucketing (a new salt reshuffles
   users independently), two-proportion z-test, per-arm counting from the event stream.
 - **Registry** (`ml_system/model_registry.py`): `export_bundle` / `load_bundle` (towers with

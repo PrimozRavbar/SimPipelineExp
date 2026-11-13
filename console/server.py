@@ -15,7 +15,8 @@ POST /api/retrain | /api/rollback | /api/spark      queued for the next tick bou
 POST /api/settings {name: value, ...}               queued for the next tick boundary
 GET  /api/faults                 faults so far (hidden chaos faults only counted while active)
 POST /api/fault {"kind": k, "duration": n|null}     inject a fault drill at the next tick
-POST /api/repair/{action}        restart_flink | rebuild_index | restart_model_server
+POST /api/repair/{action}        restart_flink | rebuild_index | restart_model_server | restart_kafka_broker
+POST /api/swap {component, to}   swap a component (ann_index: hnsw | ivf | exact); costs money
 POST /api/canary/promote | /api/canary/abort       end a running canary
 POST /api/models/{v}/export      save model v (towers, index, ranker) under <run_dir>/models/v<v>
 """
@@ -144,6 +145,10 @@ def create_app(session):
     def canary_abort():
         return action("abort_canary")
 
+    @app.post("/api/swap")
+    def swap(body: dict = Body(...)):
+        return action("swap", component=body.get("component"), to=body.get("to"))
+
     @app.get("/api/faults")
     def faults():
         return session.faults_view()
@@ -154,7 +159,7 @@ def create_app(session):
 
     @app.post("/api/repair/{name}")
     def repair(name: str):
-        if name not in ("restart_flink", "rebuild_index", "restart_model_server"):
+        if name not in ("restart_flink", "rebuild_index", "restart_model_server", "restart_kafka_broker"):
             raise HTTPException(status_code=404, detail="unknown repair %r" % name)
         return action(name)
 

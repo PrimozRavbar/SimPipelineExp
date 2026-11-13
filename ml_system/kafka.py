@@ -42,6 +42,7 @@ class Kafka(Service):
         self.published = {}          # topic -> messages ever published
         self.deleted = {}            # topic -> messages deleted by retention
         self.lost = {}               # (consumer, topic) -> messages it never read (retention)
+        self.partition_counts = {}   # topic -> {partition: retained messages}
         self.blocked_polls = 0       # polls that stopped at an unavailable partition
 
     # -- producing -----------------------------------------------------------
@@ -60,7 +61,10 @@ class Kafka(Service):
             self.log_start[topic] = 0
 
         self.topics[topic].append(event)
-        self.message_partitions[topic].append(self.partition_of(event))
+        partition = self.partition_of(event)
+        self.message_partitions[topic].append(partition)
+        counts = self.partition_counts.setdefault(topic, {})
+        counts[partition] = counts.get(partition, 0) + 1
         self.published[topic] = self.published.get(topic, 0) + 1
 
     # -- consuming -----------------------------------------------------------
@@ -156,6 +160,9 @@ class Kafka(Service):
             while drop < len(messages) and messages[drop].timestamp < cutoff:
                 drop += 1
             if drop:
+                counts = self.partition_counts.get(topic, {})
+                for p in self.message_partitions[topic][:drop]:
+                    counts[p] -= 1
                 del messages[:drop]
                 del self.message_partitions[topic][:drop]
                 self.log_start[topic] = self.log_start.get(topic, 0) + drop
@@ -166,10 +173,8 @@ class Kafka(Service):
     def describe(self):
         topics = {}
         for topic, messages in self.topics.items():
-            per_partition = [0] * max(1, self.partitions)
-            for p in self.message_partitions[topic]:
-                if p < len(per_partition):
-                    per_partition[p] += 1
+            counts = self.partition_counts.get(topic, {})
+            per_partition = [counts.get(p, 0) for p in range(max(self.partitions, max(counts, default=-1) + 1))]
             topics[topic] = {"retained": len(messages), "published": self.published.get(topic, 0),
                              "deleted": self.deleted.get(topic, 0), "per_partition": per_partition}
         consumers = {}

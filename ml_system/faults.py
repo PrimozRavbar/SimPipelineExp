@@ -34,6 +34,7 @@ FAULT_KINDS = {
     "model_server_outage": "Two-tower retrieval down (serving fallback)",
     "traffic_spike": "Traffic spike",
     "spark_failure": "Spark feature jobs failing",
+    "kafka_broker_down": "Kafka broker 0 down",
 }
 
 # Which repair action ends which fault (see FaultInjector.fix).
@@ -41,6 +42,7 @@ FIXES = {
     "restart_flink": ("flink_outage", "feature_corruption"),
     "rebuild_index": ("index_id_mismatch",),
     "restart_model_server": ("model_server_outage",),
+    "restart_kafka_broker": ("kafka_broker_down",),
 }
 
 
@@ -210,6 +212,17 @@ class FaultInjector(Service):
 
         def undo():
             spark.failing = False
+        return undo
+
+    def _start_kafka_broker_down(self, fault):
+        """Broker 0 stops: partitions with no other live replica stall
+        their consumers (Flink, the CTR tracker) until it is back."""
+        kafka = self.system["sim"].get_service("Kafka")
+        broker = fault.params.get("broker", 0)
+        kafka.broker_down(broker)
+
+        def undo():
+            kafka.broker_up(broker)
         return undo
 
     def _start_traffic_spike(self, fault):
