@@ -72,7 +72,7 @@ class PreferenceModel:
     def __init__(self, movie_objects, user_objects=None, factors=0, reg=0.01, seed=0,
                  online_lr=0.05, unclicked_weight=0.5, grade_weight=1.0, epochs=300,
                  history=False, demographics=False, pair_lr=0.3, pair_reg=0.05, shown_feature=False,
-                 half_life=0, optimism=0.0):
+                 half_life=0, optimism=0.0, repeat_skip_weight=1.0):
         from world.external_data_loader import GENRE_NAMES
 
         self.genre_names = [g for g in GENRE_NAMES if g != "unknown"]
@@ -112,6 +112,13 @@ class PreferenceModel:
         # whose quality is still uncertain, get tried (UCB-style
         # exploration, deterministic); the bonus fades as evidence comes in.
         self.optimism = optimism
+        # repeat_skip_weight: a skipped movie's row weighs this much less for
+        # every earlier impression of it to the same user (1.0 = all skips
+        # equal). A first skip says something about taste; the fifth skip of
+        # a movie shown four times before mostly says the user is tired of
+        # it, and would teach the model that the user dislikes the genres
+        # they love most (they are shown those the most).
+        self.repeat_skip_weight = repeat_skip_weight
         self.pair = {}            # (user, movie) -> offset r(u, m), learned online only
         self.params = self._initial_params(self.num_users)
 
@@ -207,7 +214,10 @@ class PreferenceModel:
                 target, weight = 0.0, self.unclicked_weight
             else:
                 target, weight = (1.0 if i == clicked else 0.0), 1.0
-            self._add_row((user_id, movies[i], i, target, weight) + history[i])
+            shown_before = history[i][2]
+            if target == 0.0 and shown_before and self.repeat_skip_weight != 1.0:
+                weight *= self.repeat_skip_weight ** shown_before
+            self._add_row((user_id, movies[i], i, target, weight) + history[i][:2])
         for m in movies:
             self.shown[(user_id, m)] = self.shown.get((user_id, m), 0) + 1
             self.impressions[m] += 1
@@ -238,7 +248,8 @@ class PreferenceModel:
         if name == "RecommendationShownEvent":
             # History as of the moment the slate is shown (its own click and
             # watch arrive later in the tick and must not leak into its rows).
-            history = [self._history(event.user_id, m) for m in event.movie_ids]
+            history = [self._history(event.user_id, m) + (self.shown.get((event.user_id, m), 0),)
+                       for m in event.movie_ids]
             self.pending[event.recommendation_id] = [event.timestamp, event.user_id, list(event.movie_ids), None, history]
         elif name == "RecommendationClickedEvent":
             slate = self.pending.get(event.recommendation_id)
