@@ -106,3 +106,37 @@ class ImplicitMF:
         if not self.fitted or user_id >= self.num_users:
             return np.zeros(len(movies))
         return self.Y[np.asarray(movies, dtype=int)] @ self.X[user_id]
+
+
+# -- serving -----------------------------------------------------------------
+
+from ml_system.model_server import RetrievalService  # noqa: E402
+
+
+class CFRetrieval(RetrievalService):
+    """Candidates: the movies whose hidden-taste vectors best match the
+    user's ("people with clicks like yours liked these"), from the whole
+    catalog, skipping movies the user already watched. `model_fn()` returns
+    the deployed ImplicitMF (None: no candidates)."""
+
+    def __init__(self, model_fn, movie_ids, is_watched=None):
+        super().__init__()
+        self.model_fn = model_fn
+        self.movie_ids = np.array(sorted(movie_ids))
+        self.is_watched = is_watched          # (user, movie) -> bool
+
+    def retrieve(self, request):
+        model = self.model_fn()
+        if model is None or not model.fitted or request.user_id >= model.num_users:
+            return []
+        if not np.any(model.X[request.user_id]):
+            return []                      # no evidence about this user yet
+        scores = model.scores(request.user_id, self.movie_ids)
+        out = []
+        for i in np.lexsort((self.movie_ids, -scores)):
+            m = int(self.movie_ids[i])
+            if self.is_watched is None or not self.is_watched(request.user_id, m):
+                out.append(m)
+                if len(out) == request.k:
+                    break
+        return out

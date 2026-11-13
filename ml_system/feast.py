@@ -80,7 +80,10 @@ class Feast(Service):
 
     def __getattr__(self, name):
         # Anything else (point-in-time lookups, raw tables): the offline store.
-        return getattr(self.__dict__["offline"], name)
+        offline = self.__dict__.get("offline")
+        if offline is None or name.startswith("__"):
+            raise AttributeError(name)
+        return getattr(offline, name)
 
     # -- materialization -----------------------------------------------------------
 
