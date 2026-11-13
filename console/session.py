@@ -125,6 +125,7 @@ DEFAULT_SETTINGS = {
     "taste_drift_every": 0,    # every N ticks some users' taste drifts (0 = off)
     "taste_drift_share_pct": 5,
     "fatigue_pct": 0,          # click probability lost per repeat impression
+    "fatigue_recovery_ticks": 0,  # fatigue halves every N ticks since the last impression (0 = never)
     "rewatch_pct": 100,        # click probability kept for an already-watched movie
     "users_joining_per_100_ticks": 0,
 }
@@ -178,6 +179,7 @@ SETTING_LIMITS = {
     "taste_drift_every": (0, 100000),
     "taste_drift_share_pct": (1, 100),
     "fatigue_pct": (0, 90),
+    "fatigue_recovery_ticks": (0, 100000),
     "rewatch_pct": (0, 100),
     "users_joining_per_100_ticks": (0, 10000),
 }
@@ -195,6 +197,7 @@ DYNAMIC_SETTINGS = {
     "taste_drift_every": DYNAMIC_WORLD["taste_drift_every"],
     "taste_drift_share_pct": round(DYNAMIC_WORLD["taste_drift_share"] * 100),
     "fatigue_pct": round(DYNAMIC_WORLD["fatigue"] * 100),
+    "fatigue_recovery_ticks": DYNAMIC_WORLD["fatigue_recovery"],
     "rewatch_pct": round(DYNAMIC_WORLD["rewatch"] * 100),
     "users_joining_per_100_ticks": round(DYNAMIC_WORLD["users_joining_per_tick"] * 100),
 }
@@ -300,7 +303,7 @@ class SimSession:
     def __init__(
         self,
         seed=42,
-        users_per_tick=10,
+        users_per_tick=20,
         settings=None,
         data=None,
         log_metrics=True,
@@ -1295,6 +1298,7 @@ class SimSession:
         d.taste_drift_share = s["taste_drift_share_pct"] / 100.0
         d.users_joining_per_tick = s["users_joining_per_100_ticks"] / 100.0
         self.simulator.fatigue = s["fatigue_pct"] / 100.0
+        self.simulator.fatigue_recovery = s["fatigue_recovery_ticks"]
         self.simulator.rewatch = s["rewatch_pct"] / 100.0
         if s["chaos_every"] and self.next_chaos_tick is None:
             self.next_chaos_tick = self.tick + self._chaos_gap()

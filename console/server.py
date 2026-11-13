@@ -161,7 +161,7 @@ def create_app(session):
     return app
 
 
-def serve(host="127.0.0.1", port=8000, seed=42, users_per_tick=10, runs_dir="runs", world="static",
+def serve(host="127.0.0.1", port=8000, seed=42, users_per_tick=20, runs_dir="runs", world="static",
           taste="genre", preset="best"):
     import faulthandler
     import signal

@@ -22,7 +22,8 @@ class UserSimulator:
         rating_noise=0.75,
         completion_noise=0.15,
         fatigue=0.0,
-        rewatch=1.0
+        rewatch=1.0,
+        fatigue_recovery=0
     ):
         self.world = world
 
@@ -31,13 +32,21 @@ class UserSimulator:
         #   user multiplies its click probability by (1 - fatigue).
         # - rewatch: click-probability multiplier for a movie the user
         #   already watched during the simulation (0 = never rewatch).
+        # - fatigue_recovery: fatigue wears off, the impression count of a
+        #   (user, movie) halving every `fatigue_recovery` ticks since its
+        #   last impression (0 = never wears off, the original behaviour).
         if not 0.0 <= fatigue < 1.0:
             raise ValueError("fatigue must be in [0, 1)")
         if not 0.0 <= rewatch <= 1.0:
             raise ValueError("rewatch must be in [0, 1]")
+        if fatigue_recovery < 0:
+            raise ValueError("fatigue_recovery must be >= 0")
         self.fatigue = fatigue
         self.rewatch = rewatch
-        self.impressions = {}       # (user_id, movie_id) -> times shown
+        self.fatigue_recovery = fatigue_recovery
+        self.impressions = {}       # (user_id, movie_id) -> times shown (decayed with recovery)
+        self.impression_ticks = {}  # (user_id, movie_id) -> tick of the last impression
+        self.now = 0
         self.watched = set()        # (user_id, movie_id) watched in the simulation
 
         # Seeded RNG so a simulation run is reproducible.
@@ -78,12 +87,15 @@ class UserSimulator:
             )
         )
 
+        self.now = sim.clock.now
         clicked_movie_id = self.choose_click(user, movie_ids)
 
         if self.fatigue > 0:
             for movie_id in movie_ids:
                 key = (user.user_id, movie_id)
-                self.impressions[key] = self.impressions.get(key, 0) + 1
+                self.impressions[key] = self.fatigue_count(key) + 1
+                if self.fatigue_recovery:
+                    self.impression_ticks[key] = self.now
 
         if clicked_movie_id is not None:
 
@@ -157,10 +169,20 @@ class UserSimulator:
         with the defaults). Uses no RNG."""
         factor = 1.0
         if self.fatigue > 0:
-            factor *= (1.0 - self.fatigue) ** self.impressions.get((user_id, movie_id), 0)
+            factor *= (1.0 - self.fatigue) ** self.fatigue_count((user_id, movie_id))
         if self.rewatch < 1.0 and (user_id, movie_id) in self.watched:
             factor *= self.rewatch
         return factor
+
+
+    def fatigue_count(self, key):
+        """Impressions of (user, movie) so far; with fatigue_recovery, each
+        halves every fatigue_recovery ticks since the last impression."""
+        count = self.impressions.get(key, 0)
+        if count and self.fatigue_recovery:
+            age = self.now - self.impression_ticks.get(key, self.now)
+            count = count * 0.5 ** (age / self.fatigue_recovery)
+        return count
 
 
     def _exposure_active(self):

@@ -22,7 +22,7 @@ DYNAMICS_KEYS = (
     "taste_drift_every", "taste_drift_share", "taste_drift_strength",
     "initial_user_share", "users_joining_per_tick",
 )
-EXPOSURE_KEYS = ("fatigue", "rewatch")
+EXPOSURE_KEYS = ("fatigue", "rewatch", "fatigue_recovery")
 
 # A preset with everything on, for the console's dynamic world.
 DYNAMIC_WORLD = {
@@ -32,6 +32,7 @@ DYNAMIC_WORLD = {
     "initial_user_share": 0.7,     # 30% of users join later (cold start)
     "users_joining_per_tick": 0.3,
     "fatigue": 0.15,               # each repeat impression: clicks x0.85
+    "fatigue_recovery": 1000,      # ...wearing off slowly: halves every 1000 ticks
     "rewatch": 0.1,                # watched movies are rarely clicked again
 }
 

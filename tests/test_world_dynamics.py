@@ -69,6 +69,24 @@ def test_fatigue_and_rewatch_lower_click_probability():
     assert simulator.exposure_factor(1, 50) == 0.0
 
 
+def test_fatigue_wears_off_with_recovery():
+    system = build({"fatigue": 0.2, "fatigue_recovery": 100})
+    simulator = system["world"].user_simulator
+    simulator.impressions[(1, 50)] = 2
+    simulator.impression_ticks[(1, 50)] = 10
+    simulator.now = 10
+    assert simulator.exposure_factor(1, 50) == pytest.approx(0.64)
+    simulator.now = 110                      # one half-life later: 1 impression's worth
+    assert simulator.exposure_factor(1, 50) == pytest.approx(0.8)
+    simulator.now = 10_000
+    assert simulator.exposure_factor(1, 50) == pytest.approx(1.0, abs=1e-6)
+
+    # In a run, a repeat impression adds to the decayed count.
+    system["sim"].run(30, verbose=False)
+    assert all(t <= 30 for t in simulator.impression_ticks.values())
+    assert any(c != int(c) for c in simulator.impressions.values())
+
+
 def test_unknown_dynamics_key_is_rejected():
     with pytest.raises(ValueError):
         build({"taste_drift": 1})
