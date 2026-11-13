@@ -81,3 +81,23 @@ def test_rich_build_runs_and_is_reproducible():
         data = load_movielens()
         build_recommendation_system(data["movie_objects"], data["user_objects"], data["user_states"],
                                     data["movie_states"], log_metrics=False, taste="spicy")
+
+
+def test_personal_world_scales_hidden_tastes_and_leaves_rich_unchanged():
+    from ml_system.build_recommendation_system import build_recommendation_system
+    from world.external_data_loader import load_movielens
+    from world.taste import PERSONAL_HIDDEN_SCALE
+
+    d = load_movielens()
+    rich = build_recommendation_system(d["movie_objects"], d["user_objects"], d["user_states"], d["movie_states"],
+                                       seed=1, log_metrics=False, taste="rich")["world"].taste
+    d = load_movielens()
+    personal = build_recommendation_system(d["movie_objects"], d["user_objects"], d["user_states"], d["movie_states"],
+                                           seed=1, log_metrics=False, taste="personal")["world"].taste
+    assert rich.hidden_scale == 1.0 and personal.hidden_scale == PERSONAL_HIDDEN_SCALE
+    assert abs(rich.threshold - 0.660) < 0.002            # unchanged by the new world
+    assert personal.threshold > rich.threshold
+    u, m = 1, 50
+    base = rich.mu + rich.quality(m)
+    hidden = float(rich.user_factors[rich.user_index[u]] @ rich.movie_factors[rich.movie_index[m]])
+    assert abs(personal.score(u, m) - min(1, max(0, (base + 3 * hidden - 1) / 4))) < 1e-9

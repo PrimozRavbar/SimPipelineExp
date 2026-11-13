@@ -98,6 +98,8 @@ DEFAULT_SETTINGS = {
     "preference_half_life": 0,
     "preference_optimism_pct": 0,
     "preference_taste_half_life": 0,
+    "preference_browse_memory_pct": 80,  # how much of the browse history is kept per new browse (80 = about the last 5)
+    "preference_grade_weight_pct": 100,  # weight of watch completion and ratings vs clicks in training
     "preference_genre_optimism_pct": 0,  # per-user bonus for genres the user has rarely been shown, x0.01 logits  # user tastes follow recent behaviour: rows halve every N ticks (0 = off)  # weight of a skip per earlier impression of the movie (100 = all skips equal)  # exploration bonus for rarely shown movies (UCB-style), x0.01 logits
     "ranker_preference_score": False,  # MLP ranker also sees the preference model's score (v6; logged at serving)     # refits weight a row half as much every N ticks of age (0 = all equal)
     # Personalisation
@@ -206,6 +208,8 @@ SETTING_LIMITS = {
     "preference_half_life": (0, 100000),
     "preference_optimism_pct": (0, 500),
     "preference_taste_half_life": (0, 100000),
+    "preference_browse_memory_pct": (0, 99),
+    "preference_grade_weight_pct": (0, 1000),
     "preference_genre_optimism_pct": (0, 500),
     "diversity_pct": (0, 100),
     "exploration_pct": (0, 50),
@@ -402,8 +406,8 @@ class SimSession:
     ):
         if world not in WORLDS:
             raise ActionError("world must be one of %s" % (WORLDS,))
-        if taste not in ("genre", "rich"):
-            raise ActionError('taste must be "genre" or "rich"')
+        if taste not in ("genre", "rich", "personal"):
+            raise ActionError('taste must be "genre", "rich" or "personal"')
         self.seed = seed
         self.world_kind = world
         self.taste_kind = taste
@@ -1376,6 +1380,8 @@ class SimSession:
             self.flink.preferences.half_life = s["preference_half_life"]
             self.flink.preferences.optimism = s["preference_optimism_pct"] / 100.0
             self.flink.preferences.taste_half_life = s["preference_taste_half_life"]
+            self.flink.preferences.browse_decay = s["preference_browse_memory_pct"] / 100.0
+            self.flink.preferences.grade_weight = s["preference_grade_weight_pct"] / 100.0
             self.flink.preferences.genre_optimism = s["preference_genre_optimism_pct"] / 100.0
             self.flink.preferences.use_history = s["preference_history"]
             self.flink.preferences.shown_feature = s["preference_history"]
