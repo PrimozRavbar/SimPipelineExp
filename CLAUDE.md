@@ -87,6 +87,20 @@ metrics, game scoring) uses that module. Don't redefine it elsewhere.
   the same RNG calls.
 - `world.relevance.relevance_matrix(user_states, movies)` is the same score vectorised
   (numpy), for evaluation code that needs every (user, movie) pair.
+- **Rich world** (`build_recommendation_system(taste="rich")`, console `--taste rich`; the
+  default `"genre"` world above is unchanged). `world/taste.py` fits a biased matrix
+  factorisation of the real MovieLens ratings once per process (ALS, 16 factors, fixed
+  settings and seed, so the true tastes are the same in every game): `rating ~ mu + b_movie +
+  p_user . q_movie`. Relevance becomes `0.4 * genre cosine + 0.6 * taste score`, with taste
+  score `clip((mu + b_movie + p . q - 1) / 4, 0, 1)` (the user bias is left out: generous raters
+  are not more interested in everything). `b_movie` is movie quality; `p . q` are hidden
+  tastes beyond genres. The threshold is calibrated (`calibrate_threshold`) so the median user
+  finds 10% of the catalog relevant (0.660; p25 5.8%, p75 16.9%). All relevance functions take
+  `taste=` (the World's `world.taste`, None in the genre world); `relevance_threshold(taste)`
+  gives the threshold. Reference CTRs: random 12.2%, oracle 68.5%. The best slate chosen by
+  genre alone reaches only 40.1%, hidden tastes alone 52.3%, one global best-quality list 34.9%:
+  there is a lot to learn beyond genres. Taste drift in the dynamic world still moves the genre
+  part only.
 
 ## Configuration switches (`build_recommendation_system`)
 
@@ -329,6 +343,105 @@ another component's random draws.
   on (static s42) served 48.8 ~ profile-ordered 48.3 < candidates 58.2 < oracle 66.9: the
   ranker uses what the system knows as well as plain profile ordering; the rest of the
   ranking loss is imperfect knowledge of users, not ranker modelling.
+- **Models in the rich world** (seed 42 unless noted, retrains at 400 and 800, CTR over ticks
+  852-1200, then the stage report at 1200): retrain only 14.7% (static) / 11.4% (dynamic); the
+  best genre-era stack (MLP ranker v3, profile candidates 30, rich profiles, onboarding, logQ)
+  37.2% static (s1 37.6%) / 19.7% dynamic. Static stage report: oracle 68.8, best of all
+  candidates 58.0, served 39.4: retrieval is now good, the ranker loses ~19 points because all
+  its features are genre-based.
+- **Movie signals and co-watching** (`ml_system/item_signals.py`, rich-world phase B):
+  `ItemSignals` is one definition updated event by event, online by Flink
+  (`track_item_signals`, Redis `("item_signals", "all")`) and by a point-in-time replay in
+  training. Per movie: smoothed click rate, completion, rating, impressions and clicks over
+  expected clicks (COEC: clicks vs the average click rate of the slots it was shown in, a
+  position-debiased quality signal); co-watch similarity (count / sqrt(watches a x watches b)
+  over each user's last 20 watches). `MLPRanker(feature_set="v4")` = v3 + those + co-watch score
+  with the recent watches; `CoWatchRetrieval` ("because you watched X") is an extra candidate
+  source. Console: `ranker_signals`, `cowatch_candidates`. Rich world, on top of the best
+  genre-era stack (37.2% static / 19.7% dynamic): both 43.8% static (s1 41.1%, base 37.6%) and
+  26.0% dynamic; each alone +0.5 / -2.5 static. Flink applies each tick's events to the signals
+  in the data lake's topic order (shown, clicked, watch, rating): COEC needs a click's slate
+  first, and with Flink's own order (clicks before slates) online and training COEC differed,
+  a train/serve skew that dropped CTR to 29.7% until fixed (`tests/test_item_signals.py`
+  checks Flink's signals equal a replay of the log). `Kafka.subscribe(from_tick=T)`: Flink now
+  subscribes to slates from the start of the current tick (it used to miss that tick's slates).
+- **Two-tower inputs for the rich world** (all off by default; a change of tower inputs gives
+  the next retrain fresh, seeded towers): `SimpleUserTower(use_engagement=True)` (per-genre
+  click-through "genre_engagement" = skips, and "profile_strength"; `features.update_engagement`
+  is one definition for Flink `track_engagement` and the offline pipeline `engagement`),
+  `demographics=` (fixed table from `ml_system/demographics.py`: age bracket, gender,
+  occupation), `history_table=` (the item tower's movie ID table shared with the watch history;
+  `SimpleItemTower(id_init_std=0.01)` starts movie IDs small). Console: `tower_engagement`,
+  `tower_demographics`, `tower_shared_ids`. Rich world, on top of signals + co-watch (43.8%
+  static / 26.0% dynamic): engagement 39.3 / 22.8, demographics 39.5 / 26.8, shared IDs
+  42.5 / 22.3, all three 39.4 / 24.2. They raise the quality of the two-tower candidates (best
+  10 up to 60.1 vs ~55) but not served CTR: in the rich world the ranker is the bottleneck.
+- **Retrieval score as a ranker feature** (`MLPRanker(feature_set="v5")`, console
+  `ranker_tower_score`): v4 + user vector . movie vector. A first version scored the training
+  rows with the freshly trained towers: label leakage (those towers were trained on the same
+  clicks), CTR 29.0 / 15.2 with the richer towers. Fixed with **feature logging**:
+  `ModelServer.score_logger(tick, user, slate, retriever)` is called for every served slate,
+  and the console logs each shown movie's score from the retriever that served it
+  (`SimSession.score_log`, (tick, user, movie) -> score); training rows join the logged scores
+  (`MLPRanker.fill_tower_scores_from_log`; Models shows `logged_share`). Rich world, s42:
+  v5 44.2 / 23.3 (vs 43.8 / 26.0 without), with the richer towers 43.4 / 27.9 (was 29.0 / 15.2).
+  A ranker that cannot be fitted yet (no clicks) no longer fails the retrain: the towers ship
+  without it.
+- **Preference model** (`ml_system/online_model.py:PreferenceModel`, console `preference_model`):
+  one model that learns from every logged signal, online every tick and refitted at every
+  retrain. Score `s(u, m) = b_m + decade_m + g_m . (w0 + a * onboarding_u + w_u) + q_m . p_u +
+  r(u, m) + h . history(u, m)`; click logit = `c + pos[i] + s` (learned position term), grade =
+  `sigmoid(c2 + kappa * s)`. Rows: clicked movie (positive), movies above it (negatives), an
+  unclicked slate (negatives, weight 0.5); grades: watch completion, rating, click without a
+  watch (0.3). `r(u, m)`: a per-pair offset moved online by surprising clicks and skips (unseen
+  pairs stay 0). History (`preference_history`): times shown (a count; it learns -0.148 per
+  impression in the dynamic world vs the true log(0.85) = -0.16) and already watched (it learns
+  -2.06 vs log(0.1) = -2.3; +0.36 in the static world, where rewatching is allowed).
+  Flink (`Flink.preferences`) applies each tick's events in data-lake order and learns from
+  that tick's slates before the next tick; a retrain snapshots it at the boundary, refits it
+  in the background (full-batch Adam, 300 epochs, seeded) and `install()`s it at the deploy
+  tick, replaying the rows logged since the snapshot. Serving: `PreferenceRanker` orders the
+  candidates (the version's own ranker until the first fit) and `PreferenceRetrieval` adds its
+  catalog-wide top `preference_candidates` (50). Options: `preference_factors` (0),
+  `preference_half_life` (0: rows weigh the same whatever their age).
+  Why: the stage report showed the system's knowledge of users and movies, not model capacity,
+  was the limit. With perfect knowledge of genre taste and movie quality (no hidden factors) a
+  rich-world slate reaches 61.6% (oracle 68.5%); the logged data is small (by tick 1200: ~12k
+  slates, ~13 per user, ~5 clicks per user), and a batch fit of this model on a recorded game
+  scores 37% / 48% / 52% at ticks 400 / 800 / 1200 (it keeps rising with data).
+  Leaks found on the way (tests in `tests/test_preference_model.py`): rating rows carrying
+  "already watched" (taught "watched means liked"), and slate rows written after their own
+  watch (taught "watched means clicked", weight +5 even where rewatches are rare; rows now take
+  their history when the slate is shown). A "times shown" feature looked harmful (-16 points)
+  only because of the second leak.
+  Protocol (CTR ticks 852-1200 after retrains at 400 and 800), old default -> with it:
+  rich static s42 44.8 -> 49.7, s1 40.9 -> 44.7; rich dynamic s42 27.6 -> 27.0, s1 24.5 -> 28.7;
+  genre static s42 49.6 -> 56.2, dynamic 31.9 -> 34.8. Stage report (rich static s42): two-tower
+  + other candidates now reach 64.6 of the 68.8 oracle; the ranking step loses the rest.
+  Long games (rich s42, retrain every 400 ticks, CTR per 400 ticks): static, it gets there much
+  faster (40.4 at 800 vs 23.0) but plateaus at ~52-53 while the old stack reaches 55.4 by 4000
+  (factors k=16 do not help: 52.4); dynamic, everything decays (old 25.1 at 1200 -> 13.2 at
+  4000, preference model 29.0 -> 14.5) because fatigue never recovers: a learner that knows
+  genre taste and quality exhausts its best picks per user, while the oracle (still ~55) knows
+  the remaining hidden tastes. A half-life (400 / 1000 ticks) gives only +1.5 / +2.6 at 2800.
+- **Ranker v6** (`ranker_preference_score`): MLP v5 + the preference model's score, logged at
+  serving time from the live fitted model (`SimSession.preference_log`) and joined to training
+  rows like the tower score. A v6 version serves its own MLP once at least half its rows had a
+  logged score; otherwise (first retrain) the preference model ranks. It combines the fast start
+  of the preference model with the collaborative signals of the old stack: long static game
+  (s42) 40.7 at 800, 55.9 at 4000 (vs 53.1 preference ranker, 55.4 old stack; s1 39.3 at 800,
+  53.6 at 4000). Protocol: rich
+  static s42 49.4, s1 46.9; rich dynamic s42 29.4, s1 27.9; genre static 53.9, dynamic 35.3
+  (average 40.5 vs 40.2 preference ranker vs 36.6 old default).
+- **Default setup** (console `preset="best"`, `--preset best`, the default; `"plain"` = every
+  model feature off, the original console): preference model with repeat effects, MLP ranker
+  v6 (genre features, movie signals, logged retrieval and preference scores), preference
+  candidates 50, profile candidates 30, co-watch candidates 30, rich profiles,
+  onboarding, logQ, diversity 15%. Chosen over the alternatives by CTR after the second
+  retrain (ticks 852-1200), averaged over static/dynamic and two seeds in the rich world:
+  this setup 34.5% vs 33.6% (no retrieval score / diversity) and lower with the tower inputs
+  (engagement + demographics + shared IDs: 36.0% static s1). Genre world s42: 49.6% static,
+  31.9% dynamic. Players can change every setting; tests pin `preset="plain"`.
 - **Experiments** (`ml_system/experiments.py`): stable hash bucketing (a new salt reshuffles
   users independently), two-proportion z-test, per-arm counting from the event stream.
 - **Registry** (`ml_system/model_registry.py`): `export_bundle` / `load_bundle` (towers with
@@ -337,7 +450,9 @@ another component's random draws.
 In the console (all live settings, applied at tick boundaries; see `console/session.py`
 `DEFAULT_SETTINGS`): `--world dynamic`, chaos (`chaos_every`: hidden seeded faults, revealed
 when they end) and drills, repair actions, `flink_capacity`, `ranker`, `filter_watched`,
-`ranker_mlp`, `ranker_genre_features`, `ranker_multitask`, `profile_candidates`, `rich_profiles`,
+`--preset best|plain`, `ranker_mlp`, `ranker_genre_features`, `ranker_multitask`, `ranker_signals`, `ranker_tower_score`,
+`tower_engagement`, `tower_demographics`, `tower_shared_ids`, `profile_candidates`,
+`cowatch_candidates`, `rich_profiles`,
 `onboarding`, `logq_correction`, `random_negatives`, `graded_positives`, `tower_history`,
 `train_from_scratch`,
 `diversity_pct`, `exploration_pct`, `batched_training`,

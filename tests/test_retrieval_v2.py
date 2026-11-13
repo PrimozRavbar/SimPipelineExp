@@ -117,7 +117,7 @@ def test_multitask_ranker_learns_completion():
 def test_stage_report_is_read_only_and_consistent():
     from console.session import SimSession
 
-    s = SimSession(seed=3, users_per_tick=4, log_metrics=False,
+    s = SimSession(preset="plain", seed=3, users_per_tick=4, log_metrics=False,
                    settings={"deploy_delay": 10, "epochs": 1, "ranker": True, "profile_candidates": 20,
                              "onboarding": True, "exploration_pct": 10})
     s.step(40)

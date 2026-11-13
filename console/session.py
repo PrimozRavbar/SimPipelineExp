@@ -32,11 +32,12 @@ from console import health
 from ml_system.build_recommendation_system import build_recommendation_system
 from ml_system.faults import FAULT_KINDS, FIXES, FaultInjector
 from ml_system.metrics import reference_ctrs
-from ml_system.candidate_sources import ProfileRetrieval
+from ml_system.candidate_sources import CoWatchRetrieval, ProfileRetrieval
 from ml_system.experiments import Experiment
 from ml_system.ranking import (ExplorationReranker, LogisticRanker, MLPRanker, MMRReranker,
                                RerankerChain, WatchedFilter)
 from ml_system.model_registry import export_bundle
+from ml_system.online_model import PreferenceModel, PreferenceRanker, PreferenceRetrieval
 from ml_system.training import TwoTowerTrainer
 from ml_system.two_tower import USER_FEATURE_DEFAULTS, SimpleItemTower, SimpleUserTower, TwoTowerRetrieval
 from world.dynamics import DYNAMIC_WORLD
@@ -67,6 +68,9 @@ DEFAULT_SETTINGS = {
     "graded_positives": False, # weight clicks by watch completion and rating
     "tower_history": False,    # user tower also sees the recent-watch history
     "train_from_scratch": False,  # new towers every retrain instead of continuing the last ones
+    "tower_engagement": False, # user tower sees per-genre click-through (skips) and profile strength
+    "tower_demographics": False,  # user tower sees age bracket, gender, occupation
+    "tower_shared_ids": False, # movie IDs in the movie tower, shared with the user's watch history
     "negatives": 5,            # sampled negatives per positive
     # Serving
     "slate_size": 10,
@@ -76,6 +80,18 @@ DEFAULT_SETTINGS = {
     "ranker_mlp": True,        # ranker model: MLP with cross/recent-history features (off: logistic)
     "ranker_genre_features": True,  # MLP also sees the taste match genre by genre (feature set v3)
     "ranker_multitask": False, # MLP also predicts watch completion; orders by p(click) x completion
+    "ranker_signals": False,   # MLP also sees movie signals from the logs: click rate, completion, rating, co-watching (v4)
+    "ranker_tower_score": False,  # MLP also sees the two-tower retrieval score (v5; needs ranker_signals)
+    "cowatch_candidates": 0,   # extra candidates co-watched with the user's recent watches (0 = off)
+    # Preference model (ml_system/online_model.py): learns from every logged
+    # signal, online between retrains and refitted at every retrain; ranks
+    # the candidates and adds its own best movies from the whole catalog.
+    "preference_model": False,
+    "preference_candidates": 50,
+    "preference_factors": 0,       # hidden taste factors per user and movie (0 = genres and quality only)
+    "preference_history": False,   # it also learns from times shown / already watched (repeat fatigue)
+    "preference_half_life": 0,
+    "ranker_preference_score": False,  # MLP ranker also sees the preference model's score (v6; logged at serving)     # refits weight a row half as much every N ticks of age (0 = all equal)
     # Personalisation
     "profile_candidates": 0,   # extra candidates from the user's genre profile (0 = two-tower only)
     "rich_profiles": False,    # profiles from clicks, watch completion and ratings, recent first
@@ -113,6 +129,22 @@ DEFAULT_SETTINGS = {
     "users_joining_per_100_ticks": 0,
 }
 
+# Presets. "plain": every model feature off (the original console). "best":
+# the setup with the best measured CTR (see CLAUDE.md, "Default setup");
+# the default. Players can change any setting afterwards.
+PLAIN_SETTINGS = dict(DEFAULT_SETTINGS)
+BEST_SETTINGS = {
+    **PLAIN_SETTINGS,
+    "ranker": True, "ranker_mlp": True, "ranker_genre_features": True,
+    "ranker_signals": True, "ranker_tower_score": True,
+    "profile_candidates": 30, "cowatch_candidates": 30,
+    "rich_profiles": True, "onboarding": True, "logq_correction": True,
+    "diversity_pct": 15,
+    "preference_model": True, "preference_history": True, "ranker_preference_score": True,
+}
+PRESETS = {"plain": PLAIN_SETTINGS, "best": BEST_SETTINGS}
+DEFAULT_SETTINGS = dict(BEST_SETTINGS)
+
 # (min, max) for numeric settings; bools are listed in BOOL_SETTINGS.
 SETTING_LIMITS = {
     "spark_every": (0, 100000),
@@ -127,6 +159,10 @@ SETTING_LIMITS = {
     "alert_window": (5, 1000),
     "profile_candidates": (0, 100),
     "random_negatives": (0, 20),
+    "cowatch_candidates": (0, 100),
+    "preference_candidates": (0, 500),
+    "preference_factors": (0, 64),
+    "preference_half_life": (0, 100000),
     "diversity_pct": (0, 100),
     "exploration_pct": (0, 50),
     "canary_share": (0, 100),
@@ -148,7 +184,9 @@ SETTING_LIMITS = {
 BOOL_SETTINGS = {"rebuild_index", "ranker", "ranker_mlp", "filter_watched", "eval_gate", "batched_training",
                  "ranker_genre_features", "rich_profiles", "onboarding",
                  "logq_correction", "graded_positives", "tower_history", "train_from_scratch",
-                 "ranker_multitask"}
+                 "ranker_multitask", "ranker_signals", "tower_engagement", "tower_demographics",
+                 "tower_shared_ids", "ranker_tower_score", "preference_model",
+                 "preference_history", "ranker_preference_score"}
 
 WORLDS = ("static", "dynamic")
 
@@ -228,9 +266,10 @@ class ActionError(ValueError):
 class ModelVersion:
     """One deployable model: user tower + item tower + ANN index."""
 
-    def __init__(self, version, user_tower, item_tower, index, ranker=None, **info):
+    def __init__(self, version, user_tower, item_tower, index, ranker=None, preferences=None, **info):
         self.version = version
         self.ranker = ranker
+        self.preferences = preferences        # fitted PreferenceModel (or None)
         self.user_tower = user_tower
         self.item_tower = item_tower
         self.index = index
@@ -269,13 +308,21 @@ class SimSession:
         run_id=None,
         training_wait_timeout=None,
         world="static",
+        taste="genre",
+        preset="best",
     ):
         if world not in WORLDS:
             raise ActionError("world must be one of %s" % (WORLDS,))
+        if taste not in ("genre", "rich"):
+            raise ActionError('taste must be "genre" or "rich"')
         self.seed = seed
         self.world_kind = world
+        self.taste_kind = taste
         self.users_per_tick = users_per_tick
-        self.settings = dict(DEFAULT_SETTINGS)
+        if preset not in PRESETS:
+            raise ActionError("preset must be one of %s" % sorted(PRESETS))
+        self.preset = preset
+        self.settings = dict(PRESETS[preset])
         if world == "dynamic":
             self.settings.update(DYNAMIC_SETTINGS)
         if settings:
@@ -300,6 +347,7 @@ class SimSession:
             # static world gets a neutral one (no RNG use outside its own).
             world_dynamics=(dict(DYNAMIC_WORLD) if world == "dynamic"
                             else {"taste_drift_every": 0}),
+            taste=taste,
         )
 
         self.sim = self.system["sim"]
@@ -392,6 +440,11 @@ class SimSession:
         self.fallback_ticks = {}         # tick -> (requests, fallback requests)
         self.open_rules = {}             # rule -> incident
         self.golden = {}                 # index version -> golden queries
+        # Feature log: the retrieval score of every served (tick, user,
+        # movie), computed by the model that served it (for the v5 ranker).
+        self.score_log = {}
+        self.preference_log = {}         # (tick, user, movie) -> preference model score at serving
+        self.model_server.score_logger = self._log_scores
         self.drift_reference = None      # genre mix of clicks just after the last deploy
         self._apply_live_settings()
 
@@ -706,14 +759,22 @@ class SimSession:
             "rebuild_index": self.settings["rebuild_index"],
             "ranker": self.settings["ranker"],
             "ranker_mlp": self.settings["ranker_mlp"],
-            "ranker_features": "v3" if self.settings["ranker_genre_features"] else "v2",
+            "ranker_features": ("v6" if self.settings["ranker_signals"] and self.settings["ranker_tower_score"]
+                                and self.settings["ranker_preference_score"] and self.settings["preference_model"] else
+                                "v5" if self.settings["ranker_signals"] and self.settings["ranker_tower_score"] else
+                                "v4" if self.settings["ranker_signals"] else
+                                "v3" if self.settings["ranker_genre_features"] else "v2"),
             "ranker_multitask": self.settings["ranker_multitask"],
             "logq_correction": self.settings["logq_correction"],
             "random_negatives": self.settings["random_negatives"],
             "graded_positives": self.settings["graded_positives"],
-            "tower_history": self.settings["tower_history"],
+            "tower_history": self.settings["tower_history"] or self.settings["tower_shared_ids"],
+            "tower_engagement": self.settings["tower_engagement"],
+            "tower_demographics": self.settings["tower_demographics"],
+            "tower_shared_ids": self.settings["tower_shared_ids"],
             "train_from_scratch": self.settings["train_from_scratch"],
             "ranker_rows": None,
+            "preferences": None,
             "eval_gate": self.settings["eval_gate"],
             "holdout_pct": self.settings["holdout_pct"],
             "gate_tolerance_pct": self.settings["gate_tolerance_pct"],
@@ -778,10 +839,24 @@ class SimSession:
             self._log("train", "Retrain v%d aborted: no usable training examples." % version, cls="s-warn")
             return
         items = _ItemFeatureSnapshot(self.offline.feature_pipeline.feature_store)
+        if self.flink.preferences is not None:
+            # Refit the preference model on everything it has logged so far
+            # (a copy; the live one keeps learning online meanwhile).
+            record["preferences"] = self.flink.preferences.snapshot()
         if record["ranker"] and record["ranker_mlp"]:
+            record["ranker_inputs"] = [] if record["ranker_features"] in ("v5", "v6") else None
             record["ranker_rows"] = MLPRanker.training_rows_from(
                 train_events, self.system["feature_store"], self._genres_of, record["ranker_features"],
-                with_completion=record["ranker_multitask"])
+                with_completion=record["ranker_multitask"], inputs=record["ranker_inputs"])
+            if record["ranker_features"] in ("v5", "v6"):
+                # Join the logged serving-time scores (no leakage).
+                inputs = record.pop("ranker_inputs")
+                v6 = record["ranker_features"] == "v6"
+                record["logged_share"] = MLPRanker.fill_tower_scores_from_log(
+                    record["ranker_rows"][0], inputs, self.score_log, column=-2 if v6 else -1)
+                if v6:
+                    record["preference_logged_share"] = MLPRanker.fill_tower_scores_from_log(
+                        record["ranker_rows"][0], inputs, self.preference_log)
         elif record["ranker"]:
             record["ranker_rows"] = LogisticRanker.training_rows_from(train_events, self.system["feature_store"])
 
@@ -808,8 +883,8 @@ class SimSession:
         try:
             started = time.monotonic()
             trainer = self.offline.trainer
-            if record["train_from_scratch"] or \
-                    getattr(trainer.user_tower, "use_history", False) != record["tower_history"]:
+            current = getattr(trainer, "tower_signature", (False, False, False, False))
+            if record["train_from_scratch"] or current != self._tower_signature(record):
                 trainer = self.offline.trainer = self._fresh_trainer(record)
             trainer.epochs = record["epochs"]
             trainer.batched = record["batched"] or bool(
@@ -832,21 +907,33 @@ class SimSession:
             index.build(embeddings)
 
             ranker = None
-            if record["ranker_rows"] is not None and record["ranker_mlp"]:
-                rows, positions, labels, *rest = record["ranker_rows"]
-                record["ranker_rows"] = None
-                ranker = MLPRanker(self.retriever.user_features, self.system["redis"],
-                                   self.system["feature_store"], self._genres_of,
-                                   seed=self.seed * 1000 + record["version"],
-                                   feature_set=record["ranker_features"],
-                                   multitask=record["ranker_multitask"])
-                ranker.fit(rows, positions, labels, rest[0] if rest else None)
-            elif record["ranker_rows"] is not None:
-                rows, labels = record["ranker_rows"]
-                record["ranker_rows"] = None
-                ranker = LogisticRanker(self.retriever.user_features, self.system["feature_store"])
-                ranker.fit(rows, labels)
+            try:
+                if record["ranker_rows"] is not None and record["ranker_mlp"]:
+                    rows, positions, labels, *rest = record["ranker_rows"]
+                    record["ranker_rows"] = None
+                    ranker = MLPRanker(self.retriever.user_features, self.system["redis"],
+                                       self.system["feature_store"], self._genres_of,
+                                       seed=self.seed * 1000 + record["version"],
+                                       feature_set=record["ranker_features"],
+                                       multitask=record["ranker_multitask"])
+                    if record["ranker_features"] in ("v5", "v6"):
+                        ranker.set_towers(user_tower, embeddings)
+                    if record["ranker_features"] == "v6":
+                        ranker.preference_fn = lambda: self.flink.preferences
+                        ranker.preference_logged_share = record.get("preference_logged_share")
+                    ranker.fit(rows, positions, labels, rest[0] if rest else None)
+                elif record["ranker_rows"] is not None:
+                    rows, labels = record["ranker_rows"]
+                    record["ranker_rows"] = None
+                    ranker = LogisticRanker(self.retriever.user_features, self.system["feature_store"])
+                    ranker.fit(rows, labels)
 
+            except ValueError as error:
+                # Not enough clicks to fit a ranker yet: ship the towers.
+                ranker = None
+                record["ranker_error"] = str(error)
+            if record["preferences"] is not None:
+                record["preferences"].fit()
             if record["holdout"]:
                 production = record["production"]
                 record["recall"] = (
@@ -882,7 +969,7 @@ class SimSession:
                     "production_recall_at_20": prod_recall, "holdout_clicks": len(record["holdout"]),
                     "passed": passed}
         self.versions[version] = ModelVersion(
-            version, user_tower, item_tower, index, ranker=ranker,
+            version, user_tower, item_tower, index, ranker=ranker, preferences=record["preferences"],
             started_tick=record["started_tick"],
             trained_tick=record["started_tick"],
             deployed_tick=None,
@@ -894,7 +981,9 @@ class SimSession:
             recall_at_20=None if gate is None else gate["recall_at_20"],
             gate=gate,
             note="",
-            ranker_info=None if ranker is None else ranker.summary() if isinstance(ranker, MLPRanker) else {
+            preference_info=None if record["preferences"] is None else record["preferences"].summary(),
+            ranker_info=None if ranker is None else {**ranker.summary(), "logged_share": record.get("logged_share")}
+            if isinstance(ranker, MLPRanker) else {
                 "model": "logistic",
                 "training_rows": ranker.training_rows,
                 "click_rate": round(ranker.positive_rate, 4),
@@ -904,6 +993,8 @@ class SimSession:
         if self.logger is not None:
             self.logger.log_event("retrain", now, model_version=version,
                                   training_examples=record["training_examples"])
+        if record.get("ranker_error"):
+            self._log("train", "v%d ships without a ranker: %s." % (version, record["ranker_error"]), cls="s-warn")
         self._log("train", "Training v%d finished (%d examples, %.1f s wall time)."
                   % (version, record["training_examples"], record.get("train_seconds") or 0), cls="s-accent")
         by = "auto" if record["by"] == "schedule" else record["by"]
@@ -930,7 +1021,15 @@ class SimSession:
         model = self.versions[version]
         self.retriever.user_tower = model.user_tower
         self.retriever.item_tower = model.item_tower
-        self.model_server.ranker = model.ranker if self.settings["ranker"] else None
+        if self.flink.preferences is not None:
+            # The preference model is part of a version: deploying (or rolling
+            # back to) a version restores its fitted copy, or the unfitted
+            # state for a version that never had one (v0).
+            if model.preferences is not None:
+                self.flink.preferences.install(model.preferences)
+            else:
+                self.flink.preferences.unfit()
+        self.model_server.ranker = self._serving_ranker(model)
         if rebuild_index:
             self.retriever.ann_index = model.index
             self.index_version = version
@@ -995,7 +1094,7 @@ class SimSession:
 
         def router(user_id):
             if experiment.arm(user_id) == "treatment":
-                return retriever, (model.ranker if self.settings["ranker"] else None)
+                return retriever, self._serving_ranker(model)
             return self.retriever, self.model_server.ranker
 
         self.model_server.router = router
@@ -1143,7 +1242,18 @@ class SimSession:
         s = self.settings
         self.model_server.slate_size = s["slate_size"]
         self.model_server.num_candidates = s["num_candidates"]
-        self.model_server.ranker = self.versions[self.serving_version].ranker if s["ranker"] else None
+        if s["preference_model"] and self.flink.preferences is None:
+            world = self.system["world"]
+            self.flink.preferences = PreferenceModel(world.movie_objects, world.user_objects, seed=self.seed,
+                                                     history=s["preference_history"],
+                                                     shown_feature=s["preference_history"],
+                                                     factors=s["preference_factors"])
+            self.preference_source = PreferenceRetrieval(lambda: self.flink.preferences)
+        if self.flink.preferences is not None:
+            self.flink.preferences.half_life = s["preference_half_life"]
+            self.flink.preferences.use_history = s["preference_history"]
+            self.flink.preferences.shown_feature = s["preference_history"]
+        self.model_server.ranker = self._serving_ranker(self.versions[self.serving_version])
         chain = []
         if s["filter_watched"]:
             chain.append(WatchedFilter(self.system["redis"]))
@@ -1161,8 +1271,18 @@ class SimSession:
             # Second candidate source: content-based, from the genre profile.
             self.profile_source = ProfileRetrieval(self.retriever.user_features, self.system["feature_store"],
                                                    self.system["world"].movie_objects)
+        if getattr(self, "cowatch_source", None) is None:
+            self.cowatch_source = CoWatchRetrieval(self.system["redis"])
         self.model_server.extra_sources = (
-            [(self.profile_source, s["profile_candidates"])] if s["profile_candidates"] else [])
+            ([(self.preference_source, s["preference_candidates"])]
+             if s["preference_model"] and s["preference_candidates"] else [])
+            + ([(self.profile_source, s["profile_candidates"])] if s["profile_candidates"] else [])
+            + ([(self.cowatch_source, s["cowatch_candidates"])] if s["cowatch_candidates"] else []))
+        if s["tower_engagement"]:
+            self.flink.track_engagement = True       # stays on once switched on
+        self.offline.feature_pipeline.engagement = s["tower_engagement"]
+        if s["cowatch_candidates"] or (s["ranker"] and s["ranker_mlp"] and s["ranker_signals"]):
+            self.flink.track_item_signals = True   # stays on once switched on
         mode = "rich" if s["rich_profiles"] else "watches"
         self.flink.profile_mode = mode
         self.offline.feature_pipeline.profile_mode = mode
@@ -1180,6 +1300,17 @@ class SimSession:
             self.next_chaos_tick = self.tick + self._chaos_gap()
         if not s["chaos_every"]:
             self.next_chaos_tick = None
+
+    def _serving_ranker(self, model):
+        """The ranker a model version serves with: the preference model when
+        it is on (the version's own ranker until its first fit)."""
+        own = model.ranker if self.settings["ranker"] else None
+        if (own is not None and getattr(own, "feature_set", None) == "v6"
+                and (getattr(own, "preference_logged_share", 0) or 0) >= 0.5):
+            return own          # the MLP already combines the preference score with everything else
+        if self.settings["preference_model"] and self.flink.preferences is not None:
+            return PreferenceRanker(lambda: self.flink.preferences, fallback=own)
+        return own
 
     def _chaos_gap(self):
         every = self.settings["chaos_every"]
@@ -1332,6 +1463,11 @@ class SimSession:
         self.health["drift_psi"] = health.genre_psi(self.drift_reference,
                                                     health.genre_distribution(recent, catalog))
 
+    @staticmethod
+    def _tower_signature(record):
+        return (record["tower_history"], record["tower_engagement"], record["tower_demographics"],
+                record["tower_shared_ids"])
+
     def _fresh_trainer(self, record):
         """New towers (and optimizer) for this retrain, seeded from the
         session seed and the version, with or without the history input."""
@@ -1342,11 +1478,47 @@ class SimSession:
         num_movies = len(self.system["world"].movie_objects)
         with torch.random.fork_rng(devices=[]):
             torch.manual_seed(self.seed * 1000 + record["version"])
+            item_kwargs = dict(self.system["item_tower_kwargs"])
+            if record["tower_shared_ids"]:
+                item_kwargs.update(use_id_embedding=True, id_init_std=0.01)
+            item = SimpleItemTower(num_movies=num_movies, **item_kwargs)
+            demographics = None
+            if record["tower_demographics"]:
+                from ml_system.demographics import demographics_table
+                demographics = demographics_table(self.system["world"].user_objects)
             user = SimpleUserTower(num_users=len(self.system["world"].user_objects),
-                                   use_history=record["tower_history"], num_movies=num_movies, **user_kwargs)
-            item = SimpleItemTower(num_movies=num_movies, **self.system["item_tower_kwargs"])
-        return TwoTowerTrainer(user, item, epochs=old.epochs, temperature=old.temperature,
-                               batch_size=old.batch_size, batched=old.batched)
+                                   use_history=record["tower_history"], num_movies=num_movies,
+                                   use_engagement=record["tower_engagement"], demographics=demographics,
+                                   history_table=item.movie_embedding if record["tower_shared_ids"] else None,
+                                   **user_kwargs)
+        trainer = TwoTowerTrainer(user, item, epochs=old.epochs, temperature=old.temperature,
+                                  batch_size=old.batch_size, batched=old.batched)
+        trainer.tower_signature = self._tower_signature(record)
+        return trainer
+
+    def _log_scores(self, tick, user, slate, retriever):
+        """Feature logging at serving time: user vector . movie vector of the
+        retriever that served this slate (not the fallback), and the live
+        preference model's score once it has been fitted (v6 ranker)."""
+        model = self.flink.preferences
+        if model is not None and model.fits:
+            for movie_id, score in zip(slate, model.scores(user.user_id, list(slate))):
+                self.preference_log[(tick, user.user_id, movie_id)] = float(score)
+        user_tower = getattr(retriever, "user_tower", None)
+        index = getattr(retriever, "ann_index", None)
+        if user_tower is None or index is None:
+            return
+        base = index
+        while hasattr(base, "inner"):
+            base = base.inner
+        nodes = getattr(base, "nodes", None)
+        if not nodes:
+            return
+        vector = user_tower.embed(retriever.user_features(user.user_id))
+        for movie_id in slate:
+            node = nodes.get(movie_id)
+            if node is not None:
+                self.score_log[(tick, user.user_id, movie_id)] = sum(a * b for a, b in zip(vector, node.unit))
 
     def _genres_of(self, movie_id):
         return self.system["world"].movie_objects[movie_id].genres
@@ -1483,6 +1655,8 @@ class SimSession:
                 "open_incidents": sum(1 for i in self.incidents if i["status"] == "Open"),
                 "canary": self._canary_view(),
                 "world": self.world_kind,
+                "taste": self.taste_kind,
+                "preset": self.preset,
                 "health": dict(self.health),
                 "pending_actions": len(self._pending),
             }

@@ -147,7 +147,8 @@ class UserSimulator:
     def click_probability(self, user_state, movie, share):
         # Non-relevant movies get only p_noise; above the relevance
         # threshold the click probability rises linearly to p_max.
-        lift = relevance_above_threshold(user_state, movie, share=share)
+        lift = relevance_above_threshold(user_state, movie, share=share,
+                                         taste=getattr(self.world, "taste", None))
         return self.p_noise + (self.p_max - self.p_noise) * lift
 
 
@@ -231,7 +232,8 @@ class UserSimulator:
     def relevance_of(self, user, movie_id):
         return relevance(
             self.world.user_states[user.user_id],
-            self.world.movie_objects[movie_id]
+            self.world.movie_objects[movie_id],
+            taste=getattr(self.world, "taste", None)
         )
 
 

@@ -6,7 +6,7 @@ from simulation.events import (
     RatingEvent,
 )
 from simulation.events import OnboardingEvent
-from .features import update_genre_counts
+from .features import update_genre_counts, update_engagement, engagement_features, new_engagement_state
 from .features import (
     RatingFeatureComputer,
     ItemRatingFeatureComputer,
@@ -53,6 +53,18 @@ class Flink(Service):
         self.track_recent = False
         self.recent = None
 
+        # track_item_signals: per-movie behaviour statistics and co-watching
+        # (ml_system.item_signals), published to Redis as
+        # ("item_signals", "all"). Needs shown slates (switches track_recent on).
+        self.track_item_signals = False
+        self.signals = None
+
+        # track_engagement: per-genre click-through and profile strength
+        # (features.update_engagement), published as "genre_engagement" and
+        # "profile_strength". Needs shown slates (switches track_recent on).
+        self.track_engagement = False
+        self.engagement = {}
+
         # profile_mode: how user genre profiles are built ("watches" = the
         # original, or "rich"; see features.update_genre_counts; the
         # offline pipeline uses the same). track_onboarding: also consume
@@ -60,6 +72,12 @@ class Flink(Service):
         self.profile_mode = "watches"
         self.track_onboarding = False
         self._onboarding_subscribed = False
+
+        # preferences: a live ml_system.online_model.PreferenceModel (set by
+        # its owner; None = off). Learns online from every event Flink
+        # consumes (slates, clicks, watches, ratings, onboarding) and is
+        # published to Redis as ("preference_model", "all").
+        self.preferences = None
 
     def start(self, sim):
         super().start(sim)
@@ -77,13 +95,30 @@ class Flink(Service):
         kafka = sim.get_service("Kafka")
         self.processed_last_tick = 0
 
+        if self.track_item_signals and self.signals is None:
+            from ml_system.item_signals import ItemSignals
+            self.signals = ItemSignals()
+            sim.get_service("Redis").set("item_signals", "all", self.signals)
+            self.track_recent = True
+
+        if self.track_engagement:
+            self.track_recent = True
+
+        if self.preferences is not None:
+            self.track_recent = True       # needs the shown slates
+            redis = sim.get_service("Redis")
+            if redis.get("preference_model", "all") is not self.preferences:
+                redis.set("preference_model", "all", self.preferences)
+
         if self.track_recent and self.recent is None:
             from ml_system.ranking import RecentHistory
             self.recent = RecentHistory()
-            kafka.subscribe(self.consumer_name, "RecommendationShownEvent", from_end=True)
+            # From the start of the current tick: the World has already
+            # published this tick's slates before Flink runs.
+            kafka.subscribe(self.consumer_name, "RecommendationShownEvent", from_tick=sim.clock.now)
             self.topics = self.topics + ["RecommendationShownEvent"]
 
-        if self.track_onboarding and not self._onboarding_subscribed:
+        if (self.track_onboarding or self.preferences is not None) and not self._onboarding_subscribed:
             kafka.subscribe(self.consumer_name, "OnboardingEvent")
             self.topics = self.topics + ["OnboardingEvent"]
             self._onboarding_subscribed = True
@@ -98,6 +133,8 @@ class Flink(Service):
             # Rotate the starting topic so no topic starves under load.
             start = sim.clock.now % len(topics)
             topics = topics[start:] + topics[:start]
+
+        signal_events = []
 
         for topic in topics:
 
@@ -115,7 +152,13 @@ class Flink(Service):
 
             self.processed_last_tick += len(events)
 
+            if self.signals is not None or self.preferences is not None:
+                signal_events.extend(events)
+
             for event in events:
+
+                if self.track_engagement:
+                    self.update_engagement(sim, event)
 
                 if isinstance(event, RecommendationClickedEvent):
                     self.handle_recommendation_clicked(sim, event)
@@ -126,7 +169,7 @@ class Flink(Service):
                 elif isinstance(event, RatingEvent):
                     self.handle_rating(sim, event)
 
-                elif isinstance(event, OnboardingEvent):
+                elif isinstance(event, OnboardingEvent) and self.track_onboarding:
                     self.update_profile(sim, event.user_id, "onboarding", event.genres)
 
                 elif isinstance(event, RecommendationShownEvent):
@@ -135,6 +178,24 @@ class Flink(Service):
                             "recent_slates", event.user_id,
                             self.recent.add_slate(event.user_id, event.movie_ids))
 
+
+        if self.signals is not None and signal_events:
+            self.apply_signals(signal_events)
+        if self.preferences is not None:
+            self.preferences.observe_tick(signal_events)
+            # Every reaction to this tick's slates is in: learn from them now,
+            # before the next tick is served.
+            self.preferences.flush(sim.clock.now + 1)
+
+    # Movie signals depend on event order (a click needs its slate first),
+    # so each tick's events are applied in the data lake's topic order,
+    # the order training replays them in.
+    SIGNAL_ORDER = {"RecommendationShownEvent": 0, "RecommendationClickedEvent": 1,
+                    "WatchEvent": 2, "RatingEvent": 3}
+
+    def apply_signals(self, events):
+        for event in sorted(events, key=lambda e: (e.timestamp, self.SIGNAL_ORDER.get(type(e).__name__, 4))):
+            self.signals.observe(event)
 
     def update_activity_level(self, sim, user_id):
 
@@ -187,6 +248,23 @@ class Flink(Service):
                 "user_id": user_id,
                 "value": {genre: count / total for genre, count in counts.items()},
             })
+
+    def update_engagement(self, sim, event):
+        kind = {"RecommendationShownEvent": "shown", "RecommendationClickedEvent": "click",
+                "WatchEvent": "watch", "OnboardingEvent": "onboarding"}.get(type(event).__name__)
+        if kind is None:
+            return
+        state = self.engagement.setdefault(event.user_id, new_engagement_state())
+        if kind == "shown":
+            update_engagement(state, kind, [self.movie_genres(sim, m) for m in event.movie_ids])
+        elif kind == "onboarding":
+            update_engagement(state, kind, event.genres)
+        else:
+            update_engagement(state, kind, self.movie_genres(sim, event.movie_id))
+        rates, strength = engagement_features(state)
+        redis = sim.get_service("Redis")
+        redis.set("genre_engagement", event.user_id, rates)
+        redis.set("profile_strength", event.user_id, strength)
 
     def movie_genres(self, sim, movie_id):
         return sim.get_service("World").movie_objects[movie_id].genres

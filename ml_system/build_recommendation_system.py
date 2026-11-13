@@ -51,7 +51,8 @@ def build_recommendation_system(
     runs_dir="runs",
     run_id=None,
     world_dynamics=None,
-    onboarding=None
+    onboarding=None,
+    taste="genre"
 ):
     """Wire up World, streaming, serving and the offline retraining loop.
 
@@ -69,7 +70,21 @@ def build_recommendation_system(
     `onboarding` (dict {"genres": 3, "noise": 0.3}, default None = off):
     new users declare favourite genres before their first slate; the
     console can also switch it on later (world.onboarding).
+    `taste`: "genre" (default: relevance is the genre match only) or
+    "rich" (relevance mixes the genre match with hidden tastes and movie
+    quality learned from the real MovieLens ratings; see world.taste).
     """
+    if taste not in ("genre", "rich"):
+        raise ValueError('taste must be "genre" or "rich"')
+    taste_model = None
+    if taste == "rich":
+        from world.relevance import calibrate_threshold
+        from world.taste import fit_taste_model, ratings_from_user_states
+
+        # Fitted on the pre-game ratings, before the simulation adds any.
+        taste_model = fit_taste_model(ratings_from_user_states(user_states))
+        calibrate_threshold(taste_model, [user_states[u] for u in sorted(user_states)],
+                            [movie_objects[m] for m in sorted(movie_objects)])
     from world.dynamics import DYNAMICS_KEYS, EXPOSURE_KEYS, WorldDynamics
 
     world_dynamics = dict(world_dynamics or {})
@@ -154,7 +169,8 @@ def build_recommendation_system(
         onboarding=onboarding,
         # Own RNG, derived from the seed directly (no draw from the shared
         # stream), so switching onboarding on never shifts other components.
-        onboarding_rng=random.Random("onboarding-%s" % seed)
+        onboarding_rng=random.Random("onboarding-%s" % seed),
+        taste=taste_model
     )
 
     sim = Simulator(seed=seeds.getrandbits(64))
@@ -205,6 +221,7 @@ def build_recommendation_system(
                 "run_id": run_id,
                 "seed": seed,
                 "config": {
+                    "taste": taste,
                     "users_per_tick": users_per_tick,
                     "outcome_model": outcome_model,
                     "num_candidates": num_candidates,

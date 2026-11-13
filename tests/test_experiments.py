@@ -26,7 +26,7 @@ from console.session import SimSession  # noqa: E402
 
 
 def canary_session():
-    s = SimSession(seed=3, users_per_tick=4, log_metrics=False,
+    s = SimSession(preset="plain", seed=3, users_per_tick=4, log_metrics=False,
                    settings={"deploy_delay": 10, "epochs": 1, "spark_every": 0,
                              "canary_share": 50, "canary_ticks": 20})
     s.step(30)

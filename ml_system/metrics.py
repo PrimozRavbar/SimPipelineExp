@@ -149,6 +149,7 @@ def reference_ctrs(world, slate_size=10, seed=0, random_slates_per_user=3):
     rel = relevance_matrix(
         [world.user_states[user_id] for user_id in user_ids],
         [world.movie_objects[movie_id] for movie_id in movie_ids],
+        taste=getattr(world, "taste", None),
     )
 
     rng = random.Random(seed)

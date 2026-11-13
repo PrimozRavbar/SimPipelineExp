@@ -10,7 +10,7 @@ from ml_system.model_registry import load_bundle
 
 
 def test_gate_scores_both_models_and_blocks_a_worse_one(tmp_path):
-    s = SimSession(seed=3, users_per_tick=4, settings={
+    s = SimSession(preset="plain", seed=3, users_per_tick=4, settings={
         "deploy_delay": 10, "epochs": 1, "spark_every": 0, "eval_gate": True,
         "holdout_pct": 20, "gate_tolerance_pct": 0}, runs_dir=str(tmp_path), run_id="gate")
     s.step(60)

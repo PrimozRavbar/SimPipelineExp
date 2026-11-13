@@ -14,7 +14,7 @@ from console.session import SimSession
 
 @pytest.fixture(scope="module")
 def client():
-    session = SimSession(seed=5, users_per_tick=3, settings={"deploy_delay": 5, "epochs": 1},
+    session = SimSession(preset="plain", seed=5, users_per_tick=3, settings={"deploy_delay": 5, "epochs": 1},
                          log_metrics=True, run_id="console-api")
     yield TestClient(create_app(session))
     session.close()

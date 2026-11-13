@@ -280,13 +280,50 @@ def features_v3(user_features, recent_watches, recent_slates, item_features, mov
     return row + [cosine] + [share.get(g, 0.0) if g in genres else 0.0 for g in _v3_genres()]
 
 
+def features_v4(user_features, recent_watches, recent_slates, item_features, movie_id, genres_of,
+                signals=None):
+    """v3 + what the game's own logs say about the movie (click rate when
+    shown, completion, rating, impressions: quality) and how often it is
+    co-watched with the user's recent watches (hidden tastes). `signals` is
+    an ml_system.item_signals.ItemSignals (Flink's online one at serving,
+    a point-in-time replay in training)."""
+    row = features_v3(user_features, recent_watches, recent_slates, item_features, movie_id, genres_of)
+    if signals is None:
+        return row + [0.0, 0.5, 0.6, 0.0, 1.0, 0.0]
+    return row + signals.stats(movie_id) + [signals.cowatch_score(movie_id, recent_watches)]
+
+
 def feature_names(feature_set):
     if feature_set == "v2":
         return list(FEATURES_V2)
-    return list(FEATURES_V2) + ["profile_cosine"] + ["genre_%s" % g for g in _v3_genres()]
+    names = list(FEATURES_V2) + ["profile_cosine"] + ["genre_%s" % g for g in _v3_genres()]
+    if feature_set in ("v4", "v5", "v6"):
+        names += ["item_click_rate", "item_completion", "item_rating", "item_log_impressions",
+                  "item_coec", "cowatch_score"]
+    if feature_set in ("v5", "v6"):
+        names += ["tower_score"]
+    if feature_set == "v6":
+        names += ["preference_score"]
+    return names
 
 
-FEATURE_SETS = {"v2": features_v2, "v3": features_v3}
+# v5 = v4 + the two-tower retrieval score (user vector . movie vector),
+# filled in by MLPRanker (it needs the towers): the ranker can build on
+# what retrieval learned about hidden tastes.
+# v6 = v5 + the preference model's score (ml_system.online_model), set at
+# serving from the live model and in training from the scores logged when
+# each slate was served.
+FEATURE_SETS = {"v2": features_v2, "v3": features_v3, "v4": features_v4, "v5": features_v4, "v6": features_v4}
+
+
+def _build_row(feature_set, user, watches, slates, item, movie_id, genres_of, signals):
+    if feature_set == "v6":
+        return features_v4(user, watches, slates, item, movie_id, genres_of, signals=signals) + [0.0, 0.0]
+    if feature_set == "v5":
+        return features_v4(user, watches, slates, item, movie_id, genres_of, signals=signals) + [0.0]
+    if feature_set == "v4":
+        return features_v4(user, watches, slates, item, movie_id, genres_of, signals=signals)
+    return FEATURE_SETS[feature_set](user, watches, slates, item, movie_id, genres_of)
 
 
 def _make_multitask_net():
@@ -337,6 +374,7 @@ class MLPRanker(Ranker):
         self.training_rows = 0
         self.positive_rate = None
         self.losses = []
+        self.preference_fn = None        # v6: returns the live preference model
 
     # -- serving ---------------------------------------------------------
 
@@ -348,9 +386,19 @@ class MLPRanker(Ranker):
         user_features = self.user_features_fn(user.user_id)
         watches = self.redis.get("recent_watches", user.user_id) or []
         slates = self.redis.get("recent_slates", user.user_id) or []
-        build = FEATURE_SETS[self.feature_set]
-        rows = [build(user_features, watches, slates, self.feature_store.get_item_features(m),
-                            m, self.genres_of) for m in candidates]
+        signals = self.redis.get("item_signals", "all") if self.feature_set in ("v4", "v5", "v6") else None
+        rows = [_build_row(self.feature_set, user_features, watches, slates, self.feature_store.get_item_features(m),
+                            m, self.genres_of, signals) for m in candidates]
+        if self.feature_set in ("v5", "v6"):
+            column = -1 if self.feature_set == "v5" else -2
+            user_vector = self.tower_user_vector({**user_features, "recent_watches": list(watches)})
+            for row, m in zip(rows, candidates):
+                row[column] = self.tower_score(user_vector, m)
+        if self.feature_set == "v6":
+            model = self.preference_fn() if self.preference_fn is not None else None
+            if model is not None:
+                for row, score in zip(rows, model.scores(user.user_id, list(candidates))):
+                    row[-1] = float(score)
         with torch.no_grad():
             x = (torch.tensor(rows, dtype=torch.float32) - self.mean) / self.scale
             if self.multitask:
@@ -364,7 +412,8 @@ class MLPRanker(Ranker):
     # -- training --------------------------------------------------------
 
     @staticmethod
-    def training_rows_from(events, feature_store, genres_of, feature_set="v2", with_completion=False):
+    def training_rows_from(events, feature_store, genres_of, feature_set="v2", with_completion=False,
+                           inputs=None):
         """Cascade rows (see LogisticRanker.training_rows_from) with v2
         features; recent history is replayed in event order, as of just
         before each slate. Returns (rows, positions, labels), plus
@@ -384,6 +433,10 @@ class MLPRanker(Ranker):
                     if rec is not None:
                         completion_of[rec] = e.completion
         history = RecentHistory()
+        signals = None
+        if feature_set in ("v4", "v5", "v6"):
+            from ml_system.item_signals import ItemSignals
+            signals = ItemSignals()
         rows, positions, labels, completions = [], [], [], []
         for event_order, event in enumerate(events):
             if isinstance(event, RecommendationShownEvent):
@@ -394,11 +447,15 @@ class MLPRanker(Ranker):
                 last = movie_ids.index(clicked) if clicked in movie_ids else len(movie_ids) - 1
                 for position, movie_id in enumerate(movie_ids[:last + 1]):
                     item = feature_store.get_item_features_as_of(movie_id, event.timestamp, event_order)
-                    rows.append(FEATURE_SETS[feature_set](user, watches, slates, item, movie_id, genres_of))
+                    rows.append(_build_row(feature_set, user, watches, slates, item, movie_id, genres_of, signals))
+                    if inputs is not None:
+                        inputs.append((event.user_id, event.timestamp, user, tuple(watches), movie_id))
                     positions.append(min(position, POSITIONS - 1))
                     labels.append(1.0 if movie_id == clicked else 0.0)
                     completions.append(completion_of.get(event.recommendation_id) if movie_id == clicked else None)
             history.observe(event)
+            if signals is not None:
+                signals.observe(event)
         if with_completion:
             return rows, positions, labels, completions
         return rows, positions, labels
@@ -465,6 +522,51 @@ class MLPRanker(Ranker):
         self.training_rows = len(y)
         self.positive_rate = float(y.mean())
         return self
+
+    # -- v5: two-tower score ----------------------------------------------
+
+    def set_towers(self, user_tower, item_embeddings):
+        """Towers for the v5 'tower_score' feature: the user tower and the
+        movie vectors (the ones the ANN index was built from)."""
+        import torch
+        self.user_tower = user_tower
+        ids = sorted(item_embeddings)
+        self._movie_row = {m: i for i, m in enumerate(ids)}
+        self._movie_vectors = torch.tensor([item_embeddings[m] for m in ids], dtype=torch.float32)
+
+    def tower_user_vector(self, user_features):
+        import torch
+        return torch.tensor(self.user_tower.embed(user_features), dtype=torch.float32)
+
+    def tower_score(self, user_vector, movie_id):
+        row = self._movie_row.get(movie_id)
+        return 0.0 if row is None else float(self._movie_vectors[row] @ user_vector)
+
+    def fill_tower_scores(self, rows, inputs):
+        """Training: set each row's tower_score from its point-in-time user
+        features and recent watches."""
+        cache = {}
+        for row, (user_id, _tick, user, watches, movie_id) in zip(rows, inputs):
+            key = (user_id, id(user), watches)
+            if key not in cache:
+                cache[key] = self.tower_user_vector({**user, "user_id": user_id,
+                                                     "recent_watches": list(watches)})
+            row[-1] = self.tower_score(cache[key], movie_id)
+
+    @staticmethod
+    def fill_tower_scores_from_log(rows, inputs, score_log, column=-1):
+        """Training without leakage: each row gets the retrieval score that
+        was logged when its slate was served ((tick, user, movie) ->
+        score, computed by the model serving at the time, which had not
+        seen these clicks). Rows with no logged score get 0. Returns the
+        share of rows found in the log."""
+        found = 0
+        for row, (user_id, tick, _user, _watches, movie_id) in zip(rows, inputs):
+            score = score_log.get((tick, user_id, movie_id))
+            if score is not None:
+                found += 1
+            row[column] = 0.0 if score is None else score
+        return found / len(rows) if rows else 0.0
 
     def summary(self):
         return {"model": "mlp", "feature_set": self.feature_set, "multitask": self.multitask,
