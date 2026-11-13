@@ -90,3 +90,27 @@ def test_fatigue_wears_off_with_recovery():
 def test_unknown_dynamics_key_is_rejected():
     with pytest.raises(ValueError):
         build({"taste_drift": 1})
+
+
+def test_gradual_drift_moves_taste_in_steps_towards_a_related_genre():
+    system = build({"taste_drift_every": 20, "taste_drift_share": 0.1, "taste_drift_strength": 0.6,
+                    "taste_drift_mode": "gradual", "taste_drift_steps": 4})
+    dynamics = system["world_dynamics"]
+    system["sim"].run(20, verbose=False)
+    started = list(dynamics.drift_log)
+    assert started and len(dynamics.journeys) == len(started)
+    _, user_id, genre = started[0]
+    prefs = system["world"].user_states[user_id].genre_preferences
+    first = prefs[genre] / sum(prefs.values())
+    system["sim"].run(20, verbose=False)               # the remaining 3 steps
+    prefs = system["world"].user_states[user_id].genre_preferences
+    final = prefs[genre] / sum(prefs.values())
+    assert first < final and final >= 0.6               # gradual, and the same total shift
+    assert user_id not in dynamics.journeys or dynamics.journeys[user_id][1] < 4
+    # Targets follow the catalog's genre co-occurrence: a pure Comedy fan
+    # never drifts to a genre that never appears with Comedy.
+    R = dynamics.relatedness()
+    from world.dynamics import DRIFT_GENRES
+    comedy = DRIFT_GENRES.index("Comedy")
+    targets = {dynamics.related_target({"Comedy": 1.0}) for _ in range(200)}
+    assert all(R[comedy][DRIFT_GENRES.index(g)] > 0 for g in targets)
