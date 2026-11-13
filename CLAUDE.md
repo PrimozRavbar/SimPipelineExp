@@ -279,7 +279,7 @@ another component's random draws.
     movies already shown to the user earlier in the same tick (`ModelServer._session`).
   Measured (rich, 20 users a tick, default setup, mean CTR ticks 800-2000; dynamic s42 baseline
   26.3): ratings 50% 25.3; interest 50/20 28.5 (s1 28.2; static s42 50.7 vs 50.0); interest
-  100/50 **29.7**; interest 50/20 + ratings 50% 28.4; two slates per visit 22.4 per slate (the
+  100/50 **29.7** (s1 30.6; static s42 51.5); interest 50/20 + ratings 50% 28.4; two slates per visit 22.4 per slate (the
   second row holds second-best picks and users tire twice as fast; about 0.45 clicks per visit
   vs 0.26); everything 24.4. Signals on examined-but-unclicked movies are the evidence the
   click alone never gave. Defaults: interest 100/50, ratings 10%, one slate.
