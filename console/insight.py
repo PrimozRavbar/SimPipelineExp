@@ -24,6 +24,7 @@ ranking loses candidates - served.
 import numpy as np
 
 from ml_system.candidate_sources import merge_candidates
+from ml_system.exploration import SlotExplorer
 from ml_system.ranking import ExplorationReranker, genre_match
 from simulation.events import RetrievalRequest
 from world.relevance import relevance_matrix, relevance_threshold
@@ -62,7 +63,7 @@ def stage_report(session, max_users=150, window=300):
         # Deterministic re-rankers only: exploration draws from a seeded
         # RNG, and calling it here would change the game.
         for reranker in getattr(server.reranker, "rerankers", [server.reranker] if server.reranker else []):
-            if not isinstance(reranker, ExplorationReranker):
+            if not isinstance(reranker, (ExplorationReranker, SlotExplorer)):
                 ordered = reranker.rerank(user, ordered)
         served = list(ordered)[:server.slate_size]
         extra = [m for lst in extras for m in lst]

@@ -130,6 +130,14 @@ class PreferenceModel:
         # as of when the slate was shown, with a learned weight kb.
         self.browse = {}
         self.browse_decay = 0.8
+        # Drift detector (per user): fast and slow moving averages of
+        # whether a slate got a click; see drifting().
+        self.ctr_fast, self.ctr_slow, self.slates_seen = {}, {}, {}
+        # Inverse propensity scoring: `propensities` ((tick, user, movie) ->
+        # probability the serving policy put the movie there, logged by the
+        # explorer); rows are weighted by min(ips_cap, 1 / p). None = off.
+        self.propensities = None
+        self.ips_cap = 10.0
         self.pair = {}            # (user, movie) -> offset r(u, m), learned online only
         self.params = self._initial_params(self.num_users)
 
@@ -208,6 +216,22 @@ class PreferenceModel:
 
     # -- logging evidence ----------------------------------------------------
 
+    def drifting(self, user_id):
+        """True when this user's taste may have moved: their recent click
+        rate fell well below their own long-run rate, or their recent
+        browsing points away from their learned top genres."""
+        if self.slates_seen.get(user_id, 0) >= 8:
+            slow, fast = self.ctr_slow[user_id], self.ctr_fast[user_id]
+            if slow >= 0.15 and fast < 0.5 * slow:
+                return True
+        vec = self.browse.get(user_id)
+        if vec is not None and vec.sum() >= 2.0:
+            top_browsed = int(np.argmax(vec))
+            taste = self._taste(user_id)
+            if top_browsed not in set(np.argsort(-taste)[:3].tolist()):
+                return True
+        return False
+
     def _browse_share(self, user_id):
         vec = self.browse.get(user_id)
         if vec is None:
@@ -234,13 +258,22 @@ class PreferenceModel:
         if self.online_lr:
             self._online_step(row, grade)
 
-    def _finish_slate(self, user_id, movies, clicked, history):
+    def _finish_slate(self, user_id, movies, clicked, history, tick=None):
+        hit = 0.0 if clicked is None else 1.0
+        n = self.slates_seen.get(user_id, 0)
+        self.ctr_fast[user_id] = hit if n == 0 else 0.7 * self.ctr_fast[user_id] + 0.3 * hit
+        self.ctr_slow[user_id] = hit if n == 0 else 0.95 * self.ctr_slow[user_id] + 0.05 * hit
+        self.slates_seen[user_id] = n + 1
         last = len(movies) - 1 if clicked is None else clicked
         for i in range(last + 1):
             if clicked is None:
                 target, weight = 0.0, self.unclicked_weight
             else:
                 target, weight = (1.0 if i == clicked else 0.0), 1.0
+            if self.propensities is not None:
+                p = self.propensities.get((tick, user_id, movies[i]))
+                if p:
+                    weight *= min(self.ips_cap, 1.0 / p)
             self._add_row((user_id, movies[i], i, target, weight) + history[i])
         seen = self.user_genre_shown.get(user_id)
         if seen is None:
@@ -256,7 +289,7 @@ class PreferenceModel:
             tick, user_id, movies, clicked, history = self.pending[rid]
             if before_tick is None or tick < before_tick:
                 del self.pending[rid]
-                self._finish_slate(user_id, movies, clicked, history)
+                self._finish_slate(user_id, movies, clicked, history, tick)
         for (u, m), tick in sorted(self.open_clicks.items()):
             if before_tick is None or tick < before_tick:
                 del self.open_clicks[(u, m)]          # clicked, not watched
@@ -351,7 +384,11 @@ class PreferenceModel:
 
     def snapshot(self):
         """A copy to fit in the background (the live one keeps learning)."""
-        return copy.deepcopy(self)
+        propensities, self.propensities = self.propensities, None
+        try:
+            return copy.deepcopy(self)
+        finally:
+            self.propensities = propensities
 
     def fit(self, epochs=None, learning_rate=0.05):
         """Refit every parameter on all logged rows, from scratch (seeded)."""
