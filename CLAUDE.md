@@ -583,6 +583,12 @@ result is unstable: the model collapses to a few dozen near-global slates.
 - Switching `rich_profiles` mid-game: Flink keeps the counts it has and adds new signal in
   the new mode, while the next Spark run recomputes every profile in the new mode, so online
   and offline profiles differ until users have new activity (the skew tile shows it).
+- Long dynamic games still decay, with or without fatigue recovery (rich s42, default setup,
+  20 users a tick, CTR per 400 ticks): recovery 1000 ticks 27.4 at 800 -> 25.5 at 1200 -> 13.9
+  at 4000 (oracle 51.2); no recovery 26.9 -> 25.4 -> 12.3 (oracle 44.3). The static world at
+  20 users a tick climbs 44.2 -> 50.3 -> 56.3. In the dynamic world a user is shown more than
+  half the catalog by tick 4000 and every candidate source keeps proposing the same tired
+  movies (best 10 of all candidates 21.6 vs oracle 51.2): retrieval needs to be exposure-aware.
 - Demographics (age, gender, occupation) are still unused by the models.
 - Exploration's long-run benefit (better training data for later retrains) is not measured
   yet, and explored slots are not logged with their propensity, so training treats them
