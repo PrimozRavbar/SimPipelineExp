@@ -22,6 +22,8 @@ consistent state.
 
 import copy
 import random
+
+import numpy as np
 from pathlib import Path
 import statistics
 import threading
@@ -43,6 +45,7 @@ from ml_system.redis import EVICTION_POLICIES
 from console.economy import ONE_OFF, PRICES, Economy
 from ml_system.online_model import PreferenceModel, PreferenceRanker, PreferenceRetrieval
 from ml_system.exploration import POLICIES as EXPLORE_POLICIES, SlotExplorer
+from ml_system.cf_model import CFRetrieval, ImplicitMF
 from ml_system.training import TwoTowerTrainer
 from ml_system.two_tower import USER_FEATURE_DEFAULTS, SimpleItemTower, SimpleUserTower, TwoTowerRetrieval
 from world.dynamics import DYNAMIC_WORLD
@@ -98,6 +101,11 @@ DEFAULT_SETTINGS = {
     "preference_half_life": 0,
     "preference_optimism_pct": 0,
     "preference_taste_half_life": 0,
+    "cf_model": False,         # collaborative filtering (implicit ALS) refitted at every retrain; a preference-model input
+    "cf_candidates": 0,        # extra candidates from collaborative filtering (needs cf_model; 0 = off)
+    "cf_factors": 16,          # hidden taste numbers per user and movie
+    "preference_browse_memory_pct": 80,  # how much of the browse history is kept per new browse (80 = about the last 5)
+    "preference_grade_weight_pct": 100,  # weight of watch completion and ratings vs clicks in training
     "preference_genre_optimism_pct": 0,  # per-user bonus for genres the user has rarely been shown, x0.01 logits  # user tastes follow recent behaviour: rows halve every N ticks (0 = off)  # weight of a skip per earlier impression of the movie (100 = all skips equal)  # exploration bonus for rarely shown movies (UCB-style), x0.01 logits
     "ranker_preference_score": False,  # MLP ranker also sees the preference model's score (v6; logged at serving)     # refits weight a row half as much every N ticks of age (0 = all equal)
     # Personalisation
@@ -206,6 +214,10 @@ SETTING_LIMITS = {
     "preference_half_life": (0, 100000),
     "preference_optimism_pct": (0, 500),
     "preference_taste_half_life": (0, 100000),
+    "preference_browse_memory_pct": (0, 99),
+    "cf_candidates": (0, 200),
+    "cf_factors": (2, 64),
+    "preference_grade_weight_pct": (0, 1000),
     "preference_genre_optimism_pct": (0, 500),
     "diversity_pct": (0, 100),
     "exploration_pct": (0, 50),
@@ -250,7 +262,7 @@ BOOL_SETTINGS = {"rebuild_index", "ranker", "ranker_mlp", "filter_watched", "eva
                  "logq_correction", "graded_positives", "tower_history", "train_from_scratch",
                  "ranker_multitask", "ranker_signals", "tower_engagement", "tower_demographics",
                  "tower_shared_ids", "ranker_tower_score", "preference_model",
-                 "preference_history", "ranker_preference_score", "explore_ips"}
+                 "preference_history", "ranker_preference_score", "explore_ips", "cf_model"}
 
 # Settings that take one of a few strings.
 CHOICE_SETTINGS = {"redis_eviction": EVICTION_POLICIES, "feast_mode": FEAST_MODES,
@@ -355,10 +367,11 @@ class ActionError(ValueError):
 class ModelVersion:
     """One deployable model: user tower + item tower + ANN index."""
 
-    def __init__(self, version, user_tower, item_tower, index, ranker=None, preferences=None, **info):
+    def __init__(self, version, user_tower, item_tower, index, ranker=None, preferences=None, cf=None, **info):
         self.version = version
         self.ranker = ranker
         self.preferences = preferences        # fitted PreferenceModel (or None)
+        self.cf = cf                          # fitted ImplicitMF (or None)
         self.user_tower = user_tower
         self.item_tower = item_tower
         self.index = index
@@ -402,8 +415,8 @@ class SimSession:
     ):
         if world not in WORLDS:
             raise ActionError("world must be one of %s" % (WORLDS,))
-        if taste not in ("genre", "rich"):
-            raise ActionError('taste must be "genre" or "rich"')
+        if taste not in ("genre", "rich", "personal"):
+            raise ActionError('taste must be "genre", "rich" or "personal"')
         self.seed = seed
         self.world_kind = world
         self.taste_kind = taste
@@ -543,6 +556,7 @@ class SimSession:
         self.feast = self.system["feast"]
         self.kserve = self.system["kserve"]
         self._infra_applied = False
+        self.cf_live = None              # deployed collaborative-filtering model
         self._materializations_billed = 0
         self._apply_live_settings()
 
@@ -895,6 +909,9 @@ class SimSession:
             "train_from_scratch": self.settings["train_from_scratch"],
             "ranker_rows": None,
             "preferences": None,
+            "cf_interactions": None,
+            "cf_factors": self.settings["cf_factors"] if self.settings["cf_model"] else 0,
+            "cf": None,
             "index_kind": self.index_kind,
             "ann_nprobe": self.settings["ann_nprobe"],
             "eval_gate": self.settings["eval_gate"],
@@ -965,6 +982,9 @@ class SimSession:
             # Refit the preference model on everything it has logged so far
             # (a copy; the live one keeps learning online meanwhile).
             record["preferences"] = self.flink.preferences.snapshot()
+        if record["cf_factors"]:
+            # Who did what with which movie, as of now (the fit runs in the background).
+            record["cf_interactions"] = ImplicitMF.interactions(train_events)
         if record["ranker"] and record["ranker_mlp"]:
             record["ranker_inputs"] = [] if record["ranker_features"] in ("v5", "v6") else None
             record["ranker_rows"] = MLPRanker.training_rows_from(
@@ -1057,6 +1077,11 @@ class SimSession:
                 record["ranker_error"] = str(error)
             if record["preferences"] is not None:
                 record["preferences"].fit()
+            if record["cf_interactions"] is not None:
+                world = self.system["world"]
+                record["cf"] = ImplicitMF(max(world.user_objects) + 1, max(world.movie_objects) + 1,
+                                          factors=record["cf_factors"], seed=self.seed).fit(record["cf_interactions"])
+                record["cf_interactions"] = None
             if record["holdout"]:
                 production = record["production"]
                 record["recall"] = (
@@ -1092,7 +1117,7 @@ class SimSession:
                     "production_recall_at_20": prod_recall, "holdout_clicks": len(record["holdout"]),
                     "passed": passed}
         self.versions[version] = ModelVersion(
-            version, user_tower, item_tower, index, ranker=ranker, preferences=record["preferences"],
+            version, user_tower, item_tower, index, ranker=ranker, preferences=record["preferences"], cf=record["cf"],
             started_tick=record["started_tick"],
             trained_tick=record["started_tick"],
             deployed_tick=None,
@@ -1144,6 +1169,7 @@ class SimSession:
         model = self.versions[version]
         self.retriever.user_tower = model.user_tower
         self.retriever.item_tower = model.item_tower
+        self.cf_live = model.cf        # collaborative filtering is part of a version too
         if self.flink.preferences is not None:
             # The preference model is part of a version: deploying (or rolling
             # back to) a version restores its fitted copy, or the unfitted
@@ -1373,9 +1399,13 @@ class SimSession:
                                                      factors=s["preference_factors"])
             self.preference_source = PreferenceRetrieval(lambda: self.flink.preferences)
         if self.flink.preferences is not None:
+            self.flink.preferences.cf_fn = self._cf_scores if s["cf_model"] else None
+        if self.flink.preferences is not None:
             self.flink.preferences.half_life = s["preference_half_life"]
             self.flink.preferences.optimism = s["preference_optimism_pct"] / 100.0
             self.flink.preferences.taste_half_life = s["preference_taste_half_life"]
+            self.flink.preferences.browse_decay = s["preference_browse_memory_pct"] / 100.0
+            self.flink.preferences.grade_weight = s["preference_grade_weight_pct"] / 100.0
             self.flink.preferences.genre_optimism = s["preference_genre_optimism_pct"] / 100.0
             self.flink.preferences.use_history = s["preference_history"]
             self.flink.preferences.shown_feature = s["preference_history"]
@@ -1410,9 +1440,14 @@ class SimSession:
                                                    self.system["world"].movie_objects)
         if getattr(self, "cowatch_source", None) is None:
             self.cowatch_source = CoWatchRetrieval(self.system["redis"])
+        if getattr(self, "cf_source", None) is None:
+            self.cf_source = CFRetrieval(lambda: self.cf_live, self.system["world"].movie_objects,
+                                         lambda u, m: self.flink.preferences is not None
+                                         and (u, m) in self.flink.preferences.watched)
         self.model_server.extra_sources = (
             ([(self.preference_source, s["preference_candidates"])]
              if s["preference_model"] and s["preference_candidates"] else [])
+            + ([(self.cf_source, s["cf_candidates"])] if s["cf_model"] and s["cf_candidates"] else [])
             + ([(self.profile_source, s["profile_candidates"])] if s["profile_candidates"] else [])
             + ([(self.cowatch_source, s["cowatch_candidates"])] if s["cowatch_candidates"] else []))
         if s["tower_engagement"]:
@@ -1443,6 +1478,12 @@ class SimSession:
             self.next_chaos_tick = self.tick + self._chaos_gap()
         if not s["chaos_every"]:
             self.next_chaos_tick = None
+
+    def _cf_scores(self, user_id, movies):
+        cf = getattr(self, "cf_live", None)
+        if cf is None:
+            return np.zeros(len(movies))
+        return cf.scores(user_id, movies)
 
     def _serving_ranker(self, model):
         """The ranker a model version serves with: the preference model when

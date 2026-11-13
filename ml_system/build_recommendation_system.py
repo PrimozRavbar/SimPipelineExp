@@ -77,15 +77,20 @@ def build_recommendation_system(
     "rich" (relevance mixes the genre match with hidden tastes and movie
     quality learned from the real MovieLens ratings; see world.taste).
     """
-    if taste not in ("genre", "rich"):
-        raise ValueError('taste must be "genre" or "rich"')
+    if taste not in ("genre", "rich", "personal"):
+        raise ValueError('taste must be "genre", "rich" or "personal"')
     taste_model = None
-    if taste == "rich":
+    if taste in ("rich", "personal"):
         from world.relevance import calibrate_threshold
         from world.taste import fit_taste_model, ratings_from_user_states
 
         # Fitted on the pre-game ratings, before the simulation adds any.
         taste_model = fit_taste_model(ratings_from_user_states(user_states))
+        if taste == "personal":
+            # Hidden tastes count PERSONAL_HIDDEN_SCALE times as much: as much
+            # as the genre match (see world.taste).
+            from world.taste import PERSONAL_HIDDEN_SCALE
+            taste_model = taste_model.scaled(PERSONAL_HIDDEN_SCALE)
         calibrate_threshold(taste_model, [user_states[u] for u in sorted(user_states)],
                             [movie_objects[m] for m in sorted(movie_objects)])
     from world.dynamics import DYNAMICS_KEYS, EXPOSURE_KEYS, WorldDynamics

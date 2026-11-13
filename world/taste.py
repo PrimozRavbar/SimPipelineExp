@@ -28,6 +28,11 @@ TARGET_RELEVANT_SHARE of the catalog relevant (as in the genre world).
 import numpy as np
 
 GENRE_WEIGHT = 0.4
+# The "personal" world: hidden tastes (p . q) count 3x. Per user, relevance
+# then varies about as much with hidden taste (0.080) as with the genre match
+# (0.085) instead of 0.029, and a slate chosen by genre and quality alone holds
+# 82% relevant movies instead of 98% (oracle 100%).
+PERSONAL_HIDDEN_SCALE = 3.0
 TARGET_RELEVANT_SHARE = 0.10
 
 FACTORS = 16
@@ -51,6 +56,19 @@ class TasteModel:
         self.movie_bias = movie_bias
         self.genre_weight = genre_weight
         self.threshold = None          # set by calibrate()
+        # hidden_scale multiplies the hidden-taste term p . q (1 = the
+        # fitted model). The "personal" world uses a larger value so that
+        # tastes beyond genres matter more (see scaled()).
+        self.hidden_scale = 1.0
+
+    def scaled(self, hidden_scale):
+        """A copy whose hidden tastes count hidden_scale times as much
+        (shares the fitted arrays; its own threshold)."""
+        import copy
+        other = copy.copy(self)
+        other.hidden_scale = float(hidden_scale)
+        other.threshold = None
+        return other
 
     def score(self, user_id, movie_id):
         """Taste score in [0, 1] (0 for unknown users or movies)."""
@@ -58,7 +76,7 @@ class TasteModel:
         m = self.movie_index.get(movie_id)
         if u is None or m is None:
             return 0.0
-        rating = self.mu + self.movie_bias[m] + float(self.user_factors[u] @ self.movie_factors[m])
+        rating = self.mu + self.movie_bias[m] + self.hidden_scale * float(self.user_factors[u] @ self.movie_factors[m])
         return min(1.0, max(0.0, (rating - 1.0) / 4.0))
 
     def score_matrix(self, user_ids, movie_ids):
@@ -71,7 +89,7 @@ class TasteModel:
             P = self.user_factors[[u_idx[i] for i in known_u]]
             Q = self.movie_factors[[m_idx[j] for j in known_m]]
             b = self.movie_bias[[m_idx[j] for j in known_m]]
-            ratings = self.mu + b[None, :] + P @ Q.T
+            ratings = self.mu + b[None, :] + self.hidden_scale * (P @ Q.T)
             rows[np.ix_(known_u, known_m)] = np.clip((ratings - 1.0) / 4.0, 0.0, 1.0)
         return rows
 

@@ -14,7 +14,7 @@ def main(argv=None):
     parser.add_argument("--runs-dir", default="runs")
     parser.add_argument("--world", choices=["static", "dynamic"], default="static",
                         help="dynamic: taste drift, users joining, fatigue, no rewatching")
-    parser.add_argument("--taste", choices=["genre", "rich"], default="genre",
+    parser.add_argument("--taste", choices=["genre", "rich", "personal"], default="genre",
                         help="rich: tastes beyond genres (hidden factors and movie quality from the real ratings)")
     parser.add_argument("--preset", choices=["best", "plain"], default="best",
                         help="best: the measured best setup (default); plain: every model feature off")

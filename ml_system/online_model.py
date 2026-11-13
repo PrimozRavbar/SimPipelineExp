@@ -130,6 +130,11 @@ class PreferenceModel:
         # as of when the slate was shown, with a learned weight kb.
         self.browse = {}
         self.browse_decay = 0.8
+        # Collaborative filtering: cf_fn(user, movies) -> scores from a CF
+        # model fitted at the last retrain (ml_system.cf_model). Rows carry
+        # the CF score as of when the slate was shown (that model had not
+        # seen the slate: no leak), with a learned weight kc. None = off.
+        self.cf_fn = None
         # Drift detector (per user): fast and slow moving averages of
         # whether a slate got a click; see drifting().
         self.ctr_fast, self.ctr_slow, self.slates_seen = {}, {}, {}
@@ -165,7 +170,7 @@ class PreferenceModel:
             "c": np.array([-3.0]), "pos": np.zeros(POSITIONS), "c2": np.array([0.0]), "kappa": np.array([1.0]),
             "b": np.zeros(self.num_movies), "y": np.zeros(DECADES),
             "w0": np.zeros(nG), "D": np.zeros((self.num_demo, nG)), "a": np.array([0.0]),
-            "W": np.zeros((num_users, nG)), "h": np.zeros(2), "kb": np.array([0.0]),
+            "W": np.zeros((num_users, nG)), "h": np.zeros(2), "kb": np.array([0.0]), "kc": np.array([0.0]),
             "q": rng.normal(0, 0.01, (self.num_movies, k)), "p": rng.normal(0, 0.01, (num_users, k)),
         }
 
@@ -201,6 +206,8 @@ class PreferenceModel:
             s = s + np.array([self.pair.get((user_id, int(m)), 0.0) for m in movies])
         if P["kb"][0] and user_id in self.browse:
             s = s + P["kb"][0] * (self.genres[movies] @ self._browse_share(user_id))
+        if P["kc"][0] and self.cf_fn is not None:
+            s = s + P["kc"][0] * np.asarray(self.cf_fn(user_id, movies), dtype=float)
         if self.optimism:
             s = s + self.optimism / np.sqrt(1.0 + self.impressions[movies] / 10.0)
         if self.genre_optimism:
@@ -241,6 +248,11 @@ class PreferenceModel:
 
     def _browse_match(self, user_id, movie_id):
         return float(self.genres[movie_id] @ self._browse_share(user_id)) if user_id in self.browse else 0.0
+
+    def _cf(self, user_id, movies):
+        if self.cf_fn is None:
+            return [0.0] * len(movies)
+        return [float(x) for x in self.cf_fn(user_id, list(movies))]
 
     def _history(self, user_id, movie_id):
         if not self.use_history:
@@ -293,7 +305,8 @@ class PreferenceModel:
         for (u, m), tick in sorted(self.open_clicks.items()):
             if before_tick is None or tick < before_tick:
                 del self.open_clicks[(u, m)]          # clicked, not watched
-                self._add_row((u, m, 0.3, 0.5 * self.grade_weight, 0.0, 0.0, self._browse_match(u, m)), grade=True)
+                self._add_row((u, m, 0.3, 0.5 * self.grade_weight, 0.0, 0.0, self._browse_match(u, m),
+                               self._cf(u, [m])[0]), grade=True)
 
     def observe_tick(self, events):
         """Apply a batch of events in canonical order (Flink and replays
@@ -309,8 +322,9 @@ class PreferenceModel:
         if name == "RecommendationShownEvent":
             # History as of the moment the slate is shown (its own click and
             # watch arrive later in the tick and must not leak into its rows).
-            history = [self._history(event.user_id, m) + (self._browse_match(event.user_id, m),)
-                       for m in event.movie_ids]
+            cf = self._cf(event.user_id, event.movie_ids)
+            history = [self._history(event.user_id, m) + (self._browse_match(event.user_id, m), cf[i])
+                       for i, m in enumerate(event.movie_ids)]
             self.pending[event.recommendation_id] = [event.timestamp, event.user_id, list(event.movie_ids), None, history]
         elif name == "RecommendationClickedEvent":
             slate = self.pending.get(event.recommendation_id)
@@ -321,12 +335,13 @@ class PreferenceModel:
             u, m = event.user_id, event.movie_id
             self.open_clicks.pop((u, m), None)
             grade = min(1.0, max(0.0, (event.completion - 0.1) / 0.85))
-            self._add_row((u, m, grade, self.grade_weight, 0.0, 0.0, self._browse_match(u, m)), grade=True)
+            self._add_row((u, m, grade, self.grade_weight, 0.0, 0.0, self._browse_match(u, m), self._cf(u, [m])[0]),
+                          grade=True)
             self.watched.add((u, m))
         elif name == "RatingEvent":
             u, m = event.user_id, event.movie_id
-            self._add_row((u, m, (event.rating - 1.0) / 4.0, self.grade_weight, 0.0, 0.0, self._browse_match(u, m)),
-                          grade=True)
+            self._add_row((u, m, (event.rating - 1.0) / 4.0, self.grade_weight, 0.0, 0.0, self._browse_match(u, m),
+                           self._cf(u, [m])[0]), grade=True)
         elif name == "BrowseEvent":
             if event.genre in self.genre_names:
                 vec = self.browse.setdefault(event.user_id, np.zeros(len(self.genre_names)))
@@ -342,10 +357,10 @@ class PreferenceModel:
 
     # -- online learning -----------------------------------------------------
 
-    def _row_score(self, u, m, shown, watched, browse=0.0):
+    def _row_score(self, u, m, shown, watched, browse=0.0, cf=0.0):
         P = self.params
         s = (P["b"][m] + P["y"][self.decade[m]] + self.genres[m] @ self._taste(u)
-             + P["h"][0] * shown + P["h"][1] * watched + P["kb"][0] * browse + self.pair.get((u, m), 0.0))
+             + P["h"][0] * shown + P["h"][1] * watched + P["kb"][0] * browse + P["kc"][0] * cf + self.pair.get((u, m), 0.0))
         if self.factors:
             s += P["q"][m] @ P["p"][u]
         return s
@@ -353,9 +368,9 @@ class PreferenceModel:
     def _pair_step(self, row):
         """Per-(user, movie) evidence, updated once per slate row as it
         arrives (never replayed: install() keeps the pairs)."""
-        u, m, position, target, weight, shown, watched, browse = row
+        u, m, position, target, weight, shown, watched, browse, cf = row
         P = self.params
-        z = P["c"][0] + P["pos"][min(position, POSITIONS - 1)] + self._row_score(u, m, shown, watched, browse)
+        z = P["c"][0] + P["pos"][min(position, POSITIONS - 1)] + self._row_score(u, m, shown, watched, browse, cf)
         err = weight * (1.0 / (1.0 + math.exp(-z)) - target)
         r = self.pair.get((u, m), 0.0)
         self.pair[(u, m)] = r - self.pair_lr * (err + self.pair_reg * r)
@@ -365,12 +380,12 @@ class PreferenceModel:
         parameters move online; shared ones change at the next fit."""
         P, lr = self.params, self.online_lr
         if grade:
-            u, m, target, weight, shown, watched, browse = row
-            z = P["c2"][0] + P["kappa"][0] * self._row_score(u, m, shown, watched, browse)
+            u, m, target, weight, shown, watched, browse, cf = row
+            z = P["c2"][0] + P["kappa"][0] * self._row_score(u, m, shown, watched, browse, cf)
             ds = weight * (1.0 / (1.0 + math.exp(-z)) - target) * P["kappa"][0]
         else:
-            u, m, position, target, weight, shown, watched, browse = row
-            z = P["c"][0] + P["pos"][min(position, POSITIONS - 1)] + self._row_score(u, m, shown, watched, browse)
+            u, m, position, target, weight, shown, watched, browse, cf = row
+            z = P["c"][0] + P["pos"][min(position, POSITIONS - 1)] + self._row_score(u, m, shown, watched, browse, cf)
             ds = weight * (1.0 / (1.0 + math.exp(-z)) - target)
         P["b"][m] -= lr * (ds + self.reg * P["b"][m])
         P["W"][u] -= lr * (ds * self.genres[m] + self.reg * P["W"][u])
@@ -384,11 +399,14 @@ class PreferenceModel:
 
     def snapshot(self):
         """A copy to fit in the background (the live one keeps learning)."""
-        propensities, self.propensities = self.propensities, None
+        # Live hooks (the explorer's propensity log, the CF scorer) are not
+        # part of the model: fitting uses the rows they already filled in.
+        propensities, cf_fn = self.propensities, self.cf_fn
+        self.propensities, self.cf_fn = None, None
         try:
             return copy.deepcopy(self)
         finally:
-            self.propensities = propensities
+            self.propensities, self.cf_fn = propensities, cf_fn
 
     def fit(self, epochs=None, learning_rate=0.05):
         """Refit every parameter on all logged rows, from scratch (seeded)."""
@@ -404,7 +422,7 @@ class PreferenceModel:
                 self._grow_users(row[0])
         nG, nU = len(self.genre_names), self.num_users
         rows = np.array(self.rows, dtype=float)
-        grades = np.array(self.grades, dtype=float).reshape(-1, 7)
+        grades = np.array(self.grades, dtype=float).reshape(-1, 8)
         onboarding = np.zeros((nU, nG))
         for u, vec in self.onboarding.items():
             onboarding[u] = vec
@@ -420,10 +438,10 @@ class PreferenceModel:
             P = {k: torch.tensor(v, dtype=torch.float32, requires_grad=True)
                  for k, v in self._initial_params(nU).items()}
 
-            def score(u, m, shown, watched, browse):
+            def score(u, m, shown, watched, browse, cf):
                 taste = P["w0"] + P["W"][u] + P["a"] * onb[u] + dem[u] @ P["D"]
                 s = (P["b"][m] + P["y"][dec[m]] + (gen[m] * taste).sum(-1)
-                     + P["h"][0] * shown + P["h"][1] * watched + P["kb"] * browse)
+                     + P["h"][0] * shown + P["h"][1] * watched + P["kb"] * browse + P["kc"] * cf)
                 if self.factors:
                     s = s + (P["p"][u] * P["q"][m]).sum(-1)
                 return s
@@ -431,8 +449,10 @@ class PreferenceModel:
             ru, rm = T(rows[:, 0], torch.long), T(rows[:, 1], torch.long)
             rp = T(np.minimum(rows[:, 2], POSITIONS - 1), torch.long)
             ry, rw, rs, rwa, rbm = T(rows[:, 3]), T(rows[:, 4]), T(rows[:, 5]), T(rows[:, 6]), T(rows[:, 7])
+            rcf = T(rows[:, 8])
             gu, gm = T(grades[:, 0], torch.long), T(grades[:, 1], torch.long)
             gy, gw, gs, gwa, gbm = T(grades[:, 2]), T(grades[:, 3]), T(grades[:, 4]), T(grades[:, 5]), T(grades[:, 6])
+            gcf = T(grades[:, 7])
             bce = torch.nn.functional.binary_cross_entropy_with_logits
             optimizer = torch.optim.Adam(P.values(), lr=learning_rate)
             if self.half_life:
@@ -443,10 +463,10 @@ class PreferenceModel:
             total = rw.sum()
             for _ in range(epochs):
                 optimizer.zero_grad()
-                z = P["c"] + P["pos"][rp] + score(ru, rm, rs, rwa, rbm)
+                z = P["c"] + P["pos"][rp] + score(ru, rm, rs, rwa, rbm, rcf)
                 loss = (bce(z, ry, reduction="none") * rw).sum() / total
                 if len(grades):
-                    zg = P["c2"] + P["kappa"] * score(gu, gm, gs, gwa, gbm)
+                    zg = P["c2"] + P["kappa"] * score(gu, gm, gs, gwa, gbm, gcf)
                     loss = loss + (bce(zg, gy, reduction="none") * gw).sum() / total
                 loss = loss + self.reg * (P["W"].pow(2).sum() + P["b"].pow(2).sum() + P["D"].pow(2).sum()
                                           + P["p"].pow(2).sum() + P["q"].pow(2).sum()) / 100.0
@@ -461,10 +481,10 @@ class PreferenceModel:
                 fixed = {k: v.detach() for k, v in P.items()}
                 W = anchor.clone().requires_grad_(True)
 
-                def score2(u, m, shown, watched, browse):
+                def score2(u, m, shown, watched, browse, cf):
                     taste = fixed["w0"] + W[u] + fixed["a"] * onb[u] + dem[u] @ fixed["D"]
                     s2 = (fixed["b"][m] + fixed["y"][dec[m]] + (gen[m] * taste).sum(-1)
-                          + fixed["h"][0] * shown + fixed["h"][1] * watched + fixed["kb"] * browse)
+                          + fixed["h"][0] * shown + fixed["h"][1] * watched + fixed["kb"] * browse + fixed["kc"] * cf)
                     if self.factors:
                         s2 = s2 + (fixed["p"][u] * fixed["q"][m]).sum(-1)
                     return s2
@@ -473,10 +493,10 @@ class PreferenceModel:
                 total2 = rw2.sum()
                 for _ in range(max(1, epochs // 2)):
                     optimizer2.zero_grad()
-                    z = fixed["c"] + fixed["pos"][rp] + score2(ru, rm, rs, rwa, rbm)
+                    z = fixed["c"] + fixed["pos"][rp] + score2(ru, rm, rs, rwa, rbm, rcf)
                     loss2 = (bce(z, ry, reduction="none") * rw2).sum() / total2
                     if len(grades):
-                        zg = fixed["c2"] + fixed["kappa"] * score2(gu, gm, gs, gwa, gbm)
+                        zg = fixed["c2"] + fixed["kappa"] * score2(gu, gm, gs, gwa, gbm, gcf)
                         loss2 = loss2 + (bce(zg, gy, reduction="none") * gw2).sum() / total2
                     loss2 = loss2 + self.reg * (W - anchor).pow(2).sum() / 100.0
                     loss2.backward()
@@ -513,7 +533,7 @@ class PreferenceModel:
                 "position_bias": [round(float(x), 2) for x in P["pos"][:10]],
                 "onboarding_weight": round(float(P["a"][0]), 3),
                 "history_weights": [round(float(x), 3) for x in P["h"]],
-                "browse_weight": round(float(P["kb"][0]), 3)}
+                "browse_weight": round(float(P["kb"][0]), 3), "cf_weight": round(float(P["kc"][0]), 3)}
 
 
 # -- serving -----------------------------------------------------------------
