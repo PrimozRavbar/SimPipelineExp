@@ -174,3 +174,28 @@ def test_v6_ranker_learns_from_logged_preference_scores():
     tick, user, movie = next(iter(s.preference_log))
     assert tick > 50                                 # first fit deployed at the tick-50 boundary
     s.close()
+
+
+def test_rollback_to_v0_also_rolls_back_the_preference_model():
+    # Regression: rolling back to v0 swapped the towers, but the live
+    # preference model kept its fit, kept ranking and kept adding its own
+    # candidates, so CTR barely moved.
+    from console.session import SimSession
+    from simulation.events import RetrievalRequest
+
+    s = SimSession(preset="plain", seed=3, users_per_tick=3, log_metrics=False,
+                   settings={"deploy_delay": 10, "epochs": 1, "spark_every": 0, "preference_model": True})
+    s.step(30)
+    s.submit("retrain")
+    s.step(12)
+    assert s.flink.preferences.fits == 1
+    s.submit("rollback")
+    s.step(1)
+    assert s.serving_version == 0 and s.flink.preferences.fits == 0
+    user = next(iter(s.system["world"].user_objects.values()))
+    assert s.preference_source.retrieve(RetrievalRequest(user_id=user.user_id, k=10)) == []
+    assert s.model_server.ranker.rank(user, [1, 2, 3]) == [1, 2, 3]       # v0 has no ranker
+    s.submit("rollback")                                                  # back to v1: its fit returns
+    s.step(1)
+    assert s.serving_version == 1 and s.flink.preferences.fits == 1
+    s.close()

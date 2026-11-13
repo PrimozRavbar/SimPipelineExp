@@ -369,6 +369,13 @@ class PreferenceModel:
         self.fits += 1
         return self
 
+    def unfit(self):
+        """Back to the never-fitted state (a rollback to a version that had
+        no fitted preference model, e.g. the bootstrap v0). The evidence log
+        is kept, so a later install() or fit() still has every row."""
+        self.params = self._initial_params(self.num_users)
+        self.fits, self.fit_loss, self.fitted_rows = 0, None, 0
+
     def install(self, fitted):
         """Swap in the parameters of a model fitted on a snapshot of this one,
         then replay the rows logged since that snapshot as online steps."""

@@ -1021,8 +1021,14 @@ class SimSession:
         model = self.versions[version]
         self.retriever.user_tower = model.user_tower
         self.retriever.item_tower = model.item_tower
-        if model.preferences is not None and self.flink.preferences is not None:
-            self.flink.preferences.install(model.preferences)
+        if self.flink.preferences is not None:
+            # The preference model is part of a version: deploying (or rolling
+            # back to) a version restores its fitted copy, or the unfitted
+            # state for a version that never had one (v0).
+            if model.preferences is not None:
+                self.flink.preferences.install(model.preferences)
+            else:
+                self.flink.preferences.unfit()
         self.model_server.ranker = self._serving_ranker(model)
         if rebuild_index:
             self.retriever.ann_index = model.index
