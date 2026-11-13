@@ -1,4 +1,4 @@
-"""python -m console [--port 8000] [--seed 42] [--users-per-tick 10] [--world static|dynamic]"""
+"""python -m console [--port 8000] [--seed 42] [--users-per-tick 20] [--world static|dynamic]"""
 
 import argparse
 
@@ -10,7 +10,7 @@ def main(argv=None):
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--users-per-tick", type=int, default=10)
+    parser.add_argument("--users-per-tick", type=int, default=20)
     parser.add_argument("--runs-dir", default="runs")
     parser.add_argument("--world", choices=["static", "dynamic"], default="static",
                         help="dynamic: taste drift, users joining, fatigue, no rewatching")

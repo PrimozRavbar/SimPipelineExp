@@ -23,6 +23,8 @@ from ml_system.two_tower import (
     DEFAULT_ITEM_TOWER_KWARGS,
 )
 from ml_system.offline_feature_store import OfflineFeatureStore
+from ml_system.feast import Feast
+from ml_system.kserve import KServe
 from ml_system.offline_pipeline import (
     OfflinePipeline,
     OfflineFeaturePipeline,
@@ -187,6 +189,17 @@ def build_recommendation_system(
     sim.register(datalake)
     sim.register(model_server)
 
+    # Feast (serving reads features through it; training reads the offline
+    # store point in time) and KServe (replicas in front of the model
+    # server). Both are pass-throughs with their default settings.
+    feast = Feast(redis, feature_store)
+    sim.register(feast)
+    retriever.feature_store = feast
+    kserve = KServe(model_server)
+    sim.register(kserve)
+    from ml_system.fallback import PopularityRetrieval
+    model_server.overflow_fallback = PopularityRetrieval(redis, movie_objects)
+
     ctr_tracker = CTRTracker()
     sim.register(ctr_tracker)
 
@@ -276,6 +289,8 @@ def build_recommendation_system(
         "model_server": model_server,
         "offline_pipeline": offline_pipeline,
         "feature_store": feature_store,
+        "feast": feast,
+        "kserve": kserve,
         "spark": sim.get_service("Spark"),
         "ctr_tracker": ctr_tracker,
         "world_dynamics": dynamics,

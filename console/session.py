@@ -37,6 +37,10 @@ from ml_system.experiments import Experiment
 from ml_system.ranking import (ExplorationReranker, LogisticRanker, MLPRanker, MMRReranker,
                                RerankerChain, WatchedFilter)
 from ml_system.model_registry import export_bundle
+from ml_system.ann_indexes import INDEX_TYPES, index_embeddings, index_kind, make_index, vectors_per_query
+from ml_system.feast import MODES as FEAST_MODES
+from ml_system.redis import EVICTION_POLICIES
+from console.economy import ONE_OFF, PRICES, Economy
 from ml_system.online_model import PreferenceModel, PreferenceRanker, PreferenceRetrieval
 from ml_system.training import TwoTowerTrainer
 from ml_system.two_tower import USER_FEATURE_DEFAULTS, SimpleItemTower, SimpleUserTower, TwoTowerRetrieval
@@ -121,10 +125,29 @@ DEFAULT_SETTINGS = {
     "chaos_every": 0,          # a hidden random fault about every N ticks (0 = off)
     "spark_throughput": 0,     # events a Spark job processes per tick (0 = instant)
     "freshness_alert": 400,    # incident when offline features are older than this (ticks)
+    # Infrastructure (defaults = the original behaviour: nothing limited)
+    "kafka_partitions": 3,
+    "kafka_replication": 1,    # copies of each partition (a broker outage stalls unreplicated ones)
+    "kafka_brokers": 3,
+    "kafka_retention_ticks": 0,   # delete messages older than this (0 = keep forever)
+    "flink_parallelism": 1,    # task slots (changing it = savepoint + restart, 2 ticks)
+    "flink_slot_capacity": 0,  # events one slot processes per tick (0 = unlimited)
+    "redis_max_keys": 0,       # memory limit in keys (0 = unlimited)
+    "redis_eviction": "allkeys-lru",
+    "redis_ttl_ticks": 0,      # user features expire this long after their last update (0 = never)
+    "feast_mode": "direct",    # "materialized": serve batch features from the online copy
+    "feast_materialize_every": 100,
+    "kserve_min_replicas": 1,
+    "kserve_max_replicas": 1,
+    "kserve_replica_capacity": 0,  # requests per replica per tick (0 = unlimited)
+    "kserve_target_pct": 70,   # autoscaler target utilisation
+    "kserve_cold_start_ticks": 3,
+    "ann_nprobe": 4,           # IVF index: cells searched per query
     # World (simulated users)
     "taste_drift_every": 0,    # every N ticks some users' taste drifts (0 = off)
     "taste_drift_share_pct": 5,
     "fatigue_pct": 0,          # click probability lost per repeat impression
+    "fatigue_recovery_ticks": 0,  # fatigue halves every N ticks since the last impression (0 = never)
     "rewatch_pct": 100,        # click probability kept for an already-watched movie
     "users_joining_per_100_ticks": 0,
 }
@@ -178,6 +201,22 @@ SETTING_LIMITS = {
     "taste_drift_every": (0, 100000),
     "taste_drift_share_pct": (1, 100),
     "fatigue_pct": (0, 90),
+    "fatigue_recovery_ticks": (0, 100000),
+    "kafka_partitions": (1, 64),
+    "kafka_replication": (1, 5),
+    "kafka_brokers": (1, 9),
+    "kafka_retention_ticks": (0, 100000),
+    "flink_parallelism": (1, 64),
+    "flink_slot_capacity": (0, 1000000),
+    "redis_max_keys": (0, 10000000),
+    "redis_ttl_ticks": (0, 100000),
+    "feast_materialize_every": (0, 100000),
+    "kserve_min_replicas": (0, 50),
+    "kserve_max_replicas": (1, 50),
+    "kserve_replica_capacity": (0, 100000),
+    "kserve_target_pct": (10, 100),
+    "kserve_cold_start_ticks": (0, 1000),
+    "ann_nprobe": (1, 256),
     "rewatch_pct": (0, 100),
     "users_joining_per_100_ticks": (0, 10000),
 }
@@ -188,6 +227,13 @@ BOOL_SETTINGS = {"rebuild_index", "ranker", "ranker_mlp", "filter_watched", "eva
                  "tower_shared_ids", "ranker_tower_score", "preference_model",
                  "preference_history", "ranker_preference_score"}
 
+# Settings that take one of a few strings.
+CHOICE_SETTINGS = {"redis_eviction": EVICTION_POLICIES, "feast_mode": FEAST_MODES}
+
+# User features that expire with redis_ttl_ticks.
+TTL_FEATURES = ("genre_preferences", "activity_level", "interactions", "average_rating",
+                "recent_watches", "recent_slates", "genre_engagement", "profile_strength")
+
 WORLDS = ("static", "dynamic")
 
 # Settings that the dynamic world preset starts from.
@@ -195,6 +241,7 @@ DYNAMIC_SETTINGS = {
     "taste_drift_every": DYNAMIC_WORLD["taste_drift_every"],
     "taste_drift_share_pct": round(DYNAMIC_WORLD["taste_drift_share"] * 100),
     "fatigue_pct": round(DYNAMIC_WORLD["fatigue"] * 100),
+    "fatigue_recovery_ticks": DYNAMIC_WORLD["fatigue_recovery"],
     "rewatch_pct": round(DYNAMIC_WORLD["rewatch"] * 100),
     "users_joining_per_100_ticks": round(DYNAMIC_WORLD["users_joining_per_tick"] * 100),
 }
@@ -210,6 +257,21 @@ CHAOS_DURATIONS = {
 }
 
 RUNBOOKS = {
+    "budget": [
+        "Open Pipeline > Costs: the bill per component per tick is listed.",
+        "Cut what you do not need: KServe replicas, Flink slots, Kafka brokers, or swap to a cheaper ANN index.",
+        "Clicks earn money: a better model pays for its infrastructure.",
+    ],
+    "kafka_partitions": [
+        "A broker is down and some partitions have no other replica.",
+        "Restart the broker (Repair: restart Kafka broker), or wait for it to come back.",
+        "Prevent it: replication factor 2 or more keeps partitions online when one broker fails.",
+    ],
+    "serving_capacity": [
+        "More requests than KServe replicas can take: the rest get the popularity fallback.",
+        "Raise max replicas (the autoscaler adds them after a cold start) or the capacity per replica.",
+        "Traffic spikes need headroom: a lower target utilisation scales up earlier.",
+    ],
     "ctr_drop": [
         "Check whether the drop lines up with a deploy (Monitoring, CTR chart). If it does, roll back first.",
         "Otherwise check the health tiles on Monitoring: Flink lag, fallback share, index self-test, feature skew.",
@@ -300,7 +362,7 @@ class SimSession:
     def __init__(
         self,
         seed=42,
-        users_per_tick=10,
+        users_per_tick=20,
         settings=None,
         data=None,
         log_metrics=True,
@@ -446,6 +508,13 @@ class SimSession:
         self.preference_log = {}         # (tick, user, movie) -> preference model score at serving
         self.model_server.score_logger = self._log_scores
         self.drift_reference = None      # genre mix of clicks just after the last deploy
+        # Infrastructure and money.
+        self.economy = Economy()
+        self.index_kind = "hnsw"         # ANN index type new models are built with
+        self.feast = self.system["feast"]
+        self.kserve = self.system["kserve"]
+        self._infra_applied = False
+        self._materializations_billed = 0
         self._apply_live_settings()
 
         self._log("system", "Simulation built: seed %d, %d users per tick." % (seed, users_per_tick))
@@ -554,6 +623,7 @@ class SimSession:
         self.sim.tick()
         self.fallback_ticks[self.tick] = (self.model_server.requests - before[0],
                                           self.model_server.fallback_requests - before[1])
+        self._account()
         self._check_alert()
         if self.canary is not None:
             self._canary_tick()
@@ -603,7 +673,10 @@ class SimSession:
     # ------------------------------------------------------------------
 
     ACTIONS = ("retrain", "rollback", "spark", "settings", "fault",
-               "promote_canary", "abort_canary", "export") + tuple(FIXES)
+               "promote_canary", "abort_canary", "export", "swap") + tuple(FIXES)
+
+    # Components that can be swapped for another that does the same job.
+    SWAPPABLE = {"ann_index": INDEX_TYPES}
 
     def submit(self, name, **params):
         """Queue an action for the next tick boundary. Returns its record;
@@ -614,6 +687,12 @@ class SimSession:
             self._check_settings(params)
         if name == "fault" and params.get("kind") not in FAULT_KINDS:
             raise ActionError("fault kind must be one of %s" % sorted(FAULT_KINDS))
+        if name == "swap":
+            options = self.SWAPPABLE.get(params.get("component"))
+            if options is None:
+                raise ActionError("component must be one of %s" % sorted(self.SWAPPABLE))
+            if params.get("to") not in options:
+                raise ActionError("%s must be one of %s" % (params.get("component"), sorted(options)))
         with self.lock:
             action = {
                 "id": self._next_action_id,
@@ -645,6 +724,8 @@ class SimSession:
             return self._end_canary(promote=True, by="you")
         if name == "abort_canary":
             return self._end_canary(promote=False, by="you")
+        if name == "swap":
+            return self._swap(params["component"], params["to"])
         raise ActionError("unknown action %r" % name)
 
     # Settings ----------------------------------------------------------
@@ -657,6 +738,10 @@ class SimSession:
                 if not isinstance(value, bool):
                     raise ActionError("%s must be true or false" % key)
                 continue
+            if key in CHOICE_SETTINGS:
+                if value not in CHOICE_SETTINGS[key]:
+                    raise ActionError("%s must be one of %s" % (key, ", ".join(CHOICE_SETTINGS[key])))
+                continue
             if isinstance(value, bool) or not isinstance(value, (int, float)) or int(value) != value:
                 raise ActionError("%s must be a whole number" % key)
             low, high = SETTING_LIMITS[key]
@@ -667,12 +752,18 @@ class SimSession:
         cands = values.get("num_candidates", self.settings["num_candidates"] if hasattr(self, "settings") else 100)
         if slate > cands:
             raise ActionError("slate size cannot exceed retrieved candidates")
+        current = self.settings if hasattr(self, "settings") else DEFAULT_SETTINGS
+        merged = {**current, **values}
+        if merged["kafka_replication"] > merged["kafka_brokers"]:
+            raise ActionError("Kafka replication cannot exceed the number of brokers")
+        if merged["kserve_min_replicas"] > merged["kserve_max_replicas"]:
+            raise ActionError("KServe min replicas cannot exceed max replicas")
 
     def _apply_settings(self, values):
         self._check_settings(values)
         changed = {k: v for k, v in values.items() if self.settings[k] != v}
         for key, value in changed.items():
-            self.settings[key] = int(value) if key not in BOOL_SETTINGS else value
+            self.settings[key] = value if key in BOOL_SETTINGS or key in CHOICE_SETTINGS else int(value)
         self._apply_live_settings()
         if changed:
             text = ", ".join("%s=%s" % (k, v) for k, v in sorted(changed.items()))
@@ -775,6 +866,8 @@ class SimSession:
             "train_from_scratch": self.settings["train_from_scratch"],
             "ranker_rows": None,
             "preferences": None,
+            "index_kind": self.index_kind,
+            "ann_nprobe": self.settings["ann_nprobe"],
             "eval_gate": self.settings["eval_gate"],
             "holdout_pct": self.settings["holdout_pct"],
             "gate_tolerance_pct": self.settings["gate_tolerance_pct"],
@@ -903,7 +996,8 @@ class SimSession:
                 movie_id: item_tower.embed(features)
                 for movie_id, features in items.item_features.items()
             }
-            index = HNSWIndex(seed=self.seed * 1000 + record["version"])
+            index = make_index(record["index_kind"], seed=self.seed * 1000 + record["version"],
+                               nprobe=record["ann_nprobe"])
             index.build(embeddings)
 
             ranker = None
@@ -912,7 +1006,7 @@ class SimSession:
                     rows, positions, labels, *rest = record["ranker_rows"]
                     record["ranker_rows"] = None
                     ranker = MLPRanker(self.retriever.user_features, self.system["redis"],
-                                       self.system["feature_store"], self._genres_of,
+                                       self.feast, self._genres_of,
                                        seed=self.seed * 1000 + record["version"],
                                        feature_set=record["ranker_features"],
                                        multitask=record["ranker_multitask"])
@@ -925,7 +1019,7 @@ class SimSession:
                 elif record["ranker_rows"] is not None:
                     rows, labels = record["ranker_rows"]
                     record["ranker_rows"] = None
-                    ranker = LogisticRanker(self.retriever.user_features, self.system["feature_store"])
+                    ranker = LogisticRanker(self.retriever.user_features, self.feast)
                     ranker.fit(rows, labels)
 
             except ValueError as error:
@@ -1087,7 +1181,7 @@ class SimSession:
         retriever = TwoTowerRetrieval(
             model.user_tower, model.item_tower,
             model.index if rebuild_index else self.retriever.ann_index,
-            self.system["redis"], self.system["feature_store"],
+            self.system["redis"], self.feast,
         )
         experiment = Experiment(self.serving_version, version, s["canary_share"],
                                 self.tick + 1, self.tick + s["canary_ticks"], salt=version)
@@ -1269,7 +1363,7 @@ class SimSession:
             self.flink.track_recent = True     # recent history for the MLP ranker / user tower (stays on)
         if getattr(self, "profile_source", None) is None:
             # Second candidate source: content-based, from the genre profile.
-            self.profile_source = ProfileRetrieval(self.retriever.user_features, self.system["feature_store"],
+            self.profile_source = ProfileRetrieval(self.retriever.user_features, self.feast,
                                                    self.system["world"].movie_objects)
         if getattr(self, "cowatch_source", None) is None:
             self.cowatch_source = CoWatchRetrieval(self.system["redis"])
@@ -1290,11 +1384,13 @@ class SimSession:
         if s["onboarding"]:
             self.flink.track_onboarding = True    # stays on once switched on
         self.flink.max_events_per_tick = s["flink_capacity"] or None
+        self._apply_infra_settings()
         d = self.dynamics
         d.taste_drift_every = s["taste_drift_every"]
         d.taste_drift_share = s["taste_drift_share_pct"] / 100.0
         d.users_joining_per_tick = s["users_joining_per_100_ticks"] / 100.0
         self.simulator.fatigue = s["fatigue_pct"] / 100.0
+        self.simulator.fatigue_recovery = s["fatigue_recovery_ticks"]
         self.simulator.rewatch = s["rewatch_pct"] / 100.0
         if s["chaos_every"] and self.next_chaos_tick is None:
             self.next_chaos_tick = self.tick + self._chaos_gap()
@@ -1311,6 +1407,99 @@ class SimSession:
         if self.settings["preference_model"] and self.flink.preferences is not None:
             return PreferenceRanker(lambda: self.flink.preferences, fallback=own)
         return own
+
+    def _apply_infra_settings(self):
+        """Kafka, Flink, Redis, Feast, KServe and the ANN index, from the
+        settings. Changes after the start that need work in a real system
+        cost money once (ONE_OFF) and some take time (a Flink rescale)."""
+        s, now = self.settings, self.tick
+        first = not self._infra_applied
+        kafka = self.kafka
+        if not first and s["kafka_partitions"] != kafka.partitions:
+            self.economy.charge(now, ONE_OFF["kafka_repartition"], "Kafka repartition to %d" % s["kafka_partitions"])
+        kafka.partitions = s["kafka_partitions"]
+        kafka.brokers = s["kafka_brokers"]
+        kafka.replication_factor = s["kafka_replication"]
+        kafka.retention_ticks = s["kafka_retention_ticks"]
+
+        flink = self.flink
+        flink.slot_capacity = s["flink_slot_capacity"]
+        if first:
+            flink.parallelism = s["flink_parallelism"]
+        elif s["flink_parallelism"] != flink.parallelism:
+            self.economy.charge(now, ONE_OFF["flink_rescale"], "Flink rescale to %d" % s["flink_parallelism"])
+            flink.rescale(s["flink_parallelism"], now)
+            self._log("config", "Flink rescaling to parallelism %d: savepoint + restart, back at tick %d."
+                      % (s["flink_parallelism"], flink.restoring_until), cls="s-warn")
+
+        redis = self.system["redis"]
+        redis.max_keys = s["redis_max_keys"]
+        redis.eviction = s["redis_eviction"]
+        redis.ttl_ticks = {f: s["redis_ttl_ticks"] for f in TTL_FEATURES} if s["redis_ttl_ticks"] else {}
+        redis.enforce()
+
+        self.feast.mode = s["feast_mode"]
+        self.feast.materialize_every = s["feast_materialize_every"]
+
+        k = self.kserve
+        k.min_replicas, k.max_replicas = s["kserve_min_replicas"], s["kserve_max_replicas"]
+        k.replica_capacity = s["kserve_replica_capacity"]
+        k.target_utilization = s["kserve_target_pct"] / 100.0
+        k.cold_start_ticks = s["kserve_cold_start_ticks"]
+        if first:
+            k.ready = k.min_replicas
+        k.ready = max(min(k.ready, k.max_replicas), 0)
+
+        for model in self.versions.values():
+            base = model.index
+            while hasattr(base, "inner"):
+                base = base.inner
+            if hasattr(base, "nprobe"):
+                base.nprobe = s["ann_nprobe"]
+        self._infra_applied = True
+
+    def _swap(self, component, to):
+        """Swap a component for another that does the same job (now: the ANN
+        index). Costs money once; the serving model's index is rebuilt with
+        the new type from its own movie vectors, and new models use it."""
+        if component != "ann_index":
+            raise ActionError("only the ANN index can be swapped so far")
+        if to == self.index_kind:
+            raise ActionError("the ANN index is already %s" % INDEX_TYPES[to]["name"])
+        cost = ONE_OFF["swap_ann_index"]
+        if self.economy.cash < cost:
+            raise ActionError("not enough cash for the migration ($%.0f)" % cost)
+        model = self.versions[self.serving_version]
+        started = time.monotonic()
+        index = make_index(to, seed=self.seed * 1000 + model.version, nprobe=self.settings["ann_nprobe"])
+        index.build(index_embeddings(model.index))
+        seconds = time.monotonic() - started
+        previous = self.index_kind
+        self.economy.charge(self.tick, cost, "Swap ANN index %s -> %s" % (previous, to))
+        model.index = index
+        self.retriever.ann_index = index
+        self.index_version = model.version
+        self.golden.pop(model.version, None)        # new golden queries for the new index
+        self.faults.fix("rebuild_index", self.tick)
+        self.index_kind = to
+        self._log("deploy", "ANN index swapped: %s -> %s (rebuilt for v%d in %.1f s, $%.0f). New models use %s."
+                  % (INDEX_TYPES[previous]["name"], INDEX_TYPES[to]["name"], model.version, seconds, cost,
+                     INDEX_TYPES[to]["name"]), cls="s-accent")
+        if self.logger is not None:
+            self.logger.log_event("swap", self.tick, component=component, to=to, previous=previous, cost=cost)
+        return "ANN index is now %s" % INDEX_TYPES[to]["name"]
+
+    def _account(self):
+        """Money for the tick just run: revenue from its clicks, running
+        costs of the current configuration, Feast materialization runs."""
+        now = self.tick
+        clicks = self.tracker.counts.get(now, (0, 0))[1]
+        breakdown = self.economy.running_costs(self.system, self.settings, self.index_kind)
+        runs = self.feast.materializations - self._materializations_billed
+        if runs:
+            breakdown["Feast"] += runs * PRICES["feast_materialization"]
+            self._materializations_billed = self.feast.materializations
+        self.economy.tick(now, clicks, breakdown)
 
     def _chaos_gap(self):
         every = self.settings["chaos_every"]
@@ -1347,8 +1536,11 @@ class SimSession:
             self.flink.paused = False
         if action == "restart_model_server":
             self.model_server.retriever_down = False
+        if action == "restart_kafka_broker":
+            self.kafka.broker_up()
         label = {"restart_flink": "Flink restarted", "rebuild_index": "ANN index rebuilt with v%d embeddings"
-                 % self.serving_version, "restart_model_server": "Model server restarted"}[action]
+                 % self.serving_version, "restart_model_server": "Model server restarted",
+                 "restart_kafka_broker": "Kafka broker restarted"}[action]
         self._log("ops", "%s by you." % label, cls="s-accent")
         if self.logger is not None:
             self.logger.log_event("repair", self.tick, action=action, faults_ended=[f.id for f in ended])
@@ -1397,6 +1589,24 @@ class SimSession:
                    "SEV2", "Model server serving popularity fallback",
                    "%.0f%% of requests in the last 10 ticks were served by the fallback, not the model."
                    % (h["fallback_share"] * 100))
+
+        cash = self.economy.cash
+        self._rule("budget", cash < 0, cash >= 0, "SEV2", "Over budget: cash $%.0f" % cash,
+                   "Running costs and one-off charges exceed what clicks have earned. Cut infrastructure "
+                   "(replicas, slots, brokers, a cheaper index) or improve CTR.")
+        kafka_down = self.kafka.unavailable_partitions()
+        self._rule("kafka_partitions", bool(kafka_down), not kafka_down, "SEV2",
+                   "Kafka partitions offline: %s" % kafka_down,
+                   "Partitions %s have no live replica: consumers (Flink, metrics) stop at them and lag "
+                   "builds up." % kafka_down)
+        k = self.kserve
+        recent = k.last["requests"]
+        share = k.last["overflow"] / recent if recent else 0.0
+        h["serving_overflow"] = share
+        self._rule("serving_capacity", share > 0.1, share == 0, "WARN",
+                   "Model serving over capacity: %.0f%% overflow" % (share * 100),
+                   "%.0f%% of last tick's requests found no free KServe replica and got the popularity "
+                   "fallback." % (share * 100))
 
         if now % 10 == 0:
             self._ctr_rule(now)
@@ -1650,6 +1860,10 @@ class SimSession:
                 },
                 "budget": {"used": self.budget_used, "total": BUDGET_TOTAL,
                            "retrain_cost": COST_RETRAIN, "spark_cost": COST_SPARK},
+                "money": {"cash": round(self.economy.cash, 2), "start_cash": self.economy.start_cash,
+                          "last_tick_revenue": self.economy.last_tick["revenue"],
+                          "last_tick_cost": self.economy.last_tick["cost"]},
+                "ann_index": self.index_kind,
                 "reference": self.reference,
                 "run_dir": str(self.system["run_dir"]) if self.system["run_dir"] else None,
                 "open_incidents": sum(1 for i in self.incidents if i["status"] == "Open"),
@@ -1771,8 +1985,34 @@ class SimSession:
                 "registry": {"versions": len(self.versions), "serving_version": self.serving_version},
                 "redis_skew": self.health["feature_skew"],
                 "world": {"kind": self.world_kind, **self.dynamics.summary()},
+                "infra": {
+                    "kafka": kafka.describe(),
+                    "flink": self.flink.describe(sim),
+                    "redis": redis.describe(),
+                    "feast": self.feast.describe(self.tick),
+                    "kserve": self.kserve.describe(),
+                    "ann_index": self._index_view(),
+                },
+                "money": self.economy.view(),
+                "swappable": {name: {kind: {"name": v["name"], "about": v["about"],
+                                            "price_per_tick": v["price_per_tick"]}
+                                     for kind, v in options.items()}
+                              for name, options in self.SWAPPABLE.items()},
                 "settings": dict(self.settings),
             }
+
+    def _index_view(self):
+        index = self.retriever.ann_index
+        kind = index_kind(index)
+        touched = vectors_per_query(index) if kind != "other" else None
+        return {"kind": self.index_kind, "serving_kind": kind,
+                "name": INDEX_TYPES.get(kind, {}).get("name", kind),
+                "items": len(getattr(index, "nodes", {}) or {}) if kind != "other" else None,
+                "vectors_per_query": touched,
+                # Simulated search time: 1 microsecond per vector touched.
+                "simulated_search_ms": None if touched is None else round(touched / 1000.0, 2),
+                "nprobe": self.settings["ann_nprobe"], "self_test": self.health["index_self_test"],
+                "swap_cost": ONE_OFF["swap_ann_index"]}
 
     def incidents_view(self):
         with self.lock:
