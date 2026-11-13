@@ -150,6 +150,7 @@ DEFAULT_SETTINGS = {
     "taste_drift_every": 0,    # every N ticks some users' taste drifts (0 = off)
     "taste_drift_share_pct": 5,
     "taste_drift_mode": "abrupt",  # "gradual": small steps towards a related genre (the dynamic world's default)
+    "browse_pct": 0,           # share of visits where the user first browses a genre (BrowseEvent)
     "fatigue_pct": 0,          # click probability lost per repeat impression
     "fatigue_recovery_ticks": 0,  # fatigue halves every N ticks since the last impression (0 = never)
     "rewatch_pct": 100,        # click probability kept for an already-watched movie
@@ -207,6 +208,7 @@ SETTING_LIMITS = {
     "freshness_alert": (10, 100000),
     "taste_drift_every": (0, 100000),
     "taste_drift_share_pct": (1, 100),
+    "browse_pct": (0, 100),
     "fatigue_pct": (0, 90),
     "fatigue_recovery_ticks": (0, 100000),
     "kafka_partitions": (1, 64),
@@ -1393,6 +1395,9 @@ class SimSession:
         self.flink.profile_mode = mode
         self.offline.feature_pipeline.profile_mode = mode
         self.system["world"].onboarding = {"genres": 3, "noise": 0.3} if s["onboarding"] else None
+        self.system["world"].browsing = {"rate": s["browse_pct"] / 100.0} if s["browse_pct"] else None
+        if s["browse_pct"]:
+            self.flink.track_browsing = True       # stays on once switched on
         if s["onboarding"]:
             self.flink.track_onboarding = True    # stays on once switched on
         self.flink.max_events_per_tick = s["flink_capacity"] or None

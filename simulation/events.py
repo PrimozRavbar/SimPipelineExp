@@ -39,6 +39,12 @@ class OnboardingEvent(Event):
     genres: list[str]
 
 @dataclass
+class BrowseEvent(Event):
+    """A user browsed or searched a genre (opt-in world feature): explicit
+    evidence of current taste, beyond the slates they were shown."""
+    genre: str
+
+@dataclass
 class Session:
     session_id: int
     user_id: int

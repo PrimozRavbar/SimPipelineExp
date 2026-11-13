@@ -86,6 +86,10 @@ class Flink(Service):
         self.profile_mode = "watches"
         self.track_onboarding = False
         self._onboarding_subscribed = False
+        # track_browsing: consume BrowseEvent (profiles in rich mode, the
+        # preference model).
+        self.track_browsing = False
+        self._browsing_subscribed = False
 
         # preferences: a live ml_system.online_model.PreferenceModel (set by
         # its owner; None = off). Learns online from every event Flink
@@ -131,6 +135,11 @@ class Flink(Service):
             # published this tick's slates before Flink runs.
             kafka.subscribe(self.consumer_name, "RecommendationShownEvent", from_tick=sim.clock.now)
             self.topics = self.topics + ["RecommendationShownEvent"]
+
+        if self.track_browsing and not self._browsing_subscribed:
+            kafka.subscribe(self.consumer_name, "BrowseEvent", from_tick=sim.clock.now)
+            self.topics = self.topics + ["BrowseEvent"]
+            self._browsing_subscribed = True
 
         if (self.track_onboarding or self.preferences is not None) and not self._onboarding_subscribed:
             kafka.subscribe(self.consumer_name, "OnboardingEvent")
@@ -184,6 +193,9 @@ class Flink(Service):
 
                 elif isinstance(event, RatingEvent):
                     self.handle_rating(sim, event)
+
+                elif type(event).__name__ == "BrowseEvent":
+                    self.update_profile(sim, event.user_id, "browse", [event.genre])
 
                 elif isinstance(event, OnboardingEvent) and self.track_onboarding:
                     self.update_profile(sim, event.user_id, "onboarding", event.genres)

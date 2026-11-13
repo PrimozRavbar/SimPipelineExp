@@ -54,6 +54,7 @@ def build_recommendation_system(
     run_id=None,
     world_dynamics=None,
     onboarding=None,
+    browsing=None,
     taste="genre"
 ):
     """Wire up World, streaming, serving and the offline retraining loop.
@@ -172,6 +173,8 @@ def build_recommendation_system(
         # Own RNG, derived from the seed directly (no draw from the shared
         # stream), so switching onboarding on never shifts other components.
         onboarding_rng=random.Random("onboarding-%s" % seed),
+        browsing=browsing,
+        browsing_rng=random.Random("browsing-%s" % seed),
         taste=taste_model
     )
 

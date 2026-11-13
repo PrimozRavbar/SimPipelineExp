@@ -114,3 +114,24 @@ def test_gradual_drift_moves_taste_in_steps_towards_a_related_genre():
     comedy = DRIFT_GENRES.index("Comedy")
     targets = {dynamics.related_target({"Comedy": 1.0}) for _ in range(200)}
     assert all(R[comedy][DRIFT_GENRES.index(g)] > 0 for g in targets)
+
+
+def test_browsing_emits_events_from_current_taste_and_profiles_count_them():
+    from ml_system.build_recommendation_system import build_recommendation_system
+    from world.external_data_loader import load_movielens
+
+    d = load_movielens()
+    system = build_recommendation_system(d["movie_objects"], d["user_objects"], d["user_states"], d["movie_states"],
+                                         seed=5, users_per_tick=5, log_metrics=False, browsing={"rate": 1.0})
+    flink = system["sim"].get_service("Flink")
+    flink.track_browsing = True
+    flink.profile_mode = "rich"
+    system["sim"].run(10, verbose=False)
+    browses = [e for e in system["datalake"].events if type(e).__name__ == "BrowseEvent"]
+    assert len(browses) == 50                                   # every visit browses at rate 1
+    world = system["world"]
+    from world.relevance import genre_share
+    assert all(genre_share(world.user_states[e.user_id]).get(e.genre, 0) > 0 for e in browses)
+    e = browses[-1]
+    profile = system["redis"].get("genre_preferences", e.user_id)
+    assert profile and profile.get(e.genre, 0) > 0

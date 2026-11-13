@@ -48,6 +48,7 @@ class ItemRatingFeatureComputer:
 PROFILE_MODES = ("watches", "rich")
 ONBOARDING_WEIGHT = 2.0      # each declared genre counts like two watches
 RICH_DECAY = 0.97            # rich mode: older signal fades with each new one
+BROWSE_WEIGHT = 0.5         # a browsed genre (rich profiles)
 RICH_CLICK_WEIGHT = 0.5
 
 
@@ -68,6 +69,14 @@ def update_genre_counts(counts, kind, genres, mode="watches", value=None):
     """
     if kind == "onboarding":
         weight = ONBOARDING_WEIGHT
+    elif kind == "browse":
+        # Browsing a genre: recent, explicit evidence (rich mode only; the
+        # original "watches" mode ignores it).
+        if mode != "rich":
+            return False
+        weight = BROWSE_WEIGHT
+        for genre in counts:
+            counts[genre] *= RICH_DECAY
     elif mode == "watches":
         if kind != "watch":
             return False
