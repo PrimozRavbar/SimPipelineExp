@@ -72,7 +72,7 @@ class PreferenceModel:
     def __init__(self, movie_objects, user_objects=None, factors=0, reg=0.01, seed=0,
                  online_lr=0.05, unclicked_weight=0.5, grade_weight=1.0, epochs=300,
                  history=False, demographics=False, pair_lr=0.3, pair_reg=0.05, shown_feature=False,
-                 half_life=0, optimism=0.0, taste_half_life=0):
+                 half_life=0, optimism=0.0, taste_half_life=0, genre_optimism=0.0):
         from world.external_data_loader import GENRE_NAMES
 
         self.genre_names = [g for g in GENRE_NAMES if g != "unknown"]
@@ -118,6 +118,13 @@ class PreferenceModel:
         # follow recent behaviour (drift), movie quality and everything
         # shared still learn from all the data. 0 = off.
         self.taste_half_life = taste_half_life
+        # genre_optimism: per-user exploration of genres. A user's taste for
+        # a genre can only be learned from slates that show it; a genre this
+        # user has rarely been shown gets a bonus that fades as it is shown
+        # (genre_optimism / sqrt(1 + impressions of that genre / 5), summed
+        # over the movie's genres). Deterministic. 0 = off.
+        self.genre_optimism = genre_optimism
+        self.user_genre_shown = {}      # user -> genre impressions (normalised genre vectors)
         self.pair = {}            # (user, movie) -> offset r(u, m), learned online only
         self.params = self._initial_params(self.num_users)
 
@@ -181,6 +188,10 @@ class PreferenceModel:
             s = s + np.array([self.pair.get((user_id, int(m)), 0.0) for m in movies])
         if self.optimism:
             s = s + self.optimism / np.sqrt(1.0 + self.impressions[movies] / 10.0)
+        if self.genre_optimism:
+            seen = self.user_genre_shown.get(user_id)
+            seen = np.zeros(len(self.genre_names)) if seen is None else seen
+            s = s + self.genre_optimism * (self.genres[movies] @ (1.0 / np.sqrt(1.0 + seen / 5.0)))
         return s
 
     def top(self, user_id, k):
@@ -214,9 +225,13 @@ class PreferenceModel:
             else:
                 target, weight = (1.0 if i == clicked else 0.0), 1.0
             self._add_row((user_id, movies[i], i, target, weight) + history[i])
+        seen = self.user_genre_shown.get(user_id)
+        if seen is None:
+            seen = self.user_genre_shown[user_id] = np.zeros(len(self.genre_names))
         for m in movies:
             self.shown[(user_id, m)] = self.shown.get((user_id, m), 0) + 1
             self.impressions[m] += 1
+            seen += self.genres[m]
 
     def flush(self, before_tick=None):
         """Learn from pending slates shown before `before_tick` (all if None)."""
