@@ -66,7 +66,7 @@ def _decade(release_date):
 
 class PreferenceModel:
 
-    ORDER = {"OnboardingEvent": 0, "BrowseEvent": 0.5, "RecommendationShownEvent": 1, "RecommendationClickedEvent": 2,
+    ORDER = {"OnboardingEvent": 0, "BrowseEvent": 0.5, "InterestEvent": 2.5, "RecommendationShownEvent": 1, "RecommendationClickedEvent": 2,
              "WatchEvent": 3, "RatingEvent": 4}
 
     def __init__(self, movie_objects, user_objects=None, factors=0, reg=0.01, seed=0,
@@ -135,6 +135,7 @@ class PreferenceModel:
         # the CF score as of when the slate was shown (that model had not
         # seen the slate: no leak), with a learned weight kc. None = off.
         self.cf_fn = None
+        self.interest_weight = 1.0      # weight of a save / dismissal row
         # Drift detector (per user): fast and slow moving averages of
         # whether a slate got a click; see drifting().
         self.ctr_fast, self.ctr_slow, self.slates_seen = {}, {}, {}
@@ -341,6 +342,12 @@ class PreferenceModel:
         elif name == "RatingEvent":
             u, m = event.user_id, event.movie_id
             self._add_row((u, m, (event.rating - 1.0) / 4.0, self.grade_weight, 0.0, 0.0, self._browse_match(u, m),
+                           self._cf(u, [m])[0]), grade=True)
+        elif name == "InterestEvent":
+            # Saved: interested (a high grade on the movie). Dismissed: not.
+            u, m = event.user_id, event.movie_id
+            target = 0.85 if event.kind == "save" else 0.0
+            self._add_row((u, m, target, self.interest_weight, 0.0, 0.0, self._browse_match(u, m),
                            self._cf(u, [m])[0]), grade=True)
         elif name == "BrowseEvent":
             if event.genre in self.genre_names:

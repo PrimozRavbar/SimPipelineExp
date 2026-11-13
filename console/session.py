@@ -166,6 +166,10 @@ DEFAULT_SETTINGS = {
     "taste_drift_share_pct": 5,
     "taste_drift_mode": "abrupt",  # "gradual": small steps towards a related genre (the dynamic world's default)
     "browse_pct": 30,          # share of visits where the user first browses a genre (BrowseEvent)
+    "rating_pct": 10,          # share of watched movies the user rates
+    "interest_save_pct": 0,    # an examined, unclicked relevant movie gets saved (x its relevance lift)
+    "interest_dismiss_pct": 0, # an examined irrelevant movie gets "not interested"
+    "session_slates": 1,       # slates per visit (the next row; later slates skip movies already shown)
     "fatigue_pct": 0,          # click probability lost per repeat impression
     "fatigue_recovery_ticks": 0,  # fatigue halves every N ticks since the last impression (0 = never)
     "rewatch_pct": 100,        # click probability kept for an already-watched movie
@@ -234,6 +238,10 @@ SETTING_LIMITS = {
     "taste_drift_every": (0, 100000),
     "taste_drift_share_pct": (1, 100),
     "browse_pct": (0, 100),
+    "rating_pct": (0, 100),
+    "interest_save_pct": (0, 100),
+    "interest_dismiss_pct": (0, 100),
+    "session_slates": (1, 5),
     "explore_slots": (0, 5),
     "explore_rate_pct": (0, 100),
     "explore_boost_pct": (0, 100),
@@ -1460,6 +1468,16 @@ class SimSession:
         self.offline.feature_pipeline.profile_mode = mode
         self.system["world"].onboarding = {"genres": 3, "noise": 0.3} if s["onboarding"] else None
         self.system["world"].browsing = {"rate": s["browse_pct"] / 100.0} if s["browse_pct"] else None
+        self.simulator.rating_probability = s["rating_pct"] / 100.0
+        if s["interest_save_pct"] or s["interest_dismiss_pct"]:
+            if self.simulator.interest_rng is None:
+                self.simulator.interest_rng = random.Random("interest-%d" % self.seed)
+            self.simulator.interest = {"save": s["interest_save_pct"] / 100.0,
+                                       "dismiss": s["interest_dismiss_pct"] / 100.0}
+            self.flink.track_interest = True       # stays on once switched on
+        else:
+            self.simulator.interest = None
+        self.system["world"].session_slates = s["session_slates"]
         if s["browse_pct"]:
             self.flink.track_browsing = True       # stays on once switched on
         if s["onboarding"]:
