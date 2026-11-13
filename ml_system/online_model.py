@@ -72,7 +72,7 @@ class PreferenceModel:
     def __init__(self, movie_objects, user_objects=None, factors=0, reg=0.01, seed=0,
                  online_lr=0.05, unclicked_weight=0.5, grade_weight=1.0, epochs=300,
                  history=False, demographics=False, pair_lr=0.3, pair_reg=0.05, shown_feature=False,
-                 half_life=0):
+                 half_life=0, optimism=0.0):
         from world.external_data_loader import GENRE_NAMES
 
         self.genre_names = [g for g in GENRE_NAMES if g != "unknown"]
@@ -107,6 +107,11 @@ class PreferenceModel:
         self.pair_lr, self.pair_reg = pair_lr, pair_reg
         self.shown_feature = shown_feature
         self.half_life = half_life      # fit(): a row's weight halves every half_life ticks (0 = all equal)
+        # optimism: when choosing (scores(), not training), a movie gets a
+        # bonus optimism / sqrt(1 + impressions / 10): rarely shown movies,
+        # whose quality is still uncertain, get tried (UCB-style
+        # exploration, deterministic); the bonus fades as evidence comes in.
+        self.optimism = optimism
         self.pair = {}            # (user, movie) -> offset r(u, m), learned online only
         self.params = self._initial_params(self.num_users)
 
@@ -168,6 +173,8 @@ class PreferenceModel:
             s = s + P["h"][1] * np.array([1.0 if (user_id, int(m)) in self.watched else 0.0 for m in movies])
         if self.pair:
             s = s + np.array([self.pair.get((user_id, int(m)), 0.0) for m in movies])
+        if self.optimism:
+            s = s + self.optimism / np.sqrt(1.0 + self.impressions[movies] / 10.0)
         return s
 
     def top(self, user_id, k):
