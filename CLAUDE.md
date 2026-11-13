@@ -238,7 +238,11 @@ main). New randomness uses its own string-seeded RNGs (`random.Random("world-dyn
 another component's random draws.
 
 - **Changing world** (`world/dynamics.py`, `UserSimulator(fatigue=, rewatch=)`): taste drift
-  (every N ticks a share of users moves part of its taste to one genre), users joining over
+  (every N ticks a share of users moves part of its taste to one genre; `taste_drift_mode`:
+  `"abrupt"`, the original, moves it at once to a random genre; `"gradual"`, the dynamic world's
+  default, starts a drift journey towards a genre related to the user's taste (catalog genre
+  co-occurrence x share, away from genres they already mostly like) and gets there in
+  `taste_drift_steps` (4) equal steps over the next N ticks, same total shift), users joining over
   time (`World.active_user_ids`, cold start), fatigue (each repeat impression of a movie
   multiplies its click probability by `1 - fatigue`), no rewatching (`rewatch` multiplier for
   movies watched in the simulation), fatigue wearing off (`fatigue_recovery=H`: a (user,
@@ -246,6 +250,40 @@ another component's random draws.
   uses 1000, console `fatigue_recovery_ticks`; 0 = never, the original). `expected_click_rate`
   applies the same factors.
   `reference_ctrs` is computed at build time and goes stale once tastes drift.
+- **Browsing** (`World(browsing={"rate": p})`, own RNG `"browsing-<seed>"`; console `browse_pct`,
+  30 by default in both worlds; the build default is off, so the golden fingerprint holds): on a
+  visit, with probability p, the user first browses a genre drawn from their *current* true
+  genre share (`BrowseEvent(genre)`, before the slate). Kafka topic and data lake like every
+  event. Rich profiles count it (`features.update_genre_counts` kind `"browse"`,
+  `BROWSE_WEIGHT` 0.5 with the rich decay; one definition for Flink `track_browsing` and Spark;
+  the original `"watches"` mode ignores it). The preference model keeps a per-user browse vector
+  (decay 0.8 per browse) and learns a weight `kb` on "browse match" (movie genres . recent
+  browsing share), taken when the slate is shown (it learns ~0.8).
+- **Targeted exploration** (`ml_system/exploration.py:SlotExplorer`, the last re-ranker; needs the
+  preference model): at `explore_rate_pct` of slates (`explore_boost_pct` for users
+  `PreferenceModel.drifting()` flags: recent click rate below half their long-run rate, or recent
+  browsing pointing away from their learned top-3 genres), up to `explore_slots` slots from
+  position 4 down get a well-rated movie (one of the 5 best by learned quality, at random) the
+  user has rarely been shown, from a genre chosen by Thompson sampling over the user's learned
+  taste and an uncertainty that shrinks with genre impressions (`explore_policy="thompson"`) or
+  towards under-shown genres (`"uniform"`); candidates come from the whole catalog, unlike
+  `ExplorationReranker`. Every shown movie's propensity goes to `SlotExplorer.propensities`
+  ((tick, user, movie)); with `explore_ips` the preference model weights rows by min(10, 1/p).
+  Own RNG `"explorer-<seed>"`; the stage report skips it. Pipeline shows the explored share,
+  their click rate and the users flagged as drifting.
+  Measured (rich, 20 users a tick, gradual drift, mean CTR over ticks 800-2000; one 400-tick
+  window is noisy, +-2-3 points): dynamic s42 gradual only 25.4, + browsing 30% 26.0, +
+  exploration only 24.6, + browsing 30% + exploration **26.3** (flattest: 26.9 / 26.2 / 25.9 /
+  26.1), + browsing 50% + exploration 26.7, stronger exploration (2 slots, 15%, 80% boosted)
+  25.6; s1 gradual only 26.2, + browsing + exploration 26.3. Abrupt drift (old) s42 25.0 mean,
+  19.5 at tick 2000 vs gradual 21.5. Static s42: no browsing 50.5, browsing 30% 50.0, + exploration
+  49.6 (nothing to find when tastes never move). So the best dynamic setup adds exploration
+  (`BEST_DYNAMIC_EXTRAS`, applied with `--world dynamic --preset best`) and the static one does
+  not. At tick 2000 (dynamic, browsing + exploration) drifted users' learned taste correlates 0.23
+  with the truth (0.15 before), the browse weight is 0.82, and the drift detector flags about
+  half the users (loose). Swapping in the true genre taste would still lift the catalog top 10
+  from 17.3% to 31.9%: with fatigue and no rewatching the system cannot re-serve known
+  favourites and needs much finer taste estimates to pick fresh movies.
 - **Pipeline infra:** `OfflineFeatureStore` binary-search point-in-time lookups and
   `clear_history()` (the offline pipeline clears before recomputing, so repeated Spark runs
   no longer stack duplicate snapshots); `Kafka.poll(max_records=)`, `Kafka.lag(consumer)`;
@@ -447,7 +485,9 @@ another component's random draws.
   model feature off, the original console): preference model with repeat effects, MLP ranker
   v6 (genre features, movie signals, logged retrieval and preference scores), preference
   candidates 50, profile candidates 30, co-watch candidates 30, rich profiles,
-  onboarding, logQ, diversity 15%. Chosen over the alternatives by CTR after the second
+  onboarding, logQ, diversity 15%; in the dynamic world also targeted exploration
+  (`BEST_DYNAMIC_EXTRAS`). The world defaults: 20 users a tick, browsing 30%, and in the dynamic
+  world gradual drift and fatigue recovery. Chosen over the alternatives by CTR after the second
   retrain (ticks 852-1200), averaged over static/dynamic and two seeds in the rich world:
   this setup 34.5% vs 33.6% (no retrieval score / diversity) and lower with the tower inputs
   (engagement + demographics + shared IDs: 36.0% static s1). Genre world s42: 49.6% static,

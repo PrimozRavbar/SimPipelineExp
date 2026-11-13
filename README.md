@@ -89,7 +89,7 @@ flowchart LR
 | **Model server** | candidates, slate size, extra candidate sources, rankers, diversity, exploration |
 | **Training** | schedule, epochs, negatives, popularity correction, graded positives, tower inputs |
 | **Registry** | canary rollouts and A/B tests with a significance test, an offline evaluation gate, roll back, export |
-| **World** | static or dynamic users: taste drift, fatigue that wears off, rewatching, new sign-ups |
+| **World** | static or dynamic users: gradual taste drift towards related genres, browsing, fatigue that wears off, rewatching, new sign-ups |
 
 ![Swap the ANN index, and the bill per component](docs/readme/ann_costs.png)
 
@@ -105,8 +105,11 @@ This isn't a toy model in a pretty UI. Under the hood:
 - an **MLP ranker** with position debiasing, movie signals from the logs (position-corrected
   click rates, co-watching) and **logged features** so it never trains on scores it couldn't
   have had at serving time;
-- re-rankers for **diversity** (MMR) and **exploration**, candidate sources for profiles,
-  co-watching and preferences, a feature store with **point-in-time** lookups.
+- re-rankers for **diversity** (MMR) and **targeted exploration**: Thompson sampling over each
+  user's uncertain genres, boosted for users whose behaviour suggests their taste moved, with
+  **propensity logging** and inverse-propensity training;
+- candidate sources for profiles, co-watching and preferences, **browsing signals** as explicit
+  evidence of current taste, and a feature store with **point-in-time** lookups.
 
 With the default setup, click-through climbs from 15% to about 50% by tick 1,200 and 56% by
 tick 4,000 in the static world. The best possible slate is 69%. How close can you get?

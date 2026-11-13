@@ -206,6 +206,9 @@ Builds each slate: retrieve candidates, rank them, re-rank, show the top.
 | Filter watched movies | off | Never show a movie the user already watched. |
 | Movie / genre exploration bonus | 0 / 0 | The preference model tries movies rarely shown to anyone / genres this user has rarely seen. Costs clicks now; can find tastes that moved. |
 | Taste memory (ticks) | 0 | Each user's taste follows their recent behaviour; older evidence halves every N ticks. |
+| Exploration slots / rate / rate for drifting users | 1 / 10% / 50% in the dynamic world (off in the static one) | Targeted exploration: a slot shows a well-rated movie from a genre the model is unsure about for this user, from the whole catalog. Users whose clicks dropped or whose browsing moved explore more. |
+| Which genre to explore | thompson | `thompson` samples from what the model believes and how unsure it is; `uniform` favours genres the user has seen least. |
+| Learn from exploration (IPS) | on | Explored picks are weighted by 1 / the probability they were shown, so the model learns what users think of them. |
 
 Action: **Restart model server**.
 
@@ -318,11 +321,13 @@ The **dynamic** world adds:
 | Setting | Default (dynamic) | Effect |
 |---|---|---|
 | Taste drift every / users drifting | 200 ticks / 5% | Some users' taste moves towards one genre. |
+| How taste drifts | gradual | `gradual`: in small steps towards a genre related to what they like. `abrupt`: most of the taste jumps to a random genre at once (harder). |
 | Fatigue (%) | 15 | Each repeat impression of a movie lowers its click chance by 15%. |
 | Fatigue wears off (ticks) | 1000 | Fatigue halves every 1000 ticks since the last impression. |
 | Rewatch (%) | 10 | A watched movie keeps 10% of its appeal. |
 | New users per 100 ticks | 30 | 30% of users join later, with no history (cold start). |
 | Onboarding | on (best) | New users name 3 favourite genres (imperfectly) before their first slate. |
+| Browsing (% of visits) | 30 (both worlds) | Users sometimes browse or search a genre before their slate: explicit evidence of their current taste, which the profiles and the preference model learn from. |
 
 ## Strategies that work
 
@@ -367,9 +372,10 @@ untrained model showed; give it data and retrain again. Check that the index mat
 (top bar) and look at *Where clicks are lost*.
 
 **Why does CTR drop in the dynamic world over long games?** Users tire of movies they've seen
-repeatedly, and some users' taste suddenly moves to a genre they are rarely shown: the system
-can't learn a taste it never sees evidence for. The exploration bonuses and taste memory help a
-little; finding drifted users is one of the open challenges of the dynamic world.
+repeatedly and can't rewatch, so the system must keep finding fresh movies, and some users'
+tastes drift towards new genres. Browsing and targeted exploration (on by default in the dynamic
+world) keep CTR flat over long games; reaching the oracle there needs much finer knowledge of each
+user than a few clicks give. It's the dynamic world's open challenge.
 
 **Why is latency different on my machine?** Latency is the real time your computer takes to
 build a slate; it never affects the simulation.

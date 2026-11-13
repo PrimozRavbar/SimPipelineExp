@@ -157,7 +157,7 @@ DEFAULT_SETTINGS = {
     "taste_drift_every": 0,    # every N ticks some users' taste drifts (0 = off)
     "taste_drift_share_pct": 5,
     "taste_drift_mode": "abrupt",  # "gradual": small steps towards a related genre (the dynamic world's default)
-    "browse_pct": 0,           # share of visits where the user first browses a genre (BrowseEvent)
+    "browse_pct": 30,          # share of visits where the user first browses a genre (BrowseEvent)
     "fatigue_pct": 0,          # click probability lost per repeat impression
     "fatigue_recovery_ticks": 0,  # fatigue halves every N ticks since the last impression (0 = never)
     "rewatch_pct": 100,        # click probability kept for an already-watched movie
@@ -178,6 +178,12 @@ BEST_SETTINGS = {
     "preference_model": True, "preference_history": True, "ranker_preference_score": True,
 }
 PRESETS = {"plain": PLAIN_SETTINGS, "best": BEST_SETTINGS}
+
+# The best setup in the dynamic world adds targeted exploration (drifting
+# users; measured in CLAUDE.md "Exploration"). In the static world, where
+# tastes never move, exploration only costs clicks, so it stays off.
+BEST_DYNAMIC_EXTRAS = {"explore_slots": 1, "explore_rate_pct": 10, "explore_boost_pct": 50,
+                       "explore_policy": "thompson", "explore_ips": True}
 DEFAULT_SETTINGS = dict(BEST_SETTINGS)
 
 # (min, max) for numeric settings; bools are listed in BOOL_SETTINGS.
@@ -408,6 +414,8 @@ class SimSession:
         self.settings = dict(PRESETS[preset])
         if world == "dynamic":
             self.settings.update(DYNAMIC_SETTINGS)
+            if preset == "best":
+                self.settings.update(BEST_DYNAMIC_EXTRAS)
         if settings:
             self._check_settings(settings)
             self.settings.update(settings)
