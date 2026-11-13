@@ -228,3 +228,15 @@ def test_console_broker_drill_stalls_unreplicated_partitions_and_the_repair_ends
     s.step(2)
     assert s.kafka.unavailable_partitions() == [] and s.kafka.lag("Flink") == 0
     s.close()
+
+
+def test_revenue_counts_published_clicks_even_when_metrics_stall():
+    # Regression: revenue was read from the CTR tracker, a Kafka consumer,
+    # so a broker outage that stalled it also stopped all revenue.
+    pytest.importorskip("torch")
+    s = _session()
+    s.submit("fault", kind="kafka_broker_down", duration=200)
+    s.step(40)
+    clicks = s.kafka.published.get("RecommendationClickedEvent", 0)
+    assert clicks > 0 and s.economy.revenue == clicks * 1.0
+    s.close()

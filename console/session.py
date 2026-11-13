@@ -1493,7 +1493,11 @@ class SimSession:
         """Money for the tick just run: revenue from its clicks, running
         costs of the current configuration, Feast materialization runs."""
         now = self.tick
-        clicks = self.tracker.counts.get(now, (0, 0))[1]
+        # Clicks users made this tick (published to Kafka), not what the
+        # metrics consumer has read: a stalled consumer must not stop revenue.
+        published = self.kafka.published.get("RecommendationClickedEvent", 0)
+        clicks = published - getattr(self, "_clicks_billed", 0)
+        self._clicks_billed = published
         breakdown = self.economy.running_costs(self.system, self.settings, self.index_kind)
         runs = self.feast.materializations - self._materializations_billed
         if runs:
