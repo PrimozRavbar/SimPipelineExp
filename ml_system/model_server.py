@@ -49,6 +49,11 @@ class ModelServer(Service):
       # retriever that produced it, so features can be logged as they were
       # at serving time (and later joined to the training data).
       self.score_logger = None
+      # admission() -> bool, set by KServe: False when no ready replica can
+      # take the request this tick; it is then served by the fallback
+      # (popularity). None = no capacity limit (the original).
+      self.admission = None
+      self.overflow_fallback = None
       self.sim = None
       self.requests = 0
       self.fallback_requests = 0
@@ -68,10 +73,15 @@ class ModelServer(Service):
       if self.retriever_down and self.fallback is not None:
           self.fallback_requests += 1
           retriever, ranker = self.fallback, None
+      elif self.admission is not None and not self.admission():
+          fallback = self.fallback or self.overflow_fallback
+          if fallback is not None:
+              self.fallback_requests += 1
+              retriever, ranker = fallback, None
 
       candidates = retriever.retrieve(request)
 
-      if self.extra_sources and retriever is not self.fallback:
+      if self.extra_sources and retriever is not self.fallback and retriever is not self.overflow_fallback:
           from ml_system.candidate_sources import merge_candidates
           extras = [
               source.retrieve(RetrievalRequest(user_id=user.user_id, k=k))

@@ -47,6 +47,20 @@ class Flink(Service):
         self.track_watched = False
         self.processed_last_tick = 0
 
+        # Cluster (defaults = the original: unlimited throughput):
+        # - parallelism: task slots; slot_capacity: events one slot handles
+        #   per tick (0 = unlimited). Capacity = parallelism x slot_capacity
+        #   (and max_events_per_tick, if also set: the smaller one).
+        # - rescale(parallelism, now, ticks): a savepoint + restart with the
+        #   new parallelism; nothing is processed until `restoring_until`.
+        # - lag_history: consumer lag after each tick (backpressure shows
+        #   as lag that keeps growing).
+        self.parallelism = 1
+        self.slot_capacity = 0
+        self.restoring_until = None
+        self.lag_history = []
+        self.processed_total = 0
+
         # track_recent: publish each user's recent watches and shown slates
         # ("recent_watches", "recent_slates") for the ranker. Subscribes to
         # shown slates from the current end of the topic when switched on.
@@ -123,10 +137,12 @@ class Flink(Service):
             self.topics = self.topics + ["OnboardingEvent"]
             self._onboarding_subscribed = True
 
-        if self.paused:
+        if self.paused or (self.restoring_until is not None and sim.clock.now < self.restoring_until):
+            self.lag_history.append(kafka.lag(self.consumer_name))
+            del self.lag_history[:-50]
             return
 
-        budget = self.max_events_per_tick
+        budget = self.capacity()
         topics = self.topics
 
         if budget is not None:
@@ -179,6 +195,10 @@ class Flink(Service):
                             self.recent.add_slate(event.user_id, event.movie_ids))
 
 
+        self.processed_total += self.processed_last_tick
+        self.lag_history.append(kafka.lag(self.consumer_name))
+        del self.lag_history[:-50]
+
         if self.signals is not None and signal_events:
             self.apply_signals(signal_events)
         if self.preferences is not None:
@@ -186,6 +206,39 @@ class Flink(Service):
             # Every reaction to this tick's slates is in: learn from them now,
             # before the next tick is served.
             self.preferences.flush(sim.clock.now + 1)
+
+    def capacity(self):
+        """Events this job can process per tick (None = unlimited)."""
+        limits = [c for c in (self.max_events_per_tick,
+                              self.parallelism * self.slot_capacity if self.slot_capacity else None)
+                  if c is not None]
+        return min(limits) if limits else None
+
+    def rescale(self, parallelism, now, restart_ticks=2):
+        """Take a savepoint and restart with a new parallelism: processing
+        stops for `restart_ticks` ticks (events wait in Kafka)."""
+        if parallelism != self.parallelism:
+            self.parallelism = parallelism
+            self.restoring_until = now + 1 + restart_ticks
+
+    def backpressured(self, ticks=10):
+        """Lag grew over each of the last `ticks` ticks."""
+        h = self.lag_history[-ticks - 1:]
+        return len(h) == ticks + 1 and all(b > a for a, b in zip(h, h[1:]))
+
+    def describe(self, sim):
+        redis = sim.get_service("Redis")
+        state_keys = sum(len(v) for v in self.state.values())
+        return {"parallelism": self.parallelism, "slot_capacity": self.slot_capacity,
+                "capacity": self.capacity(), "paused": self.paused,
+                "restoring": self.restoring_until is not None and sim.clock.now < self.restoring_until,
+                "processed_last_tick": self.processed_last_tick, "processed_total": self.processed_total,
+                "lag": self.lag_history[-1] if self.lag_history else 0, "backpressure": self.backpressured(),
+                "state_keys": state_keys, "redis_keys": len(redis.store),
+                "jobs": [name for name, on in (("features", True), ("recent history", self.track_recent),
+                                               ("movie signals", self.track_item_signals),
+                                               ("engagement", self.track_engagement),
+                                               ("preference model", self.preferences is not None)) if on]}
 
     # Movie signals depend on event order (a click needs its slate first),
     # so each tick's events are applied in the data lake's topic order,
