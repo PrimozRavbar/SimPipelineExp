@@ -557,7 +557,7 @@ ol.runbook { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction:
     const steps = run.steps.map((st) => `<div class="panel" style="flex:1 1 130px; padding:10px"><div class="label">${esc(st.name)}</div><div class="${cls(st.status)}" style="margin-top:4px"><b>${st.status}</b></div><div class="muted mono" style="font-size:12px">${st.start == null ? "" : `t ${fmt(st.start)}${st.end != null && st.end !== st.start ? ` → ${fmt(st.end)}` : ""}`}</div>${st.detail ? `<div style="font-size:12px; margin-top:4px">${esc(st.detail)}</div>` : ""}</div>`).join("");
     const tr = run.training, sec = (x) => x < 90 ? `${x.toFixed(0)} s` : `${(x / 60).toFixed(1)} min`;
     const phases = tr ? tr.phases.map(([n, a, b]) => `<tr><td>${esc(n)}</td><td class="mono" style="text-align:right">${sec(b - a)}</td></tr>`).join("") : "";
-    const trLog = tr ? tr.log.map(([t, text]) => `<tr><td class="mono">${sec(t)}</td><td>${esc(text)}</td></tr>`).join("") : "";
+    const trLog = tr ? tr.log.map(([t, text]) => `<tr><td class="mono">${sec(t)}</td><td style="white-space:normal">${esc(text)}</td></tr>`).join("") : "";
     const checks = (list) => (list || []).map((c) => `<tr><td>${esc(c.name)}</td><td class="mono">${esc(JSON.stringify(c.value))}</td><td class="mono">${esc(JSON.stringify(c.limit))}</td><td class="${c.ok ? "s-ok" : "s-crit"}">${c.ok ? "pass" : "FAIL"}</td></tr>`).join("");
     const dc = run.data_checks, mc = run.model_checks;
     const hist = w.history.slice().reverse().map((h) => `<tr><td class="mono">v${h.version}</td><td>${esc(h.by)}</td><td class="mono">t ${fmt(h.started_tick)} → ${fmt(h.ended_tick)}</td><td class="${cls(h.status)}">${h.status}${h.failed_step ? ` at ${esc(h.failed_step)}` : ""}</td></tr>`).join("");
