@@ -59,6 +59,10 @@ class World(Service):
         # browses a genre first (BrowseEvent). None = off (the original).
         self.browsing = browsing
         self.browsing_rng = browsing_rng
+        # session_slates: slates per visit (1 = the original). After each
+        # slate the user keeps going: scrolls to the next row, or comes back
+        # after watching.
+        self.session_slates = 1
         self.onboarded = set()
 
         # Users who can be active. None = everyone (the original behaviour);
@@ -117,18 +121,20 @@ class World(Service):
 
         model_server = sim.get_service("ModelServer")
 
-        movie_ids = model_server.recommend(user)
+        for _ in range(max(1, self.session_slates)):
 
-        self.recommendation_count += 1
+            movie_ids = model_server.recommend(user)
 
-        events = self.user_simulator.react(
-            sim=sim,
-            user=user,
-            recommendation_id=self.recommendation_count,
-            movie_ids=movie_ids
-        )
+            self.recommendation_count += 1
 
-        self.outbox.extend(events)
+            events = self.user_simulator.react(
+                sim=sim,
+                user=user,
+                recommendation_id=self.recommendation_count,
+                movie_ids=movie_ids
+            )
+
+            self.outbox.extend(events)
 
     def browsed_genre(self, user_id):
         """The genre a user browses: drawn from their current true genre

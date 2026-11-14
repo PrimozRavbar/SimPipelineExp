@@ -108,8 +108,8 @@ This isn't a toy model in a pretty UI. Under the hood:
 - re-rankers for **diversity** (MMR) and **targeted exploration**: Thompson sampling over each
   user's uncertain genres, boosted for users whose behaviour suggests their taste moved, with
   **propensity logging** and inverse-propensity training;
-- candidate sources for profiles, co-watching and preferences, **browsing signals** as explicit
-  evidence of current taste, and a feature store with **point-in-time** lookups.
+- candidate sources for profiles, co-watching and preferences, **browsing signals**, saves and
+  "not interested" on movies users looked at but didn't click, and a feature store with **point-in-time** lookups.
 
 With the default setup, click-through climbs from 15% to about 50% by tick 1,200 and 56% by
 tick 4,000 in the static world. The best possible slate is 69%. How close can you get?

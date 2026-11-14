@@ -45,6 +45,14 @@ class BrowseEvent(Event):
     genre: str
 
 @dataclass
+class InterestEvent(Event):
+    """A signal short of a click on a movie the user examined (opt-in world
+    feature): kind "save" (added to their list: interested) or "dismiss"
+    ("not interested")."""
+    movie_id: int
+    kind: str
+
+@dataclass
 class Session:
     session_id: int
     user_id: int

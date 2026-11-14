@@ -49,6 +49,7 @@ PROFILE_MODES = ("watches", "rich")
 ONBOARDING_WEIGHT = 2.0      # each declared genre counts like two watches
 RICH_DECAY = 0.97            # rich mode: older signal fades with each new one
 BROWSE_WEIGHT = 0.5         # a browsed genre (rich profiles)
+SAVE_WEIGHT = 0.4           # a saved movie's genres (rich profiles)
 RICH_CLICK_WEIGHT = 0.5
 
 
@@ -69,6 +70,14 @@ def update_genre_counts(counts, kind, genres, mode="watches", value=None):
     """
     if kind == "onboarding":
         weight = ONBOARDING_WEIGHT
+    elif kind == "save":
+        # A movie the user saved without watching: interest in its genres
+        # (rich mode only).
+        if mode != "rich":
+            return False
+        weight = SAVE_WEIGHT
+        for genre in counts:
+            counts[genre] *= RICH_DECAY
     elif kind == "browse":
         # Browsing a genre: recent, explicit evidence (rich mode only; the
         # original "watches" mode ignores it).

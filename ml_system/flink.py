@@ -90,6 +90,10 @@ class Flink(Service):
         # preference model).
         self.track_browsing = False
         self._browsing_subscribed = False
+        # track_interest: consume InterestEvent (saves feed rich profiles and
+        # the preference model; dismissals the preference model).
+        self.track_interest = False
+        self._interest_subscribed = False
 
         # preferences: a live ml_system.online_model.PreferenceModel (set by
         # its owner; None = off). Learns online from every event Flink
@@ -135,6 +139,11 @@ class Flink(Service):
             # published this tick's slates before Flink runs.
             kafka.subscribe(self.consumer_name, "RecommendationShownEvent", from_tick=sim.clock.now)
             self.topics = self.topics + ["RecommendationShownEvent"]
+
+        if self.track_interest and not self._interest_subscribed:
+            kafka.subscribe(self.consumer_name, "InterestEvent", from_tick=sim.clock.now)
+            self.topics = self.topics + ["InterestEvent"]
+            self._interest_subscribed = True
 
         if self.track_browsing and not self._browsing_subscribed:
             kafka.subscribe(self.consumer_name, "BrowseEvent", from_tick=sim.clock.now)
@@ -196,6 +205,10 @@ class Flink(Service):
 
                 elif type(event).__name__ == "BrowseEvent":
                     self.update_profile(sim, event.user_id, "browse", [event.genre])
+
+                elif type(event).__name__ == "InterestEvent":
+                    if event.kind == "save":
+                        self.update_profile(sim, event.user_id, "save", self.movie_genres(sim, event.movie_id))
 
                 elif isinstance(event, OnboardingEvent) and self.track_onboarding:
                     self.update_profile(sim, event.user_id, "onboarding", event.genres)

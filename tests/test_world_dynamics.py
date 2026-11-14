@@ -135,3 +135,43 @@ def test_browsing_emits_events_from_current_taste_and_profiles_count_them():
     e = browses[-1]
     profile = system["redis"].get("genre_preferences", e.user_id)
     assert profile and profile.get(e.genre, 0) > 0
+
+
+def _signals_session(**settings):
+    from console.session import SimSession
+    return SimSession(preset="plain", seed=4, users_per_tick=5, log_metrics=False,
+                      settings={"deploy_delay": 10, "epochs": 1, "spark_every": 0, **settings})
+
+
+def test_interest_signals_do_not_change_clicks_and_follow_relevance():
+    a = _signals_session()
+    b = _signals_session(interest_save_pct=100, interest_dismiss_pct=50)
+    a.step(30); b.step(30)
+    clicks = lambda s: [(e.timestamp, e.user_id, e.movie_id) for e in s.system["datalake"].events
+                        if type(e).__name__ == "RecommendationClickedEvent"]
+    assert clicks(a) == clicks(b)                     # own RNG: the shared stream is untouched
+    from world.relevance import relevance_above_threshold
+    world = b.system["world"]
+    for e in [e for e in b.system["datalake"].events if type(e).__name__ == "InterestEvent"][:50]:
+        lift = relevance_above_threshold(world.user_states[e.user_id], world.movie_objects[e.movie_id],
+                                         taste=world.taste)
+        assert (lift > 0) == (e.kind == "save")
+    a.close(); b.close()
+
+
+def test_rating_rate_and_session_slates():
+    s = _signals_session(rating_pct=100, session_slates=3)
+    s.step(20)
+    events = s.system["datalake"].events
+    watches = sum(1 for e in events if type(e).__name__ == "WatchEvent")
+    ratings = sum(1 for e in events if type(e).__name__ == "RatingEvent")
+    assert watches and ratings == watches
+    visits = {}
+    for e in events:
+        if type(e).__name__ == "RecommendationShownEvent":
+            visits.setdefault((e.timestamp, e.user_id), []).append(e.movie_ids)
+    assert {len(v) for v in visits.values()} == {3}
+    for slates in visits.values():
+        movies = [m for slate in slates for m in slate]
+        assert len(movies) == len(set(movies))        # each row shows new movies
+    s.close()

@@ -23,7 +23,8 @@ class UserSimulator:
         completion_noise=0.15,
         fatigue=0.0,
         rewatch=1.0,
-        fatigue_recovery=0
+        fatigue_recovery=0,
+        rating_probability=0.1
     ):
         self.world = world
 
@@ -44,6 +45,15 @@ class UserSimulator:
         self.fatigue = fatigue
         self.rewatch = rewatch
         self.fatigue_recovery = fatigue_recovery
+        # Probability that a watched movie gets rated (0.1 = the original).
+        self.rating_probability = rating_probability
+        # Interest signals (opt-in, set by the World): {"save": s, "dismiss": d}
+        # with their own RNG. An examined, unclicked movie is saved with
+        # probability s * lift (relevant movies only) or dismissed with
+        # probability d (irrelevant movies only).
+        self.interest = None
+        self.interest_rng = None
+        self.examined = []          # movie ids examined in the last choose_click
         self.impressions = {}       # (user_id, movie_id) -> times shown (decayed with recovery)
         self.impression_ticks = {}  # (user_id, movie_id) -> tick of the last impression
         self.now = 0
@@ -89,6 +99,8 @@ class UserSimulator:
 
         self.now = sim.clock.now
         clicked_movie_id = self.choose_click(user, movie_ids)
+        if self.interest:
+            events.extend(self.interest_signals(sim, user, clicked_movie_id))
 
         if self.fatigue > 0:
             for movie_id in movie_ids:
@@ -218,11 +230,13 @@ class UserSimulator:
         share = genre_share(user_state)
         exposure = self._exposure_active()
 
+        self.examined = []
         for rank, movie_id in enumerate(list(movie_ids)[:self.max_examined]):
 
             if self.rng.random() >= self.examine_probability(rank):
                 continue
 
+            self.examined.append(movie_id)
             movie = self.world.movie_objects[movie_id]
 
             p_click = self.click_probability(user_state, movie, share)
@@ -298,8 +312,32 @@ class UserSimulator:
         )
 
 
+    def interest_signals(self, sim, user, clicked):
+        """Saves and dismissals on examined movies the user did not click.
+        Uses only interest_rng (the shared stream is untouched)."""
+        from simulation.events import InterestEvent
+
+        out = []
+        user_state = self.world.user_states[user.user_id]
+        share = genre_share(user_state)
+        for movie_id in self.examined:
+            if movie_id == clicked:
+                continue
+            movie = self.world.movie_objects[movie_id]
+            lift = relevance_above_threshold(user_state, movie, share=share,
+                                             taste=getattr(self.world, "taste", None))
+            draw = self.interest_rng.random()
+            if lift > 0 and draw < self.interest.get("save", 0.0) * lift:
+                out.append(InterestEvent(timestamp=sim.clock.now, user_id=user.user_id,
+                                         movie_id=movie_id, kind="save"))
+            elif lift <= 0 and draw < self.interest.get("dismiss", 0.0):
+                out.append(InterestEvent(timestamp=sim.clock.now, user_id=user.user_id,
+                                         movie_id=movie_id, kind="dismiss"))
+        return out
+
+
     def should_rate(self):
-        return self.rng.random() < 0.1
+        return self.rng.random() < self.rating_probability
 
 
     def rate(
