@@ -749,10 +749,13 @@ and `tests/test_training_console.py`.
   collapsed by cosine, see Known issues, but their std is ~0.03); and **the new model against
   the serving one on the same data**: `training.evaluation_loss` (the in-batch softmax loss with
   sampled negatives, no logQ, no gradients, no randomness) of both models on the first 2000
-  examples of the new training set; the new one may be at most 1.03x worse. Measured (best
+  examples of the new training set; the new one may be at most 1.06x worse. Measured (best
   preset, seed 3, 10 users a tick, third retrain after two good ones; new / serving): lr 0.001
-  (the good second retrain) 0.85, lr 0.0001 0.97, lr 0.1 1.087, lr 1.0 1.113. The signal is
-  small (a bad learning rate trains a mediocre model, not a broken one), hence the tight limit. A first version
+  (the good second retrain) 0.85, lr 0.0001 0.97, lr 0.1 1.087, lr 1.0 1.113. Legitimate
+  retrains in the four 2000-tick default games (retrain every 200): 0.79-0.86 for the first,
+  then 0.92 and ~1.00 +- 0.04 once the model has converged (max 1.036). A limit of 1.03 rejected
+  two good models in static s42; 1.06 sits between the two groups. The signal is small: a bad
+  learning rate trains a mediocre model, not a broken one. A first version
   compared final training losses across retrains (at most 1.15x the last good model's): it
   rejected a legitimate model in the dynamic s42 game (v2 at tick 400: 3.24 vs v1's 2.80; v1 was
   trained on 200 ticks of data and reached a lower loss on it) and changed the game; losses on
