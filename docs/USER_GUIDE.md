@@ -294,7 +294,7 @@ model stays; an incident opens with the failing step.
   the GPU settings change when the model is ready, never the model (batch size and learning
   rate do change the model).
 - **Model validation** checks that the loss is a number, did not go up during training and is
-  no more than 10% above the serving model's on the same new examples (a sample of the training
+  no more than 3% above the serving model's on the same new examples (a sample of the training
   set), and that the movie embeddings are finite and not all the
   same.
 

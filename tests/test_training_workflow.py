@@ -85,8 +85,8 @@ def test_model_validation():
 def test_model_validation_compares_with_the_serving_model_on_the_same_data():
     good = {m: [0.1 * (m % 7), 0.2, -0.1 * (m % 3)] for m in range(50)}
     assert V.passed(V.validate_model([3.0, 2.7], good, eval_loss=3.1, production_eval_loss=3.2))
-    assert V.passed(V.validate_model([3.0, 2.7], good, eval_loss=3.3, production_eval_loss=3.2))   # within 10%
-    failed = {c["name"] for c in V.validate_model([3.66, 3.63], good, eval_loss=3.7, production_eval_loss=3.1)
+    assert V.passed(V.validate_model([3.0, 2.7], good, eval_loss=3.25, production_eval_loss=3.2))  # within 3%
+    failed = {c["name"] for c in V.validate_model([3.66, 3.63], good, eval_loss=3.5, production_eval_loss=3.2)
               if not c["ok"]}
     assert failed == {"loss vs production model"}
     # No production loss (the serving model takes other inputs): the check is skipped.

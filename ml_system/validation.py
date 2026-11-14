@@ -24,7 +24,7 @@ CLICK_RATE_FLOOR = 0.5       # click rate (labels) at least half the last good r
 
 # Model checks
 MAX_LOSS_RATIO = 1.2         # the last epoch's loss at most 1.2x the first's
-MAX_LOSS_VS_PRODUCTION = 1.10  # on the same examples, at most 1.10x the production model's loss
+MAX_LOSS_VS_PRODUCTION = 1.03  # on the same examples, at most 1.03x the serving model's loss
 MIN_EMBEDDING_SPREAD = 1e-4  # std of item embeddings across movies
 
 
