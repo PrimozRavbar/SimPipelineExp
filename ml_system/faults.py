@@ -33,6 +33,15 @@ Kinds and what they break:
 - viral_movie          A movie goes viral in the World: everyone clicks and
                        watches it (hot key in every job, a shift in what
                        users want).
+- gpu_preemption       Training GPUs are spot instances being reclaimed:
+                       jobs restart from their last checkpoint (or from
+                       scratch) and take longer, or fail.
+- feature_nulls        A bad deploy of the Spark feature job writes empty
+                       genre profiles for most users. The corrupted
+                       snapshots stay in the store after the fault ends,
+                       until a full backfill rewrites them.
+- scheduler_down       The workflow scheduler (Airflow) is down: scheduled
+                       Spark runs and retrains silently do not start.
 """
 
 from ml_system.ann import ANNIndex
@@ -53,6 +62,9 @@ FAULT_KINDS = {
     "spark_cluster_busy": "Spark cluster busy (resources pending)",
     "lake_ingestion_lag": "Data lake sink stuck (ingestion lag)",
     "viral_movie": "A movie went viral",
+    "gpu_preemption": "Training GPUs being preempted (spot)",
+    "feature_nulls": "Feature job writing empty profiles",
+    "scheduler_down": "Workflow scheduler down",
 }
 
 # Which repair action ends which fault (see FaultInjector.fix).
@@ -63,6 +75,8 @@ FIXES = {
     "restart_kafka_broker": ("kafka_broker_down",),
     "replace_spark_node": ("spark_slow_node",),
     "restart_lake_sink": ("lake_ingestion_lag",),
+    "restart_scheduler": ("scheduler_down",),
+    "backfill_features": ("feature_nulls",),
 }
 
 
@@ -274,6 +288,32 @@ class FaultInjector(Service):
         def undo():
             if dynamics.viral is not None and dynamics.viral["movie_id"] == movie_id:
                 dynamics.end_viral()
+        return undo
+
+    def _start_gpu_preemption(self, fault):
+        conditions = self.system["training_conditions"]
+        previous = conditions.preemption_mean_s
+        conditions.preemption_mean_s = fault.params.get("mean_seconds", 1200)
+
+        def undo():
+            conditions.preemption_mean_s = previous
+        return undo
+
+    def _start_feature_nulls(self, fault):
+        pipeline = self.system["offline_pipeline"].feature_pipeline
+        pipeline.null_profile_share = fault.params.get("share", 0.6)
+
+        def undo():
+            # The job is fixed; what it already wrote stays until a backfill.
+            pipeline.null_profile_share = 0.0
+        return undo
+
+    def _start_scheduler_down(self, fault):
+        scheduler = self.system["scheduler"]
+        scheduler["up"] = False
+
+        def undo():
+            scheduler["up"] = True
         return undo
 
     def _start_kafka_broker_down(self, fault):

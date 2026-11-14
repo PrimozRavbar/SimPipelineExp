@@ -42,6 +42,8 @@ from ml_system.model_registry import export_bundle
 from ml_system.ann_indexes import INDEX_TYPES, index_embeddings, index_kind, make_index, vectors_per_query
 from ml_system.feast import MODES as FEAST_MODES
 from ml_system.spark_sim.cluster import TICK_SECONDS, ClusterConfig
+from ml_system.spark_sim.engine import ticks_for
+from ml_system import training_job, validation
 from ml_system.redis import EVICTION_POLICIES
 from console.economy import ONE_OFF, PRICES, Economy
 from ml_system.online_model import PreferenceModel, PreferenceRanker, PreferenceRetrieval
@@ -81,6 +83,15 @@ DEFAULT_SETTINGS = {
     "tower_demographics": False,  # user tower sees age bracket, gender, occupation
     "tower_shared_ids": False, # movie IDs in the movie tower, shared with the user's watch history
     "negatives": 5,            # sampled negatives per positive
+    # Training job on a simulated GPU cluster (ml_system/training_job.py) and
+    # the checks of the retrain workflow (ml_system/validation.py).
+    "train_gpus": 1,
+    "train_gpu_memory_gb": 16,
+    "train_batch_size": 32,    # examples per training step (real: changes the model)
+    "learning_rate": "0.001",  # Adam learning rate (real: too high and training diverges)
+    "train_checkpoint_minutes": 10,  # a preempted job resumes from its last checkpoint (0 = none)
+    "validate_data": True,     # check the training set against the last good one before training
+    "validate_model": True,    # check the trained model (loss, embeddings) before registering it
     # Serving
     "slate_size": 10,
     "num_candidates": 100,
@@ -222,6 +233,10 @@ SETTING_LIMITS = {
     "deploy_delay": (1, 10000),
     "epochs": (1, 50),
     "negatives": (1, 9),
+    "train_gpus": (1, 64),
+    "train_gpu_memory_gb": (4, 192),
+    "train_batch_size": (1, 8192),
+    "train_checkpoint_minutes": (0, 1440),
     "slate_size": (1, 100),
     "num_candidates": (1, 500),
     "alert_drop_pct": (1, 100),
@@ -297,10 +312,13 @@ BOOL_SETTINGS = {"rebuild_index", "ranker", "ranker_mlp", "filter_watched", "eva
                  "ranker_multitask", "ranker_signals", "tower_engagement", "tower_demographics",
                  "tower_shared_ids", "ranker_tower_score", "preference_model",
                  "preference_history", "ranker_preference_score", "explore_ips", "cf_model",
-                 "spark_aqe", "spark_speculation", "spark_incremental", "spark_wait_for_data"}
+                 "spark_aqe", "spark_speculation", "spark_incremental", "spark_wait_for_data",
+                 "validate_data", "validate_model"}
 
 # Settings that take one of a few strings.
+LEARNING_RATES = ("0.0001", "0.0003", "0.001", "0.003", "0.01", "0.03", "0.1", "0.3", "1.0")
 CHOICE_SETTINGS = {"redis_eviction": EVICTION_POLICIES, "feast_mode": FEAST_MODES,
+                   "learning_rate": LEARNING_RATES,
                    "taste_drift_mode": ("abrupt", "gradual"), "explore_policy": EXPLORE_POLICIES}
 
 # User features that expire with redis_ttl_ticks.
@@ -333,6 +351,9 @@ CHAOS_DURATIONS = {
     "spark_cluster_busy": 150,
     "lake_ingestion_lag": None,
     "viral_movie": 300,
+    "gpu_preemption": 300,
+    "feature_nulls": 200,
+    "scheduler_down": None,
 }
 
 RUNBOOKS = {
@@ -400,6 +421,21 @@ RUNBOOKS = {
         "Check the stage table: one slow task (skew ratio) means a hot key or a slow node; all tasks slow "
         "means too few executors, spilling (memory) or a full recompute.",
         "Fixes: more executors or memory, AQE and speculation on, incremental runs, replace a degraded node.",
+    ],
+    "workflow": [
+        "Open Pipeline, Training: the last retrain workflow shows which step failed and why.",
+        "Data validation failed: the training set looks broken (too few examples, labels missing, many "
+        "empty profiles). Find the cause first: an empty-profile jump is a broken feature job; fix it with "
+        "Backfill features (Pipeline, Batch features) and retrain.",
+        "GPU out of memory: lower the batch size or use GPUs with more memory.",
+        "Preempted too often: keep checkpoints on (a preempted job resumes from them) or wait.",
+        "Model validation failed: training diverged (loss went up or NaN). Lower the learning rate.",
+        "The serving model is unchanged: a failed workflow never deploys.",
+    ],
+    "schedule_missed": [
+        "Scheduled runs (Spark, retrains) did not start: the workflow scheduler is down, and nothing "
+        "else tells you. Features and models silently go stale.",
+        "Restart the scheduler (Pipeline, Training), then run what was missed by hand.",
     ],
     "lake_ingestion": [
         "The data lake sink is not writing: events pile up in Kafka (its lag) and batch jobs see old data.",
@@ -591,6 +627,13 @@ class SimSession:
         self.spark_failures = 0
         self.last_spark_error = None     # {"tick", "reason", "error", "by"} of the last failed job
         self._spark_bill = 0.0           # money for Spark jobs finished since the last tick was billed
+        self._train_bill = 0.0           # money for GPU time of training jobs, billed like Spark
+        self.workflow_runs = []          # finished retrain workflow runs, newest last
+        self.last_workflow_failure = None
+        self.data_reference = None       # stats of the last training set that passed data validation
+        self.system["training_conditions"] = training_job.TrainingConditions()
+        self.system["scheduler"] = {"up": True}
+        self.missed_runs = []            # (tick, "spark" | "retrain") skipped while the scheduler was down
 
         # Budget, event log, incidents
         self.budget_used = 0
@@ -753,6 +796,9 @@ class SimSession:
             if before != after:
                 self._log("job", "Data lake compaction: %d files -> %d." % (before, after))
 
+        if self.retrain is not None and self.retrain["fail_at"] is not None \
+                and self.retrain["thread"] is None and now >= self.retrain["fail_at"]:
+            self._training_failed(self.retrain)
         if self.retrain is not None and self.retrain["thread"] is not None \
                 and now >= self.retrain["deploy_tick"]:
             self._finish_retrain()
@@ -770,12 +816,19 @@ class SimSession:
         # 3. Schedules from the settings.
         s = self.settings
         self._chaos(now)
-        if now > 0 and s["spark_every"] and now % s["spark_every"] == 0:
+        scheduler_up = self.system["scheduler"]["up"]
+        if now > 0 and s["spark_every"] and now % s["spark_every"] == 0 and not scheduler_up:
+            self.missed_runs.append((now, "spark"))          # silently: nothing runs, nothing is logged
+        elif now > 0 and s["spark_every"] and now % s["spark_every"] == 0:
+            self.missed_runs = []                            # the schedule runs again
             try:
                 self._run_spark(by="schedule")
             except ActionError as error:
                 self._log("job", "Scheduled Spark run skipped: %s" % error, cls="s-warn")
-        if now > 0 and s["retrain_every"] and now % s["retrain_every"] == 0:
+        if now > 0 and s["retrain_every"] and now % s["retrain_every"] == 0 and not scheduler_up:
+            self.missed_runs.append((now, "retrain"))
+        elif now > 0 and s["retrain_every"] and now % s["retrain_every"] == 0:
+            self.missed_runs = []
             if self.retrain is not None:
                 self._log("train", "Scheduled retrain skipped: a training run is still in progress.", cls="s-warn")
             else:
@@ -1032,6 +1085,20 @@ class SimSession:
             "started_tick": now,
             "deploy_tick": now + self.settings["deploy_delay"],
             "stage": "features",
+            "workflow": self._new_workflow(now, by),
+            "cluster": training_job.TrainingCluster(
+                gpus=self.settings["train_gpus"], gpu_memory_gb=self.settings["train_gpu_memory_gb"],
+                batch_size=self.settings["train_batch_size"],
+                checkpoint_minutes=self.settings["train_checkpoint_minutes"]),
+            "batch_size": self.settings["train_batch_size"],
+            "lr": float(self.settings["learning_rate"]),
+            "validate_data": self.settings["validate_data"],
+            "validate_model": self.settings["validate_model"],
+            "train_report": None,
+            "fail_at": None,
+            "data_checks": None,
+            "model_checks": None,
+            "losses": None,
             "training_examples": None,
             "epochs": self.settings["epochs"],
             "negatives": self.settings["negatives"],
@@ -1095,7 +1162,13 @@ class SimSession:
         if not ok:
             self.retrain = None
             self._log("train", "Retrain v%d aborted: its Spark feature job failed." % version, cls="s-crit")
+            self._step(record, "features", "failed", "the Spark feature job failed")
+            self._end_workflow(record, "failed", "features")
             return
+        self._step(record, "features", "succeeded",
+                   "%s over %d events" % (self.system["spark"].last_run.batch.reason,
+                                          self.system["spark"].last_run.batch.size)
+                   if self.system["spark"].last_run is not None else None)
         train_events = events
         if record["eval_gate"]:
             # Hold out the newest events: train on the rest, score both
@@ -1124,7 +1197,28 @@ class SimSession:
         if not training_data:
             self.retrain = None
             self._log("train", "Retrain v%d aborted: no usable training examples." % version, cls="s-warn")
+            self._step(record, "validate data", "failed", "no usable training examples")
+            self._end_workflow(record, "failed", "validate data")
             return
+        # Data validation: the training set against the last good one.
+        reference = self.data_reference
+        stats = validation.training_data_stats(len(training_data), train_events, self.system["feature_store"],
+                                               since_tick=reference["through_tick"] if reference else None)
+        checks = validation.validate_data(stats, reference)
+        record["data_checks"] = {"stats": stats, "checks": checks, "reference": reference}
+        failed = [c["name"] for c in checks if not c["ok"]]
+        if failed and record["validate_data"]:
+            self.retrain = None
+            self._log("train", "Retrain v%d stopped by data validation: %s." % (version, ", ".join(failed)),
+                      cls="s-crit")
+            self._step(record, "validate data", "failed", "failed: " + ", ".join(failed))
+            self._end_workflow(record, "failed", "validate data")
+            return
+        if not failed:
+            self.data_reference = stats
+        self._step(record, "validate data", "succeeded" if not failed else "skipped",
+                   "%d examples, %s" % (stats["examples"], "all checks passed" if not failed
+                                        else "checks failed but validation is off: " + ", ".join(failed)))
         items = _ItemFeatureSnapshot(self.offline.feature_pipeline.feature_store)
         if self.flink.preferences is not None:
             # Refit the preference model on everything it has logged so far
@@ -1157,6 +1251,27 @@ class SimSession:
             record["deploy_tick"] = max(record["deploy_tick"], self.tick + min(10, delay))
         record["training_examples"] = len(training_data)
         record["stage"] = "training"
+        # The training job on the GPU cluster: simulated time and outcome.
+        conditions = self.system["training_conditions"]
+        rows = record["ranker_rows"][0] if record["ranker_rows"] is not None else []
+        report = training_job.simulate_training(
+            len(training_data), record["epochs"], record["negatives"] + record["random_negatives"],
+            record["cluster"], conditions,
+            training_job.rng_for(self.seed, version) if conditions.preemption_mean_s else None,
+            items=len(items.item_features), extra_rows=len(rows))
+        record["train_report"] = report
+        record["train_ticks"] = ticks_for(report.duration_s)
+        self._step(record, "train", "running")
+        if not report.succeeded:
+            record["fail_at"] = self.tick + record["train_ticks"]
+            self._log("train", "Training v%d started on %d examples (%d GPU%s)."
+                      % (version, len(training_data), record["cluster"].gpus,
+                         "s" if record["cluster"].gpus > 1 else ""), cls="s-accent")
+            if record["fail_at"] <= self.tick:
+                self._training_failed(record)
+            return
+        record["train_done_tick"] = self.tick + record["train_ticks"]
+        record["deploy_tick"] = max(record["deploy_tick"], record["train_done_tick"])
         thread = threading.Thread(
             target=self._train, args=(record, training_data, items),
             name="retrain-v%d" % version, daemon=True,
@@ -1184,7 +1299,11 @@ class SimSession:
             trainer.graded = record["graded_positives"]
             trainer.item_pool = [items.item_features[m] for m in sorted(items.item_features)]
             trainer.seed = self.seed
+            trainer.batch_size = record["batch_size"]
+            for group in trainer.optimizer.param_groups:
+                group["lr"] = record["lr"]
             trainer.train(training_data)
+            record["losses"] = [float(x) for x in getattr(trainer, "last_losses", [])]
 
             user_tower = copy.deepcopy(trainer.user_tower).eval()
             item_tower = copy.deepcopy(trainer.item_tower).eval()
@@ -1237,12 +1356,85 @@ class SimSession:
                     recall_at_k(production.user_tower, production.index, record["holdout"]),
                 )
 
+            record["model_checks"] = validation.validate_model(record["losses"], embeddings)
             record["result"] = (user_tower, item_tower, index, ranker)
             record["train_seconds"] = round(time.monotonic() - started, 2)
         except Exception as error:  # surfaced in the log at deploy time
             record["error"] = repr(error)
         finally:
             record["done"].set()
+
+    # Retrain workflow (an Airflow-style DAG run) -------------------------
+
+    def _new_workflow(self, now, by):
+        names = ["features", "validate data", "train", "validate model"]
+        if self.settings["eval_gate"]:
+            names.append("evaluate")
+        names.append("deploy")
+        return {"started_tick": now, "by": by, "status": "running", "failed_step": None,
+                "steps": [{"name": n, "status": "pending", "start": None, "end": None, "detail": None}
+                          for n in names]}
+
+    def _step(self, record, name, status, detail=None, end=None):
+        for step in record["workflow"]["steps"]:
+            if step["name"] != name:
+                continue
+            if step["start"] is None:
+                step["start"] = record["started_tick"] if name == "features" else self.tick
+            if status in ("succeeded", "failed", "skipped"):
+                step["end"] = end if end is not None else self.tick
+            step["status"] = status
+            if detail is not None:
+                step["detail"] = detail
+
+    def _end_workflow(self, record, status, failed_step=None):
+        workflow = record["workflow"]
+        workflow.update(status=status, failed_step=failed_step, ended_tick=self.tick)
+        for step in workflow["steps"]:
+            if step["status"] == "pending":
+                step["status"] = "skipped" if status == "failed" else step["status"]
+        report = record.get("train_report")
+        run = {"version": record["version"], **workflow,
+               "training": None if report is None else report.summary(),
+               "train_ticks": record.get("train_ticks"),
+               "cluster": record["cluster"].summary(), "lr": record["lr"],
+               "data_checks": record.get("data_checks"), "model_checks": record.get("model_checks"),
+               "losses": record.get("losses")}
+        self.workflow_runs.append(run)
+        del self.workflow_runs[:-20]
+        self.last_workflow_failure = None if status == "succeeded" else run
+        if self.logger is not None:
+            self.logger.log_event("workflow", self.tick, model_version=record["version"], status=status,
+                                  failed_step=failed_step)
+
+    def _workflow_view(self):
+        r = self.retrain
+        current = None
+        if r is not None:
+            report = r["train_report"]
+            current = {"version": r["version"], **r["workflow"], "deploy_tick": r["deploy_tick"],
+                       "train_done_tick": r.get("train_done_tick"), "fail_at": r["fail_at"],
+                       "training": None if report is None else report.summary(),
+                       "data_checks": r["data_checks"]}
+        runs = self.workflow_runs
+        return {"current": current, "last": runs[-1] if runs else None,
+                "history": [{k: run[k] for k in ("version", "by", "started_tick", "ended_tick", "status",
+                                                 "failed_step", "train_ticks")} for run in runs],
+                "gpu_price_per_hour": training_job.PRICE_PER_GPU_HOUR,
+                "memory_gb": round(training_job.memory_gb(self.settings["train_batch_size"],
+                                                          self.settings["negatives"]
+                                                          + self.settings["random_negatives"]), 1),
+                "missed_runs": len(self.missed_runs)}
+
+    def _training_failed(self, record):
+        """The simulated training job failed (GPU out of memory, too many
+        preemptions): no model, the GPU time is still paid for."""
+        report = record["train_report"]
+        self.retrain = None
+        self._train_bill += report.gpu_seconds / 3600.0 * training_job.PRICE_PER_GPU_HOUR
+        self._step(record, "train", "failed", report.error)
+        self._log("train", "Training v%d FAILED: %s." % (record["version"], report.error), cls="s-crit")
+        self._end_workflow(record, "failed", "train")
 
     def _finish_retrain(self):
         record = self.retrain
@@ -1252,8 +1444,16 @@ class SimSession:
         now = self.tick
         version = record["version"]
 
+        report = record["train_report"]
+        self._train_bill += report.gpu_seconds / 3600.0 * training_job.PRICE_PER_GPU_HOUR
+        self._step(record, "train", "succeeded" if record["error"] is None else "failed",
+                   record["error"] or "%d examples x %d epochs, %.0f min on %d GPU%s"
+                   % (record["training_examples"], record["epochs"], report.duration_s / 60,
+                      record["cluster"].gpus, "s" if record["cluster"].gpus > 1 else ""),
+                   end=record.get("train_done_tick"))
         if record["error"] is not None:
             self._log("train", "Training v%d failed: %s" % (version, record["error"]), cls="s-crit")
+            self._end_workflow(record, "failed", "train")
             return
 
         user_tower, item_tower, index, ranker = record["result"]
@@ -1286,6 +1486,18 @@ class SimSession:
                 "weights": ranker.content_weights(),
             },
         )
+        model_failed = [c["name"] for c in record["model_checks"] or [] if not c["ok"]]
+        if model_failed and record["validate_model"]:
+            self.versions[version].info["rejected"] = True
+            self.versions[version].info["note"] = "failed model validation: " + ", ".join(model_failed)
+            self._step(record, "validate model", "failed", "failed: " + ", ".join(model_failed))
+            self._log("train", "v%d failed model validation (%s): not registered for deploy."
+                      % (version, ", ".join(model_failed)), cls="s-crit")
+            self._end_workflow(record, "failed", "validate model")
+            return
+        self._step(record, "validate model", "succeeded" if not model_failed else "skipped",
+                   "all checks passed" if not model_failed
+                   else "checks failed but validation is off: " + ", ".join(model_failed))
         if self.logger is not None:
             self.logger.log_event("retrain", now, model_version=version,
                                   training_examples=record["training_examples"])
@@ -1305,13 +1517,20 @@ class SimSession:
                                       recall_at_k=gate["recall_at_20"],
                                       production_recall_at_k=gate["production_recall_at_20"],
                                       passed=gate["passed"])
+            self._step(record, "evaluate", "succeeded" if gate["passed"] else "failed",
+                       "Recall@20 %.1f%% vs v%d %.1f%%" % (gate["recall_at_20"] * 100, gate["production_version"],
+                                                          gate["production_recall_at_20"] * 100))
             if not gate["passed"]:
                 self.versions[version].info["rejected"] = True
+                self._end_workflow(record, "failed", "evaluate")
                 return
         if self.settings["canary_share"] > 0:
             self._start_canary(version, by, record["rebuild_index"])
+            self._step(record, "deploy", "succeeded", "canary to %d%% of users" % self.settings["canary_share"])
         else:
             self._deploy(version, by=by, rebuild_index=record["rebuild_index"])
+            self._step(record, "deploy", "succeeded", "v%d serving" % version)
+        self._end_workflow(record, "succeeded")
 
     def _deploy(self, version, by, rebuild_index=True, note=""):
         model = self.versions[version]
@@ -1760,6 +1979,8 @@ class SimSession:
             self._materializations_billed = self.feast.materializations
         breakdown["Spark"] = self._spark_bill
         self._spark_bill = 0.0
+        breakdown["Training"] = self._train_bill
+        self._train_bill = 0.0
         self.economy.tick(now, clicks, breakdown)
 
     def _chaos_gap(self):
@@ -1801,11 +2022,21 @@ class SimSession:
             self.kafka.broker_up()
         if action == "restart_lake_sink":
             self.system["datalake"].paused = False
+        if action == "restart_scheduler":
+            self.system["scheduler"]["up"] = True
+            self.missed_runs = []
+        if action == "backfill_features":
+            self.offline.feature_pipeline.null_profile_share = 0.0
+            self.system["spark"].force_full = True
+            if self.spark_job is None:
+                self._run_spark(by="backfill")
         label = {"restart_flink": "Flink restarted", "rebuild_index": "ANN index rebuilt with v%d embeddings"
                  % self.serving_version, "restart_model_server": "Model server restarted",
                  "restart_kafka_broker": "Kafka broker restarted",
                  "replace_spark_node": "Degraded Spark node drained and replaced",
-                 "restart_lake_sink": "Data lake sink restarted"}[action]
+                 "restart_lake_sink": "Data lake sink restarted",
+                 "restart_scheduler": "Workflow scheduler restarted",
+                 "backfill_features": "Feature job fixed; full feature backfill started"}[action]
         self._log("ops", "%s by you." % label, cls="s-accent")
         if self.logger is not None:
             self.logger.log_event("repair", self.tick, action=action, faults_ended=[f.id for f in ended])
@@ -1855,6 +2086,17 @@ class SimSession:
                    "%.0f%% of requests in the last 10 ticks were served by the fallback, not the model."
                    % (h["fallback_share"] * 100))
 
+        failure = self.last_workflow_failure
+        self._rule("workflow", failure is not None, failure is None, "WARN",
+                   "Retrain workflow failed at %s" % (failure["failed_step"] if failure else ""),
+                   "Retrain v%d (by %s, started tick %d) failed at step '%s'."
+                   % (failure["version"], failure["by"], failure["started_tick"], failure["failed_step"])
+                   if failure else "")
+        missed = self.missed_runs
+        self._rule("schedule_missed", bool(missed), not missed, "WARN",
+                   "Scheduled runs missed: %d" % len(missed),
+                   "Scheduled runs did not start: %s." % ", ".join("%s at tick %d" % (k, t) for t, k in missed[-5:])
+                   if missed else "")
         error = self.last_spark_error
         self._rule("spark_job", error is not None, error is None, "WARN",
                    "Spark feature job failed%s" % (" (%s)" % error["reason"] if error and error["reason"] else ""),
@@ -2265,6 +2507,7 @@ class SimSession:
                 "train": None if r is None else {"version": r["version"], "started_tick": r["started_tick"],
                                                  "deploy_tick": r["deploy_tick"], "done": r["done"].is_set(),
                                                  "stage": r["stage"]},
+                "workflow": self._workflow_view(),
                 "registry": {"versions": len(self.versions), "serving_version": self.serving_version},
                 "redis_skew": self.health["feature_skew"],
                 "world": {"kind": self.world_kind, **self.dynamics.summary()},
