@@ -35,17 +35,22 @@ def _check(name, value, limit, ok, about):
 def training_data_stats(examples, events, feature_store, since_tick=None):
     """Summary of a training set: its size, the click rate of the events
     behind it, and the share of clicks since `since_tick` (the last good
-    run; None = all) whose user profile, as of the click, was empty. A
-    broken feature job corrupts the newest data first, so the newest slice
-    is what is checked."""
+    run; None = all) by returning users whose profile, as of the click, was
+    empty. A broken feature job corrupts the newest data first, so the
+    newest slice is what is checked. Only returning users count (a click in
+    a later tick than the user's first event): a new user's first clicks
+    legitimately see an empty profile, and the lake even stores a tick's
+    clicks before that tick's onboarding answers (one file per topic)."""
     shown = clicks = recent = empty = 0
+    first_tick = {}
     for order, event in enumerate(events):
+        first_tick.setdefault(event.user_id, event.timestamp)
         name = type(event).__name__
         if name == "RecommendationShownEvent":
             shown += 1
         elif name == "RecommendationClickedEvent":
             clicks += 1
-            if since_tick is None or event.timestamp > since_tick:
+            if (since_tick is None or event.timestamp > since_tick) and first_tick[event.user_id] < event.timestamp:
                 recent += 1
                 features = feature_store.get_user_features_as_of(event.user_id, event.timestamp, order)
                 if not (features or {}).get("genre_preferences"):

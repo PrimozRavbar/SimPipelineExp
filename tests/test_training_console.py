@@ -56,7 +56,7 @@ def test_gpu_out_of_memory_fails_the_workflow_and_keeps_the_model():
     s.submit("settings", train_batch_size=32)
     s.submit("retrain")
     s.step(15)
-    assert s.workflow_runs[-1]["status"] == "succeeded" and s.serving_version == 2
+    assert s.workflow_runs[-1]["status"] == "succeeded" and s.serving_version == 1   # the failed run registered nothing
     s.step(1)
     assert all(i["status"] != "Open" for i in s.incidents_view() if i["rule"] == "workflow")
     s.close()
