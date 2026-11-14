@@ -187,7 +187,7 @@ def build_recommendation_system(
 
     sim.register(world)
     sim.register(Kafka())
-    sim.register(Spark())
+    sim.register(Spark(seed=seed))
     sim.register(Flink())
     sim.register(redis)
     sim.register(feature_store)

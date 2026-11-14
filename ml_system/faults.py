@@ -18,8 +18,21 @@ Kinds and what they break:
 - model_server_outage  Two-tower retrieval is down; the model server serves
                        its popularity fallback.
 - traffic_spike        Several times more users per tick.
-- spark_failure        Spark feature jobs fail (offline features go stale,
-                       retrains that need them are aborted).
+- spark_failure        The Spark cluster is down: feature jobs fail (offline
+                       features go stale, retrains that need them abort).
+- spark_executor_loss  Spot executors are reclaimed mid-job (each lives ~10
+                       minutes): tasks are retried and lost shuffle output
+                       recomputed (slower jobs); a job fails once
+                       max(2 x executors, 3) executors have been lost.
+- spark_slow_node      One executor runs 10x slower (a degraded node):
+                       stragglers, unless speculation re-runs them.
+- spark_cluster_busy   The shared cluster is busy: jobs wait ~30 minutes
+                       for resources and get half the executors.
+- lake_ingestion_lag   The data lake sink is stuck: events wait in Kafka,
+                       batch jobs see incomplete input.
+- viral_movie          A movie goes viral in the World: everyone clicks and
+                       watches it (hot key in every job, a shift in what
+                       users want).
 """
 
 from ml_system.ann import ANNIndex
@@ -35,6 +48,11 @@ FAULT_KINDS = {
     "traffic_spike": "Traffic spike",
     "spark_failure": "Spark feature jobs failing",
     "kafka_broker_down": "Kafka broker 0 down",
+    "spark_executor_loss": "Spark executors being reclaimed (spot)",
+    "spark_slow_node": "Degraded Spark node (slow executor)",
+    "spark_cluster_busy": "Spark cluster busy (resources pending)",
+    "lake_ingestion_lag": "Data lake sink stuck (ingestion lag)",
+    "viral_movie": "A movie went viral",
 }
 
 # Which repair action ends which fault (see FaultInjector.fix).
@@ -43,6 +61,8 @@ FIXES = {
     "rebuild_index": ("index_id_mismatch",),
     "restart_model_server": ("model_server_outage",),
     "restart_kafka_broker": ("kafka_broker_down",),
+    "replace_spark_node": ("spark_slow_node",),
+    "restart_lake_sink": ("lake_ingestion_lag",),
 }
 
 
@@ -212,6 +232,48 @@ class FaultInjector(Service):
 
         def undo():
             spark.failing = False
+        return undo
+
+    def _spark_conditions(self, **values):
+        conditions = self.system["spark"].conditions
+        previous = {k: getattr(conditions, k) for k in values}
+        for k, v in values.items():
+            setattr(conditions, k, v)
+
+        def undo():
+            for k, v in previous.items():
+                setattr(conditions, k, v)
+        return undo
+
+    def _start_spark_executor_loss(self, fault):
+        return self._spark_conditions(executor_loss_mean_s=fault.params.get("mean_seconds", 600))
+
+    def _start_spark_slow_node(self, fault):
+        return self._spark_conditions(slow_executor_factor=fault.params.get("factor", 10))
+
+    def _start_spark_cluster_busy(self, fault):
+        return self._spark_conditions(queue_wait_s=fault.params.get("wait_seconds", 1800),
+                                      granted_share=fault.params.get("granted_share", 0.5))
+
+    def _start_lake_ingestion_lag(self, fault):
+        lake = self.system["datalake"]
+        lake.paused = True
+
+        def undo():
+            lake.paused = False
+        return undo
+
+    def _start_viral_movie(self, fault):
+        dynamics = self.system.get("world_dynamics")
+        if dynamics is None:
+            raise ValueError("viral_movie needs a world with WorldDynamics")
+        now = self.system["sim"].clock.now
+        movie_id = dynamics.start_viral(now, movie_id=fault.params.get("movie_id"), duration=0)
+        fault.params["movie_id"] = movie_id
+
+        def undo():
+            if dynamics.viral is not None and dynamics.viral["movie_id"] == movie_id:
+                dynamics.end_viral()
         return undo
 
     def _start_kafka_broker_down(self, fault):

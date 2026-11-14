@@ -64,6 +64,10 @@ class World(Service):
         # after watching.
         self.session_slates = 1
         self.onboarded = set()
+        # A viral movie (set by WorldDynamics): {"movie_id", "organic",
+        # "watched"}; users hear about it and watch it outside the slates.
+        self.viral = None
+        self.viral_rng = None
 
         # Users who can be active. None = everyone (the original behaviour);
         # WorldDynamics sets it when users join over time.
@@ -119,6 +123,9 @@ class World(Service):
                 genre=self.browsed_genre(user.user_id),
             ))
 
+        if self.viral is not None:
+            self.organic_watch(user, sim)
+
         model_server = sim.get_service("ModelServer")
 
         for _ in range(max(1, self.session_slates)):
@@ -135,6 +142,27 @@ class World(Service):
             )
 
             self.outbox.extend(events)
+
+    def organic_watch(self, user, sim):
+        """Everyone talks about the viral movie: with probability `organic`
+        a visiting user who has not seen it yet searches for it and watches
+        it (a WatchEvent with no slate behind it). Uses only viral_rng."""
+        viral = self.viral
+        if user.user_id in viral["watched"] or self.viral_rng.random() >= viral["organic"]:
+            return
+        from simulation.events import WatchEvent
+        from world.relevance import relevance
+
+        movie_id = viral["movie_id"]
+        viral["watched"].add(user.user_id)
+        rel = relevance(self.user_states[user.user_id], self.movie_objects[movie_id], taste=self.taste)
+        simulator = self.user_simulator
+        completion = min(1.0, max(0.05, 0.15 + 0.8 * rel
+                                  + self.viral_rng.gauss(0.0, simulator.completion_noise)))
+        if simulator.rewatch < 1.0:
+            simulator.watched.add((user.user_id, movie_id))
+        self.outbox.append(WatchEvent(timestamp=sim.clock.now, user_id=user.user_id, movie_id=movie_id,
+                                      watch_time=120 * completion, completion=completion))
 
     def browsed_genre(self, user_id):
         """The genre a user browses: drawn from their current true genre

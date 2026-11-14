@@ -58,6 +58,9 @@ class UserSimulator:
         self.impression_ticks = {}  # (user_id, movie_id) -> tick of the last impression
         self.now = 0
         self.watched = set()        # (user_id, movie_id) watched in the simulation
+        # Viral movies (world/dynamics.py): movie_id -> buzz in [0, 1]; a
+        # buzzing movie's click probability moves that far towards p_max.
+        self.buzz = {}
 
         # Seeded RNG so a simulation run is reproducible.
         self.rng = rng if rng is not None else random.Random(0)
@@ -173,7 +176,12 @@ class UserSimulator:
         # threshold the click probability rises linearly to p_max.
         lift = relevance_above_threshold(user_state, movie, share=share,
                                          taste=getattr(self.world, "taste", None))
-        return self.p_noise + (self.p_max - self.p_noise) * lift
+        p = self.p_noise + (self.p_max - self.p_noise) * lift
+        if self.buzz:
+            buzz = self.buzz.get(movie.movie_id)
+            if buzz:
+                p += (self.p_max - p) * buzz
+        return p
 
 
     def exposure_factor(self, user_id, movie_id):

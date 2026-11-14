@@ -194,7 +194,8 @@ On Colab, `SimPipExp_console.ipynb` starts the server in the background and open
 - **Spark.** The offline feature job runs on its own schedule (`spark_every`, default 100
   ticks) and as the first stage of every retrain (logged as `spark` with `by: "retrain vN"`;
   covered by the retrain's cost). So the Pipeline's Spark node and the feature-freshness
-  tile reflect both.
+  tile reflect both. Since the Spark realism phase a job is incremental, partitioned and
+  simulated on a cluster: see "Spark on a simulated cluster" below.
 - **Settings** (Pipeline screen, `POST /api/settings`): `spark_every`, `retrain_every`
   (0 = off), `deploy_delay`, `epochs`, `negatives`, `slate_size`, `num_candidates`,
   `rebuild_index` (off: a deploy swaps the towers but keeps the old index, the classic
@@ -312,7 +313,7 @@ another component's random draws.
   `clear_history()` (the offline pipeline clears before recomputing, so repeated Spark runs
   no longer stack duplicate snapshots); `Kafka.poll(max_records=)`, `Kafka.lag(consumer)`;
   `Flink.paused`, `Flink.max_events_per_tick` (lag builds up), `Flink.track_watched`;
-  `Redis.read_transforms` (fault hook); `Spark.failing`.
+  `Redis.read_transforms` (fault hook); `Spark.failing` (now: cluster down).
 - **Faults** (`ml_system/faults.py`): `FaultInjector` (a Service, registered last; a fault
   starting at tick S is switched on at the end of tick S-1, or immediately via
   `apply_due(now)`). Kinds: `flink_outage`, `feature_corruption` (serving reads rotated genre
@@ -601,6 +602,100 @@ to ~14% and fails the self-test; `feature_corruption` barely moves CTR but skew 
 ~96%; `flink_outage` builds ~1.9 lagged events per tick; `model_server_outage` *raised* CTR
 to ~26% (the popularity fallback beats an early two-tower model: see Known issues).
 
+## Spark on a simulated cluster
+
+Goal: Spark realism (parallelism and the common batch failure modes) with **the same features
+and the same game by default**. Files: `ml_system/spark.py` (the job), `ml_system/spark_sim/`
+(`cluster.py`: config and cost model; `engine.py`: partition planning and a discrete-event
+scheduler), `ml_system/offline_pipeline.py` (per-entity feature steps), `ml_system/datalake.py`
+(files, compaction, pause), `world/dynamics.py` (viral movies), tests `tests/test_spark.py`,
+`tests/test_spark_console.py`. The old `spark_sim` lifecycle classes (application, driver,
+job, stage, task, schedulers, executor: one task running the whole pipeline synchronously)
+were replaced.
+
+- **Features never depend on the run.** `OfflineFeaturePipeline` is split into `user_task` /
+  `item_task` (a user's features depend only on its events; a movie's only on its events) and
+  `commit`. `process(events)` (full), `process_incremental(events)` and a Spark job with any
+  cluster, partitioning, AQE plan, retries or lost executors give byte-identical feature stores
+  (latest features, point-in-time history and dict order), checked against digests of the
+  previous single-loop implementation (`LEGACY` in `tests/test_spark.py`). The refactor is also
+  ~25% faster on a full recompute.
+- **Incremental runs** carry each entity's running state (raw genre counts, rating sum and
+  count, engagement state) and process `events[processed:]`. A full backfill runs on the first
+  run, when `profile_mode`/`engagement` change, or when the log is not an extension of the last
+  one (checked by identity of the last processed event).
+- **Atomic commit.** Tasks read deep copies of carried state and write nothing; `commit`
+  publishes history, latest features and the carried state at once. A failed job leaves the
+  store and the state untouched. (Before, `process` cleared the history first, so a failure in
+  the middle would have left training a half-written store; the old fault failed jobs before
+  they started, so it never showed.)
+- **Job plan.** Stage 0 scans the lake files (incremental: only files since the last run;
+  packed into ~128 MB tasks, per-file open cost), stage 1 user features and stage 2 item
+  features (hash partitions `key % spark_shuffle_partitions`; with AQE small partitions are
+  coalesced to ~64 MB and partitions over 5x the median and 256 MB are split by key, never
+  splitting a key), then a driver commit. The real work runs afterwards in task order.
+- **Cost model** (`cluster.py`): one simulated event stands for ~1000 production rows; 1 tick =
+  15 minutes (`spark_every` 100 = about daily). Start-up 15 s driver + 60 s executors; scan
+  2 ms/row + 50 ms/file; aggregation 10 ms/row + 0.3 s/task; 0.25 MB/row of task memory; task
+  memory = executor memory x 0.6 / cores; beyond it rows spill (1.5x row time per spilled row);
+  beyond 4x it the container is killed (OOM, the executor is lost with it). Duration in ticks =
+  floor(seconds / 900): **a job finishing inside its first tick is ready at once**, as the
+  instant job was, so the default game is unchanged. Price per executor-hour $0.50/core +
+  $0.10/GB, billed in the tick the job finishes (Costs: "Spark").
+- **Engine** (`engine.simulate`): executors x cores slots, stage barriers, task retries up to
+  `max_task_failures`, executors lost at random (exponential lifetime, spot) or by OOM, with
+  replacements after start-up. As in Spark, a task on a preempted executor is retried without
+  counting towards `max_task_failures` (only OOM, "caused by the app", counts), and the job
+  fails after max(2 x executors, 3) lost executors (`spark.executor.maxNumFailures`; an
+  earlier version counted preemptions as task failures and a 90 s spot storm killed even the
+  default cluster); a lost executor's map outputs are gone, so running reduce
+  stages get FetchFailed (re-attempt, up to 4) and the lost map tasks rerun; speculation
+  (checked every simulated second: 75% of a stage done, a task 1.5x the median gets a copy on
+  another executor); queue wait and partial grants; a 24-hour job timeout. Its RNG is
+  `random.Random("spark-<seed>-<job>")`, used only while executors can be lost. Iteration
+  order is by launch order everywhere (an early version kept running attempts in a `set` and
+  timelines differed between runs: regression test
+  `test_lost_executors_are_retried_and_recomputed_deterministically`).
+- **Console** (`SimSession._run_spark`): a job first waits for complete input
+  (`spark_wait_for_data`: `DataLake.ingested_tick >= tick`), failing after
+  `spark_sensor_timeout` ticks; it is then planned and simulated, and finishes `ticks` later.
+  A retrain's Spark stage reads the lake when the job starts and trains on those events.
+  `spark_throughput` (legacy) still sets a minimum duration. New defaults (both presets):
+  4 executors x 4 cores, 8 GB, 200 shuffle partitions, AQE, speculation, 4 task failures,
+  incremental, sensor on (8 ticks), lake compaction every 100 ticks.
+- **Faults:** `spark_executor_loss` (spot, mean executor lifetime 10 minutes), `spark_slow_node` (executor 1
+  10x slower; repair `replace_spark_node`), `spark_cluster_busy` (30 min queue, half the
+  executors), `lake_ingestion_lag` (`DataLake.paused`; repair `restart_lake_sink`),
+  `viral_movie`; all in chaos. Incident rules `spark_job` (last job failed), `spark_slow`
+  (last job over a tick), `lake_ingestion` (lake > 5 ticks behind).
+- **Viral movies (World):** `WorldDynamics.start_viral`: `UserSimulator.buzz` moves the movie's
+  click probability 50% of the way to `p_max`; 15% of visiting users who have not seen it watch
+  it without a slate (an organic `WatchEvent`, completion from relevance). Own RNGs
+  (`world-viral-<seed>`, `world-viral-watch-<seed>`); `viral_every` 0 by default (it changes
+  the World, so the measured CTR baselines would move); the `viral_movie` fault starts one.
+- **Data lake files:** one file per (tick, topic); `compact(before_tick)` merges small files
+  into ~512-row files (metadata only); `file_rows(start, end)` costs a scan.
+- **Measured: the default game is unchanged.** Rich world, default console setup, retrain
+  every 200 ticks, 2000 ticks, this branch vs main: identical event logs (same hash) and CTR
+  over ticks 800-2000: static seed 42 56.67%, seed 1 56.47%; dynamic seed 42 28.36%, seed 1
+  28.57%. 28 Spark jobs per game (scheduled + retrains), all incremental, all inside their
+  tick (longest 97 s). Only cash differs (Spark cost, about $0.30 a job).
+- **Measured: failure modes** (plans only, 2000 ticks of game events = 140k events, 11k lake
+  files; incremental batch = the last 100 ticks, 6.8k events):
+
+  | Scenario | Job |
+  |---|---|
+  | default, incremental | 1.4 min, ready at once |
+  | default, full backfill | 6.1 min (5.4 with a compacted lake); hot-movie task 131 s, spills 1.6 GB |
+  | full backfill on 1 executor x 1 core | 56 min: 3 ticks late |
+  | full, 1 executor x 4 cores x 2 GB, no AQE, 8 partitions | out of memory after 16 failed attempts |
+  | viral burst (3000 watches of one movie), default | 2.0 min: one 34 s straggler |
+  | viral burst with 1 GB executors (AQE on or off) | out of memory (a single key cannot be split) |
+  | spot loss (10 min mean lifetime), default, full | 9.1 min, 10 failed attempts, succeeds |
+  | spot loss, 1 executor, full | fails: 3 executors lost |
+  | slow node 10x, full: speculation on / off | 6.9 / 12.5 min |
+  | cluster busy (30 min queue, half the executors) | 32 min: 2 ticks late |
+
 ## Why CTR was flat (fixed)
 
 Main used to go 18.3% → 18.7% after a retrain. Expected-CTR analysis per user showed the
@@ -636,7 +731,8 @@ result is unstable: the model collapses to a few dozen near-global slates.
   experiment (not merged: it couples the towers).
 - Online and offline features still disagree on popularity (Flink: watches per item in
   Redis `item_popularity`, unused by serving; offline: watches in the feature store).
-- `retrain()` recomputes offline features that the Spark job already computed.
+- `retrain()` recomputes offline features that the Spark job already computed. (Console:
+  fixed by incremental Spark runs; `OfflinePipeline.run` still recomputes.)
 - Console: a stale index (`rebuild_index` off) does not visibly hurt CTR yet, because the
   trainer warm-starts from the previous towers, so v(n) user vectors still match v(n-1)
   item vectors. Faults (`index_id_mismatch`) now give the CTR alerts a real cause.

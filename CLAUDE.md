@@ -42,7 +42,7 @@ running several simulations in parallel.
 |---|---|
 | World (users, true tastes, dynamics, browsing, interest signals) | `world/` |
 | Streaming and storage | `ml_system/kafka.py`, `flink.py`, `redis.py`, `feast.py`, `datalake.py` |
-| Offline | `ml_system/spark.py`, `offline_*`, `features.py`, `training*.py` |
+| Offline | `ml_system/spark.py` + `spark_sim/` (cluster cost model, simulated scheduler), `offline_*`, `features.py`, `training*.py` |
 | Models | `two_tower.py`, `ranking.py` (MLP v2-v6), `online_model.py` (preference model), `cf_model.py`, `item_signals.py`, `candidate_sources.py`, `exploration.py` |
 | Serving | `model_server.py`, `kserve.py`, `ann.py`, `ann_indexes.py`, `fallback.py` |
 | Ops | `faults.py`, `experiments.py`, `model_registry.py`, `metrics.py` |
@@ -60,6 +60,10 @@ running several simulations in parallel.
 - **Where CTR stands** (rich, mean ticks 800-2000): static ~51%, dynamic ~30% (seed 42 29.7,
   seed 1 30.6). The dynamic gap is evidence per user, not model capacity; hidden-taste learning
   (factors, CF) does not pay at game data volumes. Details and every experiment in the notes.
+- **Spark** runs on a simulated cluster (1 tick ~ 15 min): incremental, partitioned, atomic
+  commit; features are byte-identical for any cluster or schedule, and a job that finishes
+  inside its tick is ready at once (so the default game is unchanged). Failure modes (spot loss,
+  OOM/skew, slow node, busy cluster, stuck lake sink) are faults; viral movies are World-side.
 - **Actions apply at tick boundaries**; retrains train in a background thread and deploy after
   `deploy_delay` ticks; every version (towers, index, preference model, CF) rolls back together.
 - **API:** the UI polls `GET /api/snapshot` only; actions are POSTs queued for the next tick
