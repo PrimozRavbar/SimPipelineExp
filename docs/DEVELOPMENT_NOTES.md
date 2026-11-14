@@ -731,6 +731,10 @@ and `tests/test_training_console.py`.
   -> 27.99, s1 28.57 -> 28.26. Real training also takes up to ~3 minutes of wall time late in a
   game, so a short window would stall the clock at every retrain. `deploy_delay` stays 50 (a
   release window).
+- **Measured: the default game is unchanged.** The four 2000-tick default games (rich, retrain
+  every 200, static and dynamic, seeds 42 and 1) give the same event logs as main (same hashes)
+  and CTR over ticks 800-2000: static 56.67 / 56.47, dynamic 28.36 / 28.57. All 36 workflow runs
+  succeed; every training job simulates inside the 50-tick window.
 - **Real settings:** `train_batch_size` (the trainer's batch size) and `learning_rate` (Adam's lr,
   set on the optimizer each retrain; choices 0.0001-1.0) change the model. Defaults equal the
   previous values (32, 0.001), so models are bit-identical. Measured (best preset, seed 3, 10
