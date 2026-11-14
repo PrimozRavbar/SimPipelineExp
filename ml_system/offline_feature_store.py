@@ -51,6 +51,23 @@ class OfflineFeatureStore(Service):
         history.setdefault(entity_id, []).append((key, deepcopy(features)))
 
 
+    def append_history(self, kind, entity_id, entries):
+        """Append point-in-time snapshots [((timestamp, event_order),
+        features), ...] for one user ("user") or movie ("item"). The
+        features are stored as given (the caller passes fresh copies)."""
+        if kind == "user":
+            history, keys = self.user_feature_history, self._user_keys
+        else:
+            history, keys = self.item_feature_history, self._item_keys
+        entity_keys = keys.setdefault(entity_id, [])
+        entity_history = history.setdefault(entity_id, [])
+        for key, features in entries:
+            if entity_keys and key < entity_keys[-1]:
+                self._unsorted.add((kind, entity_id))
+            entity_keys.append(key)
+            entity_history.append((key, features))
+
+
     def write_user_features(
         self,
         user_id,

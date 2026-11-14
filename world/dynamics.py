@@ -21,6 +21,7 @@ DRIFT_GENRES = [genre for genre in GENRE_NAMES if genre != "unknown"]
 DYNAMICS_KEYS = (
     "taste_drift_every", "taste_drift_share", "taste_drift_strength",
     "initial_user_share", "users_joining_per_tick", "taste_drift_mode", "taste_drift_steps",
+    "viral_every", "viral_duration", "viral_buzz", "viral_organic",
 )
 DRIFT_MODES = ("abrupt", "gradual")
 EXPOSURE_KEYS = ("fatigue", "rewatch", "fatigue_recovery")
@@ -53,6 +54,10 @@ class WorldDynamics(Service):
         users_joining_per_tick=0.0,
         taste_drift_mode="abrupt",
         taste_drift_steps=4,
+        viral_every=0,
+        viral_duration=300,
+        viral_buzz=0.5,
+        viral_organic=0.15,
     ):
         super().__init__()
 
@@ -82,6 +87,20 @@ class WorldDynamics(Service):
         self.journeys = {}           # user -> [target genre, steps left]
         self._relatedness = None
 
+        # Viral movies: every viral_every ticks (0 = off) a random movie goes
+        # viral for viral_duration ticks. Its click probability moves
+        # viral_buzz of the way to the maximum for every user, and a share
+        # viral_organic of visiting users watch it without a slate (they
+        # heard about it). Its own RNG, so it never shifts other draws.
+        self.viral_every = int(viral_every)
+        self.viral_duration = int(viral_duration)
+        self.viral_buzz = float(viral_buzz)
+        self.viral_organic = float(viral_organic)
+        self.viral_rng = random.Random("world-viral-%s" % seed)
+        self.viral = None            # {"movie_id", "start", "end"} while one is viral
+        self.viral_log = []          # (start tick, movie_id)
+        world.viral_rng = random.Random("world-viral-watch-%s" % seed)
+
         self.drift_log = []          # (tick, user_id, genre)
         self.joined_log = []         # (tick, user_id)
 
@@ -96,6 +115,11 @@ class WorldDynamics(Service):
 
     def process(self, sim):
         now = sim.clock.now
+
+        if self.viral is not None and self.viral["end"] is not None and now >= self.viral["end"]:
+            self.end_viral()
+        if self.viral_every and now > 0 and now % self.viral_every == 0 and self.viral is None:
+            self.start_viral(now)
 
         if self.taste_drift_every and self.taste_drift_mode == "abrupt" \
                 and now % self.taste_drift_every == 0:
@@ -197,8 +221,32 @@ class WorldDynamics(Service):
             else:
                 self.journeys[user_id][1] = left - 1
 
+    # -- viral movies ------------------------------------------------------
+
+    def start_viral(self, now, movie_id=None, duration=None):
+        """Make a movie viral from the next tick, for `duration` ticks
+        (None = viral_duration, 0 = until end_viral). Returns its id."""
+        if self.viral is not None:
+            self.end_viral()
+        if movie_id is None:
+            movie_id = self.viral_rng.choice(sorted(self.world.movie_objects))
+        if duration is None:
+            duration = self.viral_duration
+        self.viral = {"movie_id": movie_id, "start": now, "end": now + duration if duration else None}
+        self.viral_log.append((now, movie_id))
+        self.world.user_simulator.buzz = {movie_id: self.viral_buzz}
+        self.world.viral = {"movie_id": movie_id, "organic": self.viral_organic, "watched": set()}
+        return movie_id
+
+    def end_viral(self):
+        self.viral = None
+        self.world.user_simulator.buzz = {}
+        self.world.viral = None
+
     def summary(self):
         return {
+            "viral": None if self.viral is None else dict(self.viral),
+            "viral_movies": len(self.viral_log),
             "active_users": len(self.world.active_user_ids)
             if self.world.active_user_ids is not None else len(self.world.user_objects),
             "waiting_users": len(self.waiting),

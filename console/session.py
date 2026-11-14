@@ -41,6 +41,7 @@ from ml_system.ranking import (ExplorationReranker, LogisticRanker, MLPRanker, M
 from ml_system.model_registry import export_bundle
 from ml_system.ann_indexes import INDEX_TYPES, index_embeddings, index_kind, make_index, vectors_per_query
 from ml_system.feast import MODES as FEAST_MODES
+from ml_system.spark_sim.cluster import TICK_SECONDS, ClusterConfig
 from ml_system.redis import EVICTION_POLICIES
 from console.economy import ONE_OFF, PRICES, Economy
 from ml_system.online_model import PreferenceModel, PreferenceRanker, PreferenceRetrieval
@@ -141,7 +142,21 @@ DEFAULT_SETTINGS = {
     "lag_alert": 150,          # incident when Flink's Kafka lag exceeds this
     "skew_alert_pct": 60,      # incident when online/offline feature skew exceeds this %
     "chaos_every": 0,          # a hidden random fault about every N ticks (0 = off)
-    "spark_throughput": 0,     # events a Spark job processes per tick (0 = instant)
+    "spark_throughput": 0,     # legacy: events a Spark job processes per tick (0 = use the cluster model)
+    # Spark cluster (ml_system/spark_sim): a job's duration and failures come
+    # from its tasks on this cluster; 1 tick ~ 15 minutes, and a job that
+    # finishes inside its first tick is ready at once.
+    "spark_executors": 4,
+    "spark_executor_cores": 4,
+    "spark_executor_memory_gb": 8,
+    "spark_shuffle_partitions": 200,
+    "spark_aqe": True,         # adaptive query execution: coalesce small partitions, split skewed ones
+    "spark_speculation": True, # re-launch straggling tasks on another executor
+    "spark_task_max_failures": 4,  # attempts per task before the job is aborted
+    "spark_incremental": True, # process only the events since the last run (a full backfill when needed)
+    "spark_wait_for_data": True,   # wait until the lake has the latest data before running (sensor)
+    "spark_sensor_timeout": 8, # ... and fail the job after waiting this many ticks
+    "lake_compact_every": 100, # merge the data lake's small files every N ticks (0 = never)
     "freshness_alert": 400,    # incident when offline features are older than this (ticks)
     # Infrastructure (defaults = the original behaviour: nothing limited)
     "kafka_partitions": 3,
@@ -174,6 +189,8 @@ DEFAULT_SETTINGS = {
     "fatigue_recovery_ticks": 0,  # fatigue halves every N ticks since the last impression (0 = never)
     "rewatch_pct": 100,        # click probability kept for an already-watched movie
     "users_joining_per_100_ticks": 0,
+    "viral_every": 0,          # every N ticks a movie goes viral: everyone talks about it (0 = off)
+    "viral_duration": 300,     # ... for this many ticks
 }
 
 # Presets. "plain": every model feature off (the original console). "best":
@@ -234,6 +251,15 @@ SETTING_LIMITS = {
     "skew_alert_pct": (1, 100),
     "chaos_every": (0, 100000),
     "spark_throughput": (0, 10000000),
+    "spark_executors": (1, 64),
+    "spark_executor_cores": (1, 32),
+    "spark_executor_memory_gb": (1, 256),
+    "spark_shuffle_partitions": (1, 5000),
+    "spark_task_max_failures": (1, 20),
+    "spark_sensor_timeout": (1, 10000),
+    "lake_compact_every": (0, 100000),
+    "viral_every": (0, 100000),
+    "viral_duration": (10, 100000),
     "freshness_alert": (10, 100000),
     "taste_drift_every": (0, 100000),
     "taste_drift_share_pct": (1, 100),
@@ -270,7 +296,8 @@ BOOL_SETTINGS = {"rebuild_index", "ranker", "ranker_mlp", "filter_watched", "eva
                  "logq_correction", "graded_positives", "tower_history", "train_from_scratch",
                  "ranker_multitask", "ranker_signals", "tower_engagement", "tower_demographics",
                  "tower_shared_ids", "ranker_tower_score", "preference_model",
-                 "preference_history", "ranker_preference_score", "explore_ips", "cf_model"}
+                 "preference_history", "ranker_preference_score", "explore_ips", "cf_model",
+                 "spark_aqe", "spark_speculation", "spark_incremental", "spark_wait_for_data"}
 
 # Settings that take one of a few strings.
 CHOICE_SETTINGS = {"redis_eviction": EVICTION_POLICIES, "feast_mode": FEAST_MODES,
@@ -301,6 +328,11 @@ CHAOS_DURATIONS = {
     "model_server_outage": 120,
     "traffic_spike": 80,
     "spark_failure": 300,
+    "spark_executor_loss": 200,
+    "spark_slow_node": None,
+    "spark_cluster_busy": 150,
+    "lake_ingestion_lag": None,
+    "viral_movie": 300,
 }
 
 RUNBOOKS = {
@@ -352,6 +384,26 @@ RUNBOOKS = {
         "Offline features have not been recomputed for a long time: training and serving fallbacks use old data.",
         "Check the Spark job on Pipeline (Batch features): is it scheduled, and do its runs fail?",
         "If runs fail, wait for the cluster to recover, then run the job by hand.",
+    ],
+    "spark_job": [
+        "Open Pipeline, Batch features (Spark): the last job's stages, tasks and log show where it failed.",
+        "Out of memory: a task held more rows than its executor memory allows. Raise executor memory, use "
+        "fewer cores per executor, more shuffle partitions, or switch AQE on (it splits skewed partitions).",
+        "Executors lost / FetchFailed: spot nodes are being reclaimed. Retries absorb it (max task failures "
+        "4); the job is slower until the cluster is stable.",
+        "Sensor timed out: the data lake is behind (see the lake's Kafka lag). Restart the lake sink.",
+        "The feature store keeps the last good version: a failed job never publishes half its output.",
+    ],
+    "spark_slow": [
+        "The last Spark job took more than a tick: features (and a retrain waiting for them) land later.",
+        "Check the stage table: one slow task (skew ratio) means a hot key or a slow node; all tasks slow "
+        "means too few executors, spilling (memory) or a full recompute.",
+        "Fixes: more executors or memory, AQE and speculation on, incremental runs, replace a degraded node.",
+    ],
+    "lake_ingestion": [
+        "The data lake sink is not writing: events pile up in Kafka (its lag) and batch jobs see old data.",
+        "Restart the lake sink (Pipeline, Data lake). With 'wait for data' on, Spark jobs wait for it; off, "
+        "they run on incomplete data and succeed silently.",
     ],
     "drift": [
         "What users click has shifted away from what the model was trained on.",
@@ -535,6 +587,9 @@ class SimSession:
         self.last_spark_tick = None
         self.spark_job = None
         self.spark_runs = 0
+        self.spark_failures = 0
+        self.last_spark_error = None     # {"tick", "reason", "error", "by"} of the last failed job
+        self._spark_bill = 0.0           # money for Spark jobs finished since the last tick was billed
 
         # Budget, event log, incidents
         self.budget_used = 0
@@ -684,9 +739,18 @@ class SimSession:
         now = self.tick
 
         # 1. A due deploy goes first, so actions at this boundary see it.
-        # 0. A Spark job that is due finishes first (a retrain may be waiting).
-        if self.spark_job is not None and now >= self.spark_job["done_tick"]:
+        # 0. A Spark job waiting for its input starts once the lake has
+        # caught up; a job that is due finishes (a retrain may be waiting).
+        if self.spark_job is not None and self.spark_job["status"] == "waiting":
+            self._check_spark_sensor()
+        if self.spark_job is not None and self.spark_job["status"] == "running" \
+                and now >= self.spark_job["done_tick"]:
             self._finish_spark()
+        s = self.settings
+        if now > 0 and s["lake_compact_every"] and now % s["lake_compact_every"] == 0:
+            before, after = self.system["datalake"].compact(now)
+            if before != after:
+                self._log("job", "Data lake compaction: %d files -> %d." % (before, after))
 
         if self.retrain is not None and self.retrain["thread"] is not None \
                 and now >= self.retrain["deploy_tick"]:
@@ -826,49 +890,119 @@ class SimSession:
     # Spark -------------------------------------------------------------
 
     def _run_spark(self, by, events=None, charge=True, then=None):
-        """Start the offline feature job (Spark) over the data lake.
+        """Submit the offline feature job (Spark) over the data lake.
 
-        With spark_throughput 0 it finishes at once (the original
-        behaviour); otherwise it takes ceil(events / throughput) ticks and
-        its features land when it finishes. `then(ok)` runs at completion
-        (a retrain uses it to start training). Every retrain runs this as
-        its first stage (charge=False: the retrain cost covers it)."""
+        The job first waits for complete input (spark_wait_for_data: the
+        lake must have every tick so far; it fails after
+        spark_sensor_timeout ticks). Then it is planned and simulated on
+        the cluster (ml_system/spark.py): its duration in ticks is the
+        simulated time / TICK_SECONDS, rounded down, so a job that
+        finishes inside its first tick is ready at once. Its features land
+        when it finishes. `then(ok, events)` runs at completion (a retrain
+        uses it to start training). Every retrain runs this as its first
+        stage (charge=False: the retrain cost covers it). spark_throughput
+        > 0 (legacy) makes a job take at least events / throughput ticks."""
         if self.spark_job is not None:
-            raise ActionError("a Spark job is already running (finishes at tick %d)" % self.spark_job["done_tick"])
-        if events is None:
-            events = list(self.system["datalake"].events)
-        throughput = self.settings["spark_throughput"]
-        duration = 0 if not throughput else max(1, -(-len(events) // throughput))
+            job = self.spark_job
+            when = ("finishes at tick %d" % job["done_tick"]) if job["status"] == "running" \
+                else "waiting for the data lake"
+            raise ActionError("a Spark job is already running (%s)" % when)
         if charge:
             self.budget_used += COST_SPARK
-        self.spark_job = {"start": self.tick, "done_tick": self.tick + duration, "events": events,
-                          "by": by, "then": then}
+        self.spark_job = {"start": self.tick, "done_tick": None, "events": events, "by": by,
+                          "then": then, "run": None, "status": "waiting"}
+        if self.settings["spark_wait_for_data"] and not self._lake_complete():
+            lake = self.system["datalake"]
+            self._log("job", "Spark feature job (by %s) waiting for the data lake: it has data up to tick %d, "
+                      "not %d." % (by, lake.ingested_tick, self.tick), cls="s-warn")
+            return "spark job waiting for the data lake"
+        return self._launch_spark()
+
+    def _lake_complete(self):
+        return self.tick == 0 or self.system["datalake"].ingested_tick >= self.tick
+
+    def _check_spark_sensor(self):
+        job = self.spark_job
+        if not self.settings["spark_wait_for_data"] or self._lake_complete():
+            self._launch_spark()
+            return
+        if self.tick - job["start"] >= self.settings["spark_sensor_timeout"]:
+            self.spark_job = None
+            lake = self.system["datalake"]
+            error = ("sensor timed out after %d ticks: the data lake has data up to tick %d only"
+                     % (self.tick - job["start"], lake.ingested_tick))
+            self.spark_failures += 1
+            self.last_spark_error = {"tick": self.tick, "reason": "sensor_timeout", "error": error, "by": job["by"]}
+            self._log("job", "Spark feature job FAILED (by %s): %s" % (job["by"], error), cls="s-crit")
+            if self.logger is not None:
+                self.logger.log_event("spark_failed", self.tick, events=0, by=job["by"], reason="sensor_timeout")
+            if job["then"] is not None:
+                job["then"](False, None)
+
+    def _launch_spark(self):
+        job = self.spark_job
+        lake = self.system["datalake"]
+        if job["events"] is None:
+            job["events"] = list(lake.events)
+        events = job["events"]
+        run = self.system["spark"].plan_offline_feature_job(events, self.offline.feature_pipeline,
+                                                            lake=lake, submitted_tick=self.tick)
+        duration = run.ticks
+        throughput = self.settings["spark_throughput"]
+        if throughput:
+            duration = max(duration, max(1, -(-len(events) // throughput)))
+        job.update(run=run, status="running", started=self.tick, done_tick=self.tick + duration)
+        report = run.report
         if duration:
-            self._log("job", "Spark feature job started over %d events (by %s); finishes at tick %d."
-                      % (len(events), by, self.tick + duration))
+            self._log("job", "Spark feature job started (by %s): %s over %d events; finishes at tick %d."
+                      % (job["by"], run.batch.reason, run.batch.size, self.tick + duration))
             return "spark job started, finishes at tick %d" % (self.tick + duration)
         return self._finish_spark()
 
     def _finish_spark(self):
         job, self.spark_job = self.spark_job, None
         events = job["events"]
+        run = job["run"]
         try:
-            self.system["spark"].run_offline_feature_job(events, self.offline.feature_pipeline)
+            self.system["spark"].run_offline_feature_job(events, self.offline.feature_pipeline, run=run)
             ok = True
         except RuntimeError as error:
             ok = False
+            self.spark_failures += 1
+            self.last_spark_error = {"tick": self.tick, "reason": run.report.reason, "error": run.report.error,
+                                     "by": job["by"]}
             self._log("job", "Spark feature job FAILED (by %s): %s" % (job["by"], error), cls="s-crit")
             if self.logger is not None:
-                self.logger.log_event("spark_failed", self.tick, events=len(events), by=job["by"])
+                self.logger.log_event("spark_failed", self.tick, events=len(events), by=job["by"],
+                                      reason=run.report.reason)
+        self._spark_bill += run.summary()["cost"]
         if ok:
             self.last_spark_tick = self.tick
             self.spark_runs += 1
-            self._log("job", "Spark feature job finished over %d events (by %s)." % (len(events), job["by"]))
+            self.last_spark_error = None
+            self._log("job", "Spark feature job finished (by %s): %s over %d events in %.1f min."
+                      % (job["by"], run.batch.reason, run.batch.size, run.report.duration_s / 60.0))
             if self.logger is not None:
                 self.logger.log_event("spark", self.tick, events=len(events), by=job["by"])
         if job["then"] is not None:
-            job["then"](ok)
+            job["then"](ok, events)
         return "spark job finished" if ok else "spark job failed"
+
+    def _spark_view(self):
+        spark = self.system["spark"]
+        job = self.spark_job
+        last = spark.last_run
+        return {"last_run_tick": self.last_spark_tick, "runs": self.spark_runs,
+                "failures": self.spark_failures, "last_error": self.last_spark_error,
+                "every": self.settings["spark_every"],
+                "running": None if job is None else {"start": job["start"], "done_tick": job["done_tick"],
+                                                     "status": job["status"], "by": job["by"]},
+                "cluster": spark.config.summary(), "price_per_hour": round(spark.config.price_per_hour(), 2),
+                "incremental": spark.incremental, "tick_seconds": TICK_SECONDS,
+                "last_job": None if last is None else last.summary(timeline=True),
+                "history": [{k: h[k] for k in ("job_id", "mode", "reason", "events", "submitted_tick", "ticks",
+                                               "status", "error", "duration_s", "cost")}
+                            for h in spark.history]}
 
     # Retrain / deploy --------------------------------------------------
 
@@ -880,7 +1014,10 @@ class SimSession:
         if self.canary is not None:
             raise ActionError("a canary is running; promote or abort it first")
         if self.spark_job is not None:
-            raise ActionError("a Spark job is running; retrain when it finishes (tick %d)" % self.spark_job["done_tick"])
+            job = self.spark_job
+            raise ActionError("a Spark job is running; retrain when it finishes (%s)"
+                              % ("tick %d" % job["done_tick"] if job["status"] == "running"
+                                 else "it is waiting for the data lake"))
         if not any(type(e).__name__ == "RecommendationClickedEvent" for e in self.system["datalake"].events):
             raise ActionError("no clicks to learn from yet; let the simulation run first")
 
@@ -939,8 +1076,10 @@ class SimSession:
             self.logger.log_event("retrain_start", now, model_version=version,
                                   deploy_tick=record["deploy_tick"])
         # Stage 1: offline features (Spark). Training starts when it ends.
-        self._run_spark(by="retrain v%d" % version, events=events, charge=False,
-                        then=lambda ok: self._features_ready(record, events, ok))
+        # events=None: the job reads the lake when it starts (the same events
+        # unless it has to wait for the lake to catch up).
+        self._run_spark(by="retrain v%d" % version, events=None, charge=False,
+                        then=lambda ok, used: self._features_ready(record, used if used is not None else events, ok))
         if record["stage"] == "features":
             return "retrain v%d: waiting for the Spark job" % version
         return "training v%d, deploys at tick %d" % (version, record["deploy_tick"])
@@ -1466,6 +1605,15 @@ class SimSession:
         mode = "rich" if s["rich_profiles"] else "watches"
         self.flink.profile_mode = mode
         self.offline.feature_pipeline.profile_mode = mode
+        spark = self.system["spark"]
+        spark.config = ClusterConfig(
+            executors=s["spark_executors"], cores=s["spark_executor_cores"],
+            memory_gb=s["spark_executor_memory_gb"], shuffle_partitions=s["spark_shuffle_partitions"],
+            aqe=s["spark_aqe"], speculation=s["spark_speculation"],
+            max_task_failures=s["spark_task_max_failures"])
+        spark.incremental = s["spark_incremental"]
+        self.dynamics.viral_every = s["viral_every"]
+        self.dynamics.viral_duration = s["viral_duration"]
         self.system["world"].onboarding = {"genres": 3, "noise": 0.3} if s["onboarding"] else None
         self.system["world"].browsing = {"rate": s["browse_pct"] / 100.0} if s["browse_pct"] else None
         self.simulator.rating_probability = s["rating_pct"] / 100.0
@@ -1609,6 +1757,8 @@ class SimSession:
         if runs:
             breakdown["Feast"] += runs * PRICES["feast_materialization"]
             self._materializations_billed = self.feast.materializations
+        breakdown["Spark"] = self._spark_bill
+        self._spark_bill = 0.0
         self.economy.tick(now, clicks, breakdown)
 
     def _chaos_gap(self):
@@ -1648,9 +1798,13 @@ class SimSession:
             self.model_server.retriever_down = False
         if action == "restart_kafka_broker":
             self.kafka.broker_up()
+        if action == "restart_lake_sink":
+            self.system["datalake"].paused = False
         label = {"restart_flink": "Flink restarted", "rebuild_index": "ANN index rebuilt with v%d embeddings"
                  % self.serving_version, "restart_model_server": "Model server restarted",
-                 "restart_kafka_broker": "Kafka broker restarted"}[action]
+                 "restart_kafka_broker": "Kafka broker restarted",
+                 "replace_spark_node": "Degraded Spark node drained and replaced",
+                 "restart_lake_sink": "Data lake sink restarted"}[action]
         self._log("ops", "%s by you." % label, cls="s-accent")
         if self.logger is not None:
             self.logger.log_event("repair", self.tick, action=action, faults_ended=[f.id for f in ended])
@@ -1699,6 +1853,23 @@ class SimSession:
                    "SEV2", "Model server serving popularity fallback",
                    "%.0f%% of requests in the last 10 ticks were served by the fallback, not the model."
                    % (h["fallback_share"] * 100))
+
+        error = self.last_spark_error
+        self._rule("spark_job", error is not None, error is None, "WARN",
+                   "Spark feature job failed%s" % (" (%s)" % error["reason"] if error and error["reason"] else ""),
+                   "The last Spark feature job (by %s, tick %d) failed: %s" % (error["by"], error["tick"], error["error"])
+                   if error else "")
+        last = self.system["spark"].last_run
+        slow = last is not None and last.report.succeeded and last.ticks >= 1
+        self._rule("spark_slow", slow, last is not None and last.ticks == 0, "WARN", "Spark job over a tick: %.0f min" % (last.report.duration_s / 60.0 if last else 0),
+                   "The last Spark job took %.0f minutes (%d ticks of 15 minutes)."
+                   % ((last.report.duration_s / 60.0, last.ticks) if last else (0, 0)))
+        lake = self.system["datalake"]
+        behind = now - lake.ingested_tick if now > 0 else 0
+        self._rule("lake_ingestion", behind > 5, behind <= 1, "WARN",
+                   "Data lake %d ticks behind" % behind,
+                   "The lake sink has written no data since tick %d; %d events are waiting in Kafka."
+                   % (lake.ingested_tick, self.kafka.lag("DataLake")))
 
         cash = self.economy.cash
         self._rule("budget", cash < 0, cash >= 0, "SEV2", "Over budget: cash $%.0f" % cash,
@@ -1960,7 +2131,10 @@ class SimSession:
                 "index_version": self.index_version,
                 "spark_job": None if self.spark_job is None else {
                     "start": self.spark_job["start"], "done_tick": self.spark_job["done_tick"],
-                    "events": len(self.spark_job["events"]), "by": self.spark_job["by"]},
+                    "status": self.spark_job["status"],
+                    "events": len(self.spark_job["events"] if self.spark_job["events"] is not None
+                                  else self.system["datalake"].events),
+                    "by": self.spark_job["by"]},
                 "training": None if r is None else {
                     "stage": r["stage"],
                     "version": r["version"],
@@ -2084,11 +2258,8 @@ class SimSession:
                 "ann": {"index_version": self.index_version, "model_version": self.serving_version,
                         "self_test": self.health["index_self_test"],
                         "items": len(getattr(self.retriever.ann_index, "nodes", {}) or {})},
-                "lake": {"events": len(datalake.events)},
-                "spark": {"last_run_tick": self.last_spark_tick, "runs": self.spark_runs,
-                          "every": self.settings["spark_every"],
-                          "running": None if self.spark_job is None else {
-                              "start": self.spark_job["start"], "done_tick": self.spark_job["done_tick"]}},
+                "lake": {**datalake.summary(), "lag": kafka.lag("DataLake")},
+                "spark": self._spark_view(),
                 "ofs": {"users": len(store.user_features), "items": len(store.item_features)},
                 "train": None if r is None else {"version": r["version"], "started_tick": r["started_tick"],
                                                  "deploy_tick": r["deploy_tick"], "done": r["done"].is_set(),

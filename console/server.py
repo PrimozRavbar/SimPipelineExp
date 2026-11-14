@@ -16,6 +16,7 @@ POST /api/settings {name: value, ...}               queued for the next tick bou
 GET  /api/faults                 faults so far (hidden chaos faults only counted while active)
 POST /api/fault {"kind": k, "duration": n|null}     inject a fault drill at the next tick
 POST /api/repair/{action}        restart_flink | rebuild_index | restart_model_server | restart_kafka_broker
+                                 | replace_spark_node | restart_lake_sink
 POST /api/swap {component, to}   swap a component (ann_index: hnsw | ivf | exact); costs money
 POST /api/canary/promote | /api/canary/abort       end a running canary
 POST /api/models/{v}/export      save model v (towers, index, ranker) under <run_dir>/models/v<v>
@@ -23,6 +24,7 @@ POST /api/models/{v}/export      save model v (towers, index, ranker) under <run
 
 from pathlib import Path
 
+from ml_system.faults import FIXES
 from console.session import ActionError, SimSession
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -159,7 +161,7 @@ def create_app(session):
 
     @app.post("/api/repair/{name}")
     def repair(name: str):
-        if name not in ("restart_flink", "rebuild_index", "restart_model_server", "restart_kafka_broker"):
+        if name not in FIXES:
             raise HTTPException(status_code=404, detail="unknown repair %r" % name)
         return action(name)
 
