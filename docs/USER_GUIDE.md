@@ -328,7 +328,7 @@ every` to get hidden ones.
 | Two-tower retrieval down | fallback share 100% | Restart model server |
 | Traffic spike | more users per tick; overflow if KServe is capped | Scale KServe, wait |
 | Spark feature jobs failing (cluster down) | jobs fail, features age, retrains abort | Wait; freshness alert |
-| Spark executors being reclaimed (spot) | executors lost mid-job, tasks retried, lost shuffle output recomputed; slower jobs | Retries absorb it (max task failures 4); with 1 the jobs fail |
+| Spark executors being reclaimed (spot) | executors lost mid-job (each lives ~10 minutes), tasks retried, lost shuffle output recomputed; slower jobs | The default cluster absorbs it; a small cluster gives up after max(2 x executors, 3) lost executors. More executors, incremental runs |
 | Degraded Spark node | one executor 10x slower: stragglers, high skew ratio | Speculation (on by default); Replace degraded node |
 | Spark cluster busy | jobs wait ~30 min for resources and get half the executors; late features | Wait |
 | Data lake sink stuck | lake stops growing, its Kafka lag grows; jobs wait for data, then fail | Restart lake sink |

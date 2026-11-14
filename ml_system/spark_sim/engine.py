@@ -289,6 +289,8 @@ def simulate(stages, config, conditions=None, rng=None, listing_files=0, commit_
     by_id = {s.spec.stage_id: s for s in st}
     failed = [None]
     now = [begin]
+    executor_failures = [0]
+    max_executor_failures = max(2 * config.executors, 3)
     check_pending = [False]
 
     def runnable(stage):
@@ -361,18 +363,30 @@ def simulate(stages, config, conditions=None, rng=None, listing_files=0, commit_
         if not any(not a.done for a in task.attempts):
             task.state = "pending"
 
-    def lose_executor(executor, reason):
+    def lose_executor(executor, reason, caused_by_app=False):
         if not executor.alive:
             return
         executor.alive = False
         executor.lost_at = now[0]
         executor.lost_reason = reason
+        executor_failures[0] += 1
         log(now[0], "Executor %d lost: %s" % (executor.id, reason))
         for attempt in list(executor.running):
             finish_attempt(attempt, "lost")
             task = attempt.task
-            if task.state != "done":
-                fail_task(task, "ExecutorLostFailure (executor %d exited: %s)" % (executor.id, reason))
+            if task.state == "done":
+                continue
+            if caused_by_app:
+                fail_task(task, "ExecutorLostFailure (executor %d exited caused by one of the running "
+                                "tasks: %s)" % (executor.id, reason))
+            elif not any(not a.done for a in task.attempts):
+                # Not the task's fault (preemption): retried without
+                # counting towards spark.task.maxFailures.
+                task.state = "pending"
+        if failed[0] is None and executor_failures[0] >= max_executor_failures:
+            failed[0] = ("Max number of executor failures (%d) reached (spark.executor.maxNumFailures)"
+                         % max_executor_failures)
+            report.reason = "oom" if caused_by_app else "executors_lost"
         # Map outputs on it are gone: reduce stages that still need them
         # fail to fetch, and the lost map tasks run again.
         lost_maps = [task for stage in st if stage.spec.kind == "scan" for task in stage.tasks
@@ -442,7 +456,7 @@ def simulate(stages, config, conditions=None, rng=None, listing_files=0, commit_
                 if failed[0] is None:
                     log(now[0], "Task %d of %s ran out of memory (%d rows)" % (task.index, task.stage.spec.name,
                                                                                task.spec.rows))
-                    lose_executor(attempt.executor, "container killed (out of memory)")
+                    lose_executor(attempt.executor, "container killed (out of memory)", caused_by_app=True)
                 else:
                     report.reason = "oom"
         elif kind == "lost":

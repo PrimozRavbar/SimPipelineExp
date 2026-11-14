@@ -87,7 +87,7 @@ def test_retrain_waits_for_the_lake_and_trains_on_complete_data():
 
 
 def test_fragile_cluster_fails_under_spot_loss_and_retrains_abort():
-    s = make(spark_task_max_failures=1, spark_executors=2, spark_executor_cores=1)
+    s = make(spark_executors=1, spark_executor_cores=1)
     s.step(20)
     s.submit("fault", kind="spark_executor_loss", duration=None)
     s.step(1)

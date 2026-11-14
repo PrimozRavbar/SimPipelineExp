@@ -20,9 +20,10 @@ Kinds and what they break:
 - traffic_spike        Several times more users per tick.
 - spark_failure        The Spark cluster is down: feature jobs fail (offline
                        features go stale, retrains that need them abort).
-- spark_executor_loss  Spot executors are reclaimed mid-job: tasks are
-                       retried and lost shuffle output recomputed (slower
-                       jobs; with too few retries they fail).
+- spark_executor_loss  Spot executors are reclaimed mid-job (each lives ~10
+                       minutes): tasks are retried and lost shuffle output
+                       recomputed (slower jobs); a job fails once
+                       max(2 x executors, 3) executors have been lost.
 - spark_slow_node      One executor runs 10x slower (a degraded node):
                        stragglers, unless speculation re-runs them.
 - spark_cluster_busy   The shared cluster is busy: jobs wait ~30 minutes
@@ -245,7 +246,7 @@ class FaultInjector(Service):
         return undo
 
     def _start_spark_executor_loss(self, fault):
-        return self._spark_conditions(executor_loss_mean_s=fault.params.get("mean_seconds", 90))
+        return self._spark_conditions(executor_loss_mean_s=fault.params.get("mean_seconds", 600))
 
     def _start_spark_slow_node(self, fault):
         return self._spark_conditions(slow_executor_factor=fault.params.get("factor", 10))

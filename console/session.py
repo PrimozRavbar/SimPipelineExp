@@ -389,8 +389,9 @@ RUNBOOKS = {
         "Open Pipeline, Batch features (Spark): the last job's stages, tasks and log show where it failed.",
         "Out of memory: a task held more rows than its executor memory allows. Raise executor memory, use "
         "fewer cores per executor, more shuffle partitions, or switch AQE on (it splits skewed partitions).",
-        "Executors lost / FetchFailed: spot nodes are being reclaimed. Retries absorb it (max task failures "
-        "4); the job is slower until the cluster is stable.",
+        "Executors lost: spot nodes are being reclaimed. Tasks are retried and lost shuffle output recomputed "
+        "(slower jobs); the job gives up after max(2 x executors, 3) lost executors. More executors and "
+        "incremental (short) runs ride it out.",
         "Sensor timed out: the data lake is behind (see the lake's Kafka lag). Restart the lake sink.",
         "The feature store keeps the last good version: a failed job never publishes half its output.",
     ],

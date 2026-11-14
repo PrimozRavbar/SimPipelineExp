@@ -644,7 +644,11 @@ were replaced.
   $0.10/GB, billed in the tick the job finishes (Costs: "Spark").
 - **Engine** (`engine.simulate`): executors x cores slots, stage barriers, task retries up to
   `max_task_failures`, executors lost at random (exponential lifetime, spot) or by OOM, with
-  replacements after start-up; a lost executor's map outputs are gone, so running reduce
+  replacements after start-up. As in Spark, a task on a preempted executor is retried without
+  counting towards `max_task_failures` (only OOM, "caused by the app", counts), and the job
+  fails after max(2 x executors, 3) lost executors (`spark.executor.maxNumFailures`; an
+  earlier version counted preemptions as task failures and a 90 s spot storm killed even the
+  default cluster); a lost executor's map outputs are gone, so running reduce
   stages get FetchFailed (re-attempt, up to 4) and the lost map tasks rerun; speculation
   (checked every simulated second: 75% of a stage done, a task 1.5x the median gets a copy on
   another executor); queue wait and partial grants; a 24-hour job timeout. Its RNG is
@@ -659,7 +663,7 @@ were replaced.
   `spark_throughput` (legacy) still sets a minimum duration. New defaults (both presets):
   4 executors x 4 cores, 8 GB, 200 shuffle partitions, AQE, speculation, 4 task failures,
   incremental, sensor on (8 ticks), lake compaction every 100 ticks.
-- **Faults:** `spark_executor_loss` (spot, mean lifetime 90 s), `spark_slow_node` (executor 1
+- **Faults:** `spark_executor_loss` (spot, mean executor lifetime 10 minutes), `spark_slow_node` (executor 1
   10x slower; repair `replace_spark_node`), `spark_cluster_busy` (30 min queue, half the
   executors), `lake_ingestion_lag` (`DataLake.paused`; repair `restart_lake_sink`),
   `viral_movie`; all in chaos. Incident rules `spark_job` (last job failed), `spark_slow`

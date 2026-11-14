@@ -177,8 +177,16 @@ def test_lost_executors_are_retried_and_recomputed_deterministically():
     assert any("lost" in text for _, text in a.log)
     healthy = reduce_job(rows, ClusterConfig())
     assert a.duration_s > healthy.duration_s
-    fragile = reduce_job(rows, ClusterConfig(max_task_failures=1), loss, random.Random("x"))
-    assert not fragile.succeeded
+    # Preemption is not the tasks' fault: it does not count towards
+    # spark.task.maxFailures ...
+    strict = reduce_job(rows, ClusterConfig(max_task_failures=1), loss, random.Random("x"))
+    assert strict.succeeded
+    # ... but an application that keeps losing executors gives up
+    # (spark.executor.maxNumFailures = max(2 x executors, 3)).
+    fragile = reduce_job(rows * 3, ClusterConfig(executors=1), Conditions(executor_loss_mean_s=10),
+                         random.Random("x"))
+    assert not fragile.succeeded and fragile.reason == "executors_lost"
+    assert "executor failures" in fragile.error
 
 
 def test_cluster_down_and_busy():
