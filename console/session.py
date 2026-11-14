@@ -429,7 +429,8 @@ RUNBOOKS = {
         "Backfill features (Pipeline, Batch features) and retrain.",
         "GPU out of memory: lower the batch size or use GPUs with more memory.",
         "Preempted too often: keep checkpoints on (a preempted job resumes from them) or wait.",
-        "Model validation failed: training diverged (loss went up or NaN). Lower the learning rate.",
+        "Model validation failed: the loss is not a number, went up, or is well above the last good "
+        "model's (a learning rate too high or too low trains a worse model). Fix the setting and retrain.",
         "The serving model is unchanged: a failed workflow never deploys.",
     ],
     "schedule_missed": [
@@ -631,6 +632,7 @@ class SimSession:
         self.workflow_runs = []          # finished retrain workflow runs, newest last
         self.last_workflow_failure = None
         self.data_reference = None       # stats of the last training set that passed data validation
+        self.model_reference_loss = None # final training loss of the last model that passed validation
         self.system["training_conditions"] = training_job.TrainingConditions()
         self.system["scheduler"] = {"up": True}
         self.missed_runs = []            # (tick, "spark" | "retrain") skipped while the scheduler was down
@@ -1096,6 +1098,7 @@ class SimSession:
             "validate_model": self.settings["validate_model"],
             "train_report": None,
             "fail_at": None,
+            "reference_loss": self.model_reference_loss,
             "data_checks": None,
             "model_checks": None,
             "losses": None,
@@ -1356,7 +1359,8 @@ class SimSession:
                     recall_at_k(production.user_tower, production.index, record["holdout"]),
                 )
 
-            record["model_checks"] = validation.validate_model(record["losses"], embeddings)
+            record["model_checks"] = validation.validate_model(record["losses"], embeddings,
+                                                               record["reference_loss"])
             record["result"] = (user_tower, item_tower, index, ranker)
             record["train_seconds"] = round(time.monotonic() - started, 2)
         except Exception as error:  # surfaced in the log at deploy time
@@ -1495,6 +1499,8 @@ class SimSession:
                       % (version, ", ".join(model_failed)), cls="s-crit")
             self._end_workflow(record, "failed", "validate model")
             return
+        if not model_failed and record["losses"]:
+            self.model_reference_loss = record["losses"][-1]
         self._step(record, "validate model", "succeeded" if not model_failed else "skipped",
                    "all checks passed" if not model_failed
                    else "checks failed but validation is off: " + ", ".join(model_failed))

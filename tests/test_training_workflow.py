@@ -80,3 +80,11 @@ def test_model_validation():
     bad = dict(good)
     bad[3] = [math.inf, 0.0, 0.0]
     assert names(V.validate_model([3.0, 2.0], bad)) == {"embeddings are finite"}
+
+
+def test_model_validation_compares_with_the_last_good_model():
+    good = {m: [0.1 * (m % 7), 0.2, -0.1 * (m % 3)] for m in range(50)}
+    assert V.passed(V.validate_model([3.0, 2.7], good, reference_loss=2.67))
+    # Measured: learning rate 0.1 instead of 0.001 ends at ~3.63 instead of ~2.67.
+    failed = {c["name"] for c in V.validate_model([3.66, 3.63], good, reference_loss=2.67) if not c["ok"]}
+    assert failed == {"loss vs last good model"}
