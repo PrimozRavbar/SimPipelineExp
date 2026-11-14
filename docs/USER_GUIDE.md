@@ -231,11 +231,34 @@ old index, the classic stale-index bug). Action: **Rebuild index**.
 
 ### Data lake, Spark, offline features
 
-The data lake keeps every event. **Spark** recomputes offline features on a schedule (`Run
-every`, default 100 ticks) and as the first stage of every retrain; `Throughput` makes jobs take
-time as the lake grows. The offline feature store keeps point-in-time snapshots, so training
-sees each feature as it was when the event happened. Action: **Run feature job now** (5
-credits).
+The data lake keeps every event; its sink writes one file per topic per tick, and a compaction
+job merges the small files (`Compact small files every`, default 100 ticks). The offline feature
+store keeps point-in-time snapshots, so training sees each feature as it was when the event
+happened.
+
+**Spark** recomputes offline features on a schedule (`Run every`, default 100 ticks, about once
+a day) and as the first stage of every retrain. A job runs on a simulated cluster: it reads the
+lake files, shuffles every event to its user's and its movie's partition, computes features
+task by task on the executors and commits a new feature version at once. A failed job publishes
+nothing: the store keeps the last good version. **One tick is about 15 minutes**: a healthy job
+takes a minute or two and is ready at once; a slow one finishes ticks later (and a retrain waits
+for it). The features are the same whatever the cluster: only the time and the failures change.
+
+| Setting | Default | Effect |
+|---|---|---|
+| Executors, cores per executor | 4, 4 | Task slots. Fewer = slower jobs; you pay per executor-hour while a job runs. |
+| Memory per executor (GB) | 8 | A task's share is memory x 0.6 / cores. More rows than that spill to disk (slower); far more and the container is killed (out of memory). |
+| Shuffle partitions | 200 | Reduce tasks per stage. Too few: big tasks that spill. Too many: overhead (AQE merges them). |
+| Max task failures | 4 | Attempts per task before the job is aborted. |
+| Incremental runs | on | Only the events since the last run. Changing the profile settings triggers a full backfill. Off: everything, every run (slow, grows with the lake). |
+| Adaptive query execution | on | Merges small partitions, splits skewed ones (a hot movie) into several tasks. A single movie is never split. |
+| Speculative execution | on | A straggling task gets a copy on another executor; the first to finish wins. |
+| Wait for complete data | on | The job waits until the lake has every tick so far, and fails after `Wait for data at most` (8 ticks). Off: it runs on whatever has landed and "succeeds" on stale data. |
+
+The Spark panel (Pipeline > Batch features) shows the last job: its stages (tasks, rows, median
+and slowest task, skew, spill, failed attempts), the executors over time (lost executors in
+red), the job log and the last 20 jobs. Actions: **Run feature job now** (5 credits),
+**Replace degraded node**; on the data lake, **Restart lake sink**.
 
 ### Training
 
@@ -286,6 +309,7 @@ Two resources:
 | KServe | $1.00 per replica per tick |
 | ANN index | HNSW $0.60, IVF $0.30, exact $1.50 per tick |
 | Feast | $0.30 per tick + $2 per materialization run |
+| Spark | per executor-hour while a job runs: $0.50 per core + $0.10 per GB (the default cluster $11.20 an hour; a healthy job costs well under a dollar) |
 | One-off | index swap $500, Flink rescale $20, Kafka repartition $50 |
 
 The default setup costs about $4.50 a tick. At 20 users a tick an untrained model (CTR ~13%)
@@ -303,12 +327,18 @@ every` to get hidden ones.
 | ANN index returns wrong movie ids | CTR drops, index self-test fails | Rebuild index (or a deploy) |
 | Two-tower retrieval down | fallback share 100% | Restart model server |
 | Traffic spike | more users per tick; overflow if KServe is capped | Scale KServe, wait |
-| Spark feature jobs failing | features age, retrains abort | Wait; freshness alert |
+| Spark feature jobs failing (cluster down) | jobs fail, features age, retrains abort | Wait; freshness alert |
+| Spark executors being reclaimed (spot) | executors lost mid-job, tasks retried, lost shuffle output recomputed; slower jobs | Retries absorb it (max task failures 4); with 1 the jobs fail |
+| Degraded Spark node | one executor 10x slower: stragglers, high skew ratio | Speculation (on by default); Replace degraded node |
+| Spark cluster busy | jobs wait ~30 min for resources and get half the executors; late features | Wait |
+| Data lake sink stuck | lake stops growing, its Kafka lag grows; jobs wait for data, then fail | Restart lake sink |
+| A movie went viral | one movie everyone clicks and watches (World): a hot key in every job, a shift in what users want | Retrain; AQE and memory for the jobs |
 | Kafka broker 0 down | partitions offline (with replication 1), lag builds | Restart failed broker; use replication 2 |
 
 Incident rules: CTR drop (any time and after a deploy), Flink lag, fallback share, ANN
-self-test, feature skew, freshness, data drift, cash below zero, Kafka partitions offline and
-serving overflow. Each comes with a runbook.
+self-test, feature skew, freshness, data drift, cash below zero, Kafka partitions offline,
+serving overflow, Spark job failed, Spark job over a tick and data lake behind. Each comes with
+a runbook.
 
 ## The world: static or dynamic users
 
@@ -332,6 +362,7 @@ The **dynamic** world adds:
 | Ratings (% of watches) | 10 | How often a user rates a movie they watched. |
 | Slates per visit | 1 | Rows a user scrolls per visit: more clicks per visit, but each row is second-best and users tire faster. |
 | Browsing (% of visits) | 30 (both worlds) | Users sometimes browse or search a genre before their slate: explicit evidence of their current taste, which the profiles and the preference model learn from. |
+| A movie goes viral every / for (ticks) | 0 (off) / 300 | Everyone talks about one random movie: its click chance moves halfway to the maximum for every user, and 15% of visiting users watch it without a recommendation. A hot key for every batch job. Also a drill and a chaos fault. |
 
 ## Strategies that work
 

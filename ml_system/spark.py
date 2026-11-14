@@ -48,12 +48,14 @@ class SparkJobRun:
         return ticks_for(self.report.duration_s)
 
     def summary(self, timeline=False):
-        return {"job_id": self.job_id, "mode": "full" if self.batch.full else "incremental",
+        report = self.report.summary(timeline=timeline)
+        report["failure"] = report.pop("reason")         # oom, executors_lost, ... (None if it succeeded)
+        return {**report, "job_id": self.job_id, "mode": "full" if self.batch.full else "incremental",
                 "reason": self.batch.reason, "events": self.batch.size, "lake_events": len(self.batch.events),
                 "submitted_tick": self.submitted_tick, "ticks": self.ticks,
                 "cost": round(self.report.executor_seconds / 3600.0 * self.config.price_per_hour()
                               / max(1, self.config.executors), 2),
-                "config": self.config.summary(), **self.report.summary(timeline=timeline)}
+                "config": self.config.summary()}
 
 
 class Spark(Service):
@@ -89,7 +91,7 @@ class Spark(Service):
             if hasattr(event, "movie_id"):
                 item_rows[event.movie_id] = item_rows.get(event.movie_id, 0) + 1
 
-        if lake is not None and getattr(lake, "files", None) is not None and lake.events is events:
+        if lake is not None and getattr(lake, "files", None) is not None and self._reads_lake(events, lake):
             file_rows = lake.file_rows(batch.start, len(events))
         else:
             file_rows = [batch.size] if batch.size else []
@@ -111,6 +113,13 @@ class Spark(Service):
                           commit_rows=len(user_rows) + len(item_rows))
         report.notes = ["%s over %d events (%d lake files)" % (batch.reason, batch.size, len(file_rows))]
         return SparkJobRun(job_id, batch, user_tasks, item_tasks, report, self.config, submitted_tick)
+
+    @staticmethod
+    def _reads_lake(events, lake):
+        """True if `events` is (a snapshot of) the lake's log, so its files
+        describe how the job reads it."""
+        n = len(events)
+        return n <= len(lake.events) and (n == 0 or events[n - 1] is lake.events[n - 1])
 
     # -- running ---------------------------------------------------------
 

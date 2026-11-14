@@ -143,7 +143,7 @@ class _Executor:
         self.alive = True
         self.lost_at = None
         self.lost_reason = None
-        self.running = set()          # attempts
+        self.running = {}             # attempts, in launch order (a set would iterate by address)
 
 
 class _Attempt:
@@ -314,7 +314,7 @@ def simulate(stages, config, conditions=None, rng=None, listing_files=0, commit_
         attempt = _Attempt(task, executor, start, end, outcome, speculative)
         task.attempts.append(attempt)
         task.state = "running"
-        executor.running.add(attempt)
+        executor.running[attempt] = None
         push(end, "end", attempt)
 
     def schedule():
@@ -346,7 +346,7 @@ def simulate(stages, config, conditions=None, rng=None, listing_files=0, commit_
     def finish_attempt(attempt, outcome):
         attempt.done = True
         attempt.outcome = outcome
-        attempt.executor.running.discard(attempt)
+        attempt.executor.running.pop(attempt, None)
         if len(report.timeline) < max_timeline:
             report.timeline.append([attempt.executor.id, attempt.task.stage.spec.stage_id, attempt.task.index,
                                     round(attempt.start, 2), round(now[0], 2), outcome,
