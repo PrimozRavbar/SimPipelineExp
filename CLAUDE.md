@@ -42,7 +42,7 @@ running several simulations in parallel.
 |---|---|
 | World (users, true tastes, dynamics, browsing, interest signals) | `world/` |
 | Streaming and storage | `ml_system/kafka.py`, `flink.py`, `redis.py`, `feast.py`, `datalake.py` |
-| Offline | `ml_system/spark.py` + `spark_sim/` (cluster cost model, simulated scheduler), `offline_*`, `features.py`, `training*.py` |
+| Offline | `ml_system/spark.py` + `spark_sim/` (cluster cost model, simulated scheduler), `offline_*`, `features.py`, `training*.py`, `training_job.py` (GPU job model), `validation.py` (data and model checks) |
 | Models | `two_tower.py`, `ranking.py` (MLP v2-v6), `online_model.py` (preference model), `cf_model.py`, `item_signals.py`, `candidate_sources.py`, `exploration.py` |
 | Serving | `model_server.py`, `kserve.py`, `ann.py`, `ann_indexes.py`, `fallback.py` |
 | Ops | `faults.py`, `experiments.py`, `model_registry.py`, `metrics.py` |
@@ -64,6 +64,11 @@ running several simulations in parallel.
   commit; features are byte-identical for any cluster or schedule, and a job that finishes
   inside its tick is ready at once (so the default game is unchanged). Failure modes (spot loss,
   OOM/skew, slow node, busy cluster, stuck lake sink) are faults; viral movies are World-side.
+- **Retrains are workflows** (features → validate data → train → validate model → evaluate →
+  deploy). Training time and failures (GPU OOM, preemption) are simulated on a GPU cluster; the
+  model deploys `deploy_delay` ticks after the start or when training is done, whichever is
+  later (a 5-tick delay measured slightly worse CTR, so 50 stays). Batch size and learning rate
+  are real. Faults: gpu_preemption, feature_nulls (needs a backfill), scheduler_down.
 - **Actions apply at tick boundaries**; retrains train in a background thread and deploy after
   `deploy_delay` ticks; every version (towers, index, preference model, CF) rolls back together.
 - **API:** the UI polls `GET /api/snapshot` only; actions are POSTs queued for the next tick

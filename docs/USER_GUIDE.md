@@ -266,10 +266,36 @@ red), the job log and the last 20 jobs. Actions: **Run feature job now** (5 cred
 |---|---|---|
 | Retrain every (ticks) | 0 | Automatic retrains (40 credits each). 0 = only when you start one. |
 | Epochs, negatives | 5, 5 | Training length and sampled negatives per click. |
-| Deploy after (ticks) | 50 | The new model serves this long after training starts (the clock waits if training is slower). |
+| Deploy after (ticks) | 50 | The release window: the earliest a new model serves after its retrain starts. A training job that takes longer deploys when it is done. |
 | Popularity correction (logQ) | on | Stops popular movies being pushed down by in-batch negatives. |
 | Graded positives, random negatives, recent history, engagement, demographics, shared IDs, train from scratch | off | Advanced training options. |
 | Batched training | on | Much faster on CPU; same model. |
+| GPUs | 1 | Data-parallel training: faster, $3 per GPU-hour, a little lost to communication. |
+| GPU memory (GB) | 16 | The weights, the batch's activations and the batch x batch in-batch logits must fit, or the job dies with CUDA out of memory. |
+| Batch size | 32 | Real: bigger batches keep the GPU busy (faster) and add in-batch negatives, but take fewer steps per epoch and need more memory. |
+| Learning rate | 0.001 | Real: too high or too low and the model trains worse. |
+| Checkpoint every (minutes) | 10 | A preempted job resumes from its last checkpoint; 0 = it restarts from scratch. |
+| Validate training data | on | Stop the run if the training set looks broken (see below). |
+| Validate the model | on | Do not deploy a model whose loss is broken or well above the last good model's. |
+
+**Every retrain is a workflow** (an Airflow DAG run), shown step by step under Pipeline >
+Training: **features** (the Spark job), **validate data**, **train**, **validate model**,
+**evaluate** (with the gate on) and **deploy**. A failed step stops the run and the serving
+model stays; an incident opens with the failing step.
+
+- **Data validation** compares the training set with the last one that passed: at least 60% as
+  many examples, a click rate at least half the last one's, and no more than 15 points more
+  users with an empty taste profile among the clicks since the last run (a broken feature job
+  shows up there first).
+- **Training** runs on a simulated GPU cluster (one tick is about 15 minutes): start-up, loading
+  the data, the epochs (examples x candidates / GPU throughput), the index and the rankers, saving
+  the model. A healthy run takes minutes and deploys on the release window; a slow one (GPUs
+  scarce, many preemptions) deploys late. The real training runs in the background either way:
+  the GPU settings change when the model is ready, never the model (batch size and learning
+  rate do change the model).
+- **Model validation** checks that the loss is a number, did not go up during training and is
+  within 15% of the last good model's, and that the movie embeddings are finite and not all the
+  same.
 
 ### Model registry
 
@@ -281,9 +307,10 @@ red), the job log and the last 20 jobs. Actions: **Run feature job now** (5 cred
 
 ## Models: retraining, deploying, rolling back
 
-- **Retrain** (Models or Pipeline > Training): Spark builds features, then the two-tower model,
-  the ranker and the preference model train in the background while the current model keeps
-  serving. The new version deploys `Deploy after` ticks later.
+- **Retrain** (Models or Pipeline > Training): a workflow run. Spark builds features, the data is
+  validated, then the two-tower model, the ranker and the preference model train in the
+  background while the current model keeps serving. The model is validated and deploys
+  `Deploy after` ticks after the start (later if training takes longer).
 - **Roll back** redeploys the previous version instantly, including its index and its
   preference model. Some things are not versioned and keep learning whatever serves: user
   profiles and co-watch signals.
@@ -309,6 +336,7 @@ Two resources:
 | KServe | $1.00 per replica per tick |
 | ANN index | HNSW $0.60, IVF $0.30, exact $1.50 per tick |
 | Feast | $0.30 per tick + $2 per materialization run |
+| Training | $3 per GPU-hour while a training job runs (a default retrain costs about $1-3) |
 | Spark | per executor-hour while a job runs: $0.50 per core + $0.10 per GB (the default cluster $11.20 an hour; a healthy job costs well under a dollar) |
 | One-off | index swap $500, Flink rescale $20, Kafka repartition $50 |
 
@@ -333,12 +361,15 @@ every` to get hidden ones.
 | Spark cluster busy | jobs wait ~30 min for resources and get half the executors; late features | Wait |
 | Data lake sink stuck | lake stops growing, its Kafka lag grows; jobs wait for data, then fail | Restart lake sink |
 | A movie went viral | one movie everyone clicks and watches (World): a hot key in every job, a shift in what users want | Retrain; AQE and memory for the jobs |
+| Training GPUs being preempted (spot) | training jobs restart from their last checkpoint and take longer; without checkpoints they start over and can fail | Keep checkpoints on; wait |
+| Feature job writing empty profiles | a bad deploy of the Spark job: most users' profiles go empty in the offline store, and stay so after the fault ends; the next retrain fails data validation | Backfill features (Pipeline > Batch features), then retrain |
+| Workflow scheduler down | scheduled Spark runs and retrains silently do not start; features and models go stale | Restart workflow scheduler (Pipeline > Training) |
 | Kafka broker 0 down | partitions offline (with replication 1), lag builds | Restart failed broker; use replication 2 |
 
 Incident rules: CTR drop (any time and after a deploy), Flink lag, fallback share, ANN
 self-test, feature skew, freshness, data drift, cash below zero, Kafka partitions offline,
-serving overflow, Spark job failed, Spark job over a tick and data lake behind. Each comes with
-a runbook.
+serving overflow, Spark job failed, Spark job over a tick, data lake behind, retrain workflow
+failed and scheduled runs missed. Each comes with a runbook.
 
 ## The world: static or dynamic users
 

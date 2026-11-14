@@ -696,6 +696,66 @@ were replaced.
   | slow node 10x, full: speculation on / off | 6.9 / 12.5 min |
   | cluster busy (30 min queue, half the executors) | 32 min: 2 ticks late |
 
+## Retrain workflow and the training job
+
+Goal: training and the retrain process as realistic as Spark, with **the same default game**.
+Files: `ml_system/training_job.py` (GPU job model), `ml_system/validation.py` (data and model
+checks), `console/session.py` (`_start_retrain`, `_features_ready`, `_train`,
+`_finish_retrain`, `_training_failed`, `_new_workflow` / `_step` / `_end_workflow`,
+`_workflow_view`), `ml_system/faults.py`, tests `tests/test_training_workflow.py` (no torch)
+and `tests/test_training_console.py`.
+
+- **A retrain is a workflow run** (Airflow-style DAG): `features` (the Spark job), `validate
+  data`, `train`, `validate model`, `evaluate` (only with `eval_gate`), `deploy`. Each step
+  records status, start and end tick and a detail; a failed step ends the run (later steps
+  skipped) and the serving model stays. Finished runs (last 20) keep their training report and
+  checks: `pipeline()["workflow"]`, the Training panel, the `workflow` metrics event. Incident
+  rule `workflow` (open while the last run failed).
+- **Training job model** (`training_job.simulate_training`): start-up 120 s; load 4 ms per
+  example; compute = epochs x examples x (1 + negatives) x 4 ms / throughput, throughput =
+  sqrt(batch / 256) capped at 1 (floor 0.15) x GPUs x 0.9^log2(GPUs); checkpoints (10 s each)
+  every `train_checkpoint_minutes`; index 20 ms per movie and rankers 0.4 ms per row; save 30 s.
+  GPU memory = 1.5 GB + batch x candidates x 4 MB + (batch / 1024)^2 GB (in-batch logits):
+  over `train_gpu_memory_gb` = CUDA out of memory right after start-up (deterministic, so
+  retrying does not help). Spot preemption (fault `gpu_preemption`, mean lifetime 20 min): the
+  job restarts after 180 s from its last checkpoint (or from scratch), failing after 3
+  restarts. RNG `random.Random("training-<seed>-<version>")`, only while preemption is on.
+  $3 per GPU-hour, billed as "Training".
+- **Timing.** The real training still runs in the background thread; the simulated duration
+  only moves the deploy: `deploy_tick = max(start + deploy_delay, start + training ticks)`, and a
+  failing job ends the run at its simulated failure tick (no thread is started). A default
+  retrain simulates in minutes (0-1 ticks), far inside the 50-tick window, so default games
+  are unchanged. **Measured:** deploying 5 ticks after the start instead of 50 (what a
+  realistic workflow would allow) does not raise CTR (2000 ticks, retrain every 200, mean CTR
+  ticks 800-2000; delay 50 -> 5): static s42 56.67 -> 56.72, s1 56.47 -> 56.19; dynamic s42 28.36
+  -> 27.99, s1 28.57 -> 28.26. Real training also takes up to ~3 minutes of wall time late in a
+  game, so a short window would stall the clock at every retrain. `deploy_delay` stays 50 (a
+  release window).
+- **Real settings:** `train_batch_size` (the trainer's batch size) and `learning_rate` (Adam's lr,
+  set on the optimizer each retrain; choices 0.0001-1.0) change the model. Defaults equal the
+  previous values (32, 0.001), so models are bit-identical. Measured (best preset, seed 3, 10
+  users a tick, two retrains): lr 0.001 ends at loss 2.67, 0.1 at 3.63, 1.0 at 3.60: the loss
+  does not blow up (normalised embeddings, bounded logits), the model is just worse.
+- **Data validation** (`validation.training_data_stats` / `validate_data`, against the stats of
+  the last training set that passed): examples >= 1 and >= 60% of the last good set; click rate
+  >= half the last good one's (labels lost; rising is fine: CTR legitimately climbs after a
+  deploy, and the stat is cumulative); empty genre profiles (as of each click, from the
+  feature store) among the clicks since the last good run <= last + 15 points. The newest
+  slice is what matters: a broken feature job only corrupts recent snapshots, which would be
+  diluted in the whole training set. An absolute minimum of 50 examples was tried and dropped:
+  it blocked early retrains that train fine today.
+- **Model validation** (`validate_model`): final loss finite; last / first epoch <= 1.2; final
+  loss <= 1.15x the last good model's (catches a bad learning rate); item embeddings finite and
+  not collapsed (std across movies >= 1e-4; trained embeddings are nearly collapsed by cosine,
+  see Known issues, but their std is ~0.03). A failing model is kept as a Rejected version.
+- **Faults:** `gpu_preemption`; `feature_nulls` (`OfflineFeaturePipeline.null_profile_share`:
+  the job writes empty `genre_preferences` for that share of users, by user id, into history
+  snapshots and latest features, never into the carried state; after the fault ends the
+  corrupted snapshots stay until a full recompute; repair `backfill_features` sets
+  `Spark.force_full` and runs the job); `scheduler_down` (scheduled Spark runs and retrains are
+  skipped silently and recorded in `missed_runs`; incident rule `schedule_missed`, like an
+  Airflow SLA miss; repair `restart_scheduler`; the next run on schedule clears it).
+
 ## Why CTR was flat (fixed)
 
 Main used to go 18.3% → 18.7% after a retrain. Expected-CTR analysis per user showed the

@@ -20,11 +20,15 @@ cut replicas to save money, requests really spill over to the fallback.
 
 1. **Start the clock.** Users arrive and get ten-movie slates from an untrained model. About
    one slate in seven gets a click.
-2. **Retrain.** Spark rebuilds the features, the two-tower model and the ranker train in the
-   background, and the new version deploys while the old one keeps serving. Click-through
-   jumps from ~15% to ~45%, and keeps climbing as the system learns your users.
+2. **Retrain.** A workflow runs like it would in production: Spark rebuilds the features on its
+   cluster, the training data is validated, the two-tower model and the ranker train on GPUs
+   in the background, the model is validated, and the new version deploys while the old one
+   keeps serving. Click-through jumps from ~15% to ~45%, and keeps climbing as the system
+   learns your users.
 3. **Something breaks.** A Kafka broker dies, Flink falls behind, a bad index ships with
-   the wrong movie ids, traffic triples. An incident opens with a runbook. You find the cause
+   the wrong movie ids, traffic triples, Spark executors run out of memory on a viral movie, a
+   feature job writes empty profiles, training GPUs get preempted, the scheduler silently
+   stops. An incident opens with a runbook. You find the cause
    from the symptoms and fix it: restart, roll back, rebuild, scale.
 4. **Watch the money.** Every click earns $1. Every broker, task slot, replica and index costs
    money every tick. Over-provision and you go broke; under-provision and your users get the
@@ -56,7 +60,7 @@ were found while building the game, they are documented, and you can recreate th
 
 **Incidents feel like on-call.** Alert rules watch CTR, consumer lag, the fallback share, an ANN
 self-test, online/offline feature skew, feature freshness, data drift, partitions offline,
-serving overflow and your cash. Each incident has a runbook, a timeline and the CTR around it.
+serving overflow, Spark jobs, the data lake, retrain workflows, missed schedules and your cash. Each incident has a runbook, a timeline and the CTR around it.
 Turn on chaos and faults arrive unannounced, revealed only when they end.
 
 ![Incidents: alerts with runbooks and the CTR around them](docs/readme/incidents.png)
@@ -73,8 +77,9 @@ flowchart LR
   FE --> KS[KServe] --> MS[Model server]
   MS <--> ANN[ANN index<br/>HNSW · IVF · exact]
   MS -- ten movies --> U
-  K --> DL[(Data lake)] --> S[Spark] --> OFS[(Offline features)]
-  OFS --> T[Training<br/>two-tower · ranker · preference model] --> REG[Model registry]
+  K --> DL[(Data lake)] --> S[Spark cluster] --> OFS[(Offline features)]
+  OFS --> V{{Data validation}} --> T[Training on GPUs<br/>two-tower · ranker · preference model]
+  T --> MV{{Model validation}} --> REG[Model registry]
   REG -- deploy / roll back --> MS
 ```
 
@@ -87,9 +92,10 @@ flowchart LR
 | **KServe** | replicas, capacity, autoscaling target, cold starts; overflow goes to the fallback |
 | **ANN index** | **swappable**: HNSW, FAISS-style IVF (tune `nprobe`) or exact search; recall vs cost vs latency |
 | **Model server** | candidates, slate size, extra candidate sources, rankers, diversity, exploration |
-| **Training** | schedule, epochs, negatives, popularity correction, graded positives, tower inputs |
+| **Spark** | executors, cores, memory, shuffle partitions, AQE, speculation, incremental runs; jobs spill, run out of memory on hot keys, lose spot executors, wait for late data |
+| **Training** | a workflow (features, data validation, training, model validation, deploy) with a schedule; GPUs, GPU memory, batch size, learning rate, checkpoints; epochs, negatives, popularity correction, graded positives, tower inputs |
 | **Registry** | canary rollouts and A/B tests with a significance test, an offline evaluation gate, roll back, export |
-| **World** | static or dynamic users: gradual taste drift towards related genres, browsing, fatigue that wears off, rewatching, new sign-ups |
+| **World** | static or dynamic users: gradual taste drift towards related genres, browsing, fatigue that wears off, rewatching, new sign-ups, viral movies |
 
 ![Swap the ANN index, and the bill per component](docs/readme/ann_costs.png)
 
@@ -144,7 +150,8 @@ new browser tab.
 **Your first game:**
 
 1. Press play at 10×. Watch Monitoring: CTR hovers around 13-15%.
-2. At tick ~400, go to Models and press **Retrain now**. It deploys 50 ticks later.
+2. At tick ~400, go to Models and press **Retrain now**. It deploys 50 ticks later (watch
+   the workflow under Pipeline > Training).
 3. Watch CTR climb. Open **Where clicks are lost** to see what's left on the table.
 4. Go to Pipeline > Chaos and inject a **Kafka broker** drill. Find the incident. Fix it.
 5. Check your cash in the top bar. Can you run the platform at a profit?
