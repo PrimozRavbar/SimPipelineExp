@@ -63,7 +63,7 @@ def test_gpu_out_of_memory_fails_the_workflow_and_keeps_the_model():
 
 
 def test_a_broken_feature_job_is_caught_by_data_validation_and_fixed_by_a_backfill():
-    s = make(preset="best", users=10)
+    s = make(preset="best", users=10, spark_every=20)    # scheduled jobs run while the job is broken
     s.step(60)
     s.submit("retrain")
     s.step(12)
