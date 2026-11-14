@@ -129,3 +129,22 @@ def test_gpu_preemption_makes_training_slower_but_checkpoints_save_it():
     assert report["preemptions"] > 0
     assert any("preempted" in text for _, text in report["log"])
     s.close()
+
+
+def test_a_bad_learning_rate_is_caught_by_model_validation():
+    # Measured: lr 0.1 ends at loss ~3.6 vs ~2.7 for the default 0.001; the
+    # check compares the new and the serving model on the same new examples.
+    s = make(preset="best", users=10, epochs=5)
+    s.step(150)
+    s.submit("retrain")
+    s.step(12)
+    s.submit("retrain")
+    s.step(12)
+    assert [r["status"] for r in s.workflow_runs] == ["succeeded", "succeeded"]
+    s.submit("settings", learning_rate="0.1")
+    s.submit("retrain")
+    s.step(12)
+    run = s.workflow_runs[-1]
+    assert run["status"] == "failed" and run["failed_step"] == "validate model"
+    assert s.serving_version == 2 and s.versions[3].info.get("rejected")
+    s.close()
