@@ -744,10 +744,16 @@ and `tests/test_training_console.py`.
   slice is what matters: a broken feature job only corrupts recent snapshots, which would be
   diluted in the whole training set. An absolute minimum of 50 examples was tried and dropped:
   it blocked early retrains that train fine today.
-- **Model validation** (`validate_model`): final loss finite; last / first epoch <= 1.2; final
-  loss <= 1.15x the last good model's (catches a bad learning rate); item embeddings finite and
-  not collapsed (std across movies >= 1e-4; trained embeddings are nearly collapsed by cosine,
-  see Known issues, but their std is ~0.03). A failing model is kept as a Rejected version.
+- **Model validation** (`validate_model`): final loss finite; last / first epoch <= 1.2; item
+  embeddings finite and not collapsed (std across movies >= 1e-4; trained embeddings are nearly
+  collapsed by cosine, see Known issues, but their std is ~0.03); and **the new model against
+  the serving one on the same data**: `training.evaluation_loss` (the in-batch softmax loss with
+  sampled negatives, no logQ, no gradients, no randomness) of both models on the first 2000
+  examples of the new training set; the new one may be at most 1.10x worse. A first version
+  compared final training losses across retrains (at most 1.15x the last good model's): it
+  rejected a legitimate model in the dynamic s42 game (v2 at tick 400: 3.24 vs v1's 2.80; v1 was
+  trained on 200 ticks of data and reached a lower loss on it) and changed the game; losses on
+  different data are not comparable. A failing model is kept as a Rejected version.
 - **Faults:** `gpu_preemption`; `feature_nulls` (`OfflineFeaturePipeline.null_profile_share`:
   the job writes empty `genre_preferences` for that share of users, by user id, into history
   snapshots and latest features, never into the carried state; after the fault ends the

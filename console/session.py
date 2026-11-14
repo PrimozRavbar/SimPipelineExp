@@ -49,7 +49,7 @@ from console.economy import ONE_OFF, PRICES, Economy
 from ml_system.online_model import PreferenceModel, PreferenceRanker, PreferenceRetrieval
 from ml_system.exploration import POLICIES as EXPLORE_POLICIES, SlotExplorer
 from ml_system.cf_model import CFRetrieval, ImplicitMF
-from ml_system.training import TwoTowerTrainer
+from ml_system.training import TwoTowerTrainer, evaluation_loss
 from ml_system.two_tower import USER_FEATURE_DEFAULTS, SimpleItemTower, SimpleUserTower, TwoTowerRetrieval
 from world.dynamics import DYNAMIC_WORLD
 from world.external_data_loader import load_movielens
@@ -64,6 +64,7 @@ MIN_YIELD_SECONDS = 0.003
 BUDGET_TOTAL = 1000
 COST_RETRAIN = 40
 COST_SPARK = 5
+EVAL_SAMPLE = 2000           # training examples model validation scores both models on
 
 DEFAULT_SETTINGS = {
     # Offline schedules (0 = off, the player triggers runs by hand).
@@ -429,8 +430,9 @@ RUNBOOKS = {
         "Backfill features (Pipeline, Batch features) and retrain.",
         "GPU out of memory: lower the batch size or use GPUs with more memory.",
         "Preempted too often: keep checkpoints on (a preempted job resumes from them) or wait.",
-        "Model validation failed: the loss is not a number, went up, or is well above the last good "
-        "model's (a learning rate too high or too low trains a worse model). Fix the setting and retrain.",
+        "Model validation failed: the loss is not a number or went up, or the new model is worse than the "
+        "serving one on the same new data (a learning rate too high or too low trains a worse model). "
+        "Fix the setting and retrain.",
         "The serving model is unchanged: a failed workflow never deploys.",
     ],
     "schedule_missed": [
@@ -632,7 +634,6 @@ class SimSession:
         self.workflow_runs = []          # finished retrain workflow runs, newest last
         self.last_workflow_failure = None
         self.data_reference = None       # stats of the last training set that passed data validation
-        self.model_reference_loss = None # final training loss of the last model that passed validation
         self.system["training_conditions"] = training_job.TrainingConditions()
         self.system["scheduler"] = {"up": True}
         self.missed_runs = []            # (tick, "spark" | "retrain") skipped while the scheduler was down
@@ -1098,7 +1099,6 @@ class SimSession:
             "validate_model": self.settings["validate_model"],
             "train_report": None,
             "fail_at": None,
-            "reference_loss": self.model_reference_loss,
             "data_checks": None,
             "model_checks": None,
             "losses": None,
@@ -1273,6 +1273,10 @@ class SimSession:
             if record["fail_at"] <= self.tick:
                 self._training_failed(record)
             return
+        # Model validation scores the new and the serving model on the same
+        # new examples (a sample of the training set).
+        record["eval_sample"] = training_data[:EVAL_SAMPLE]
+        record["eval_production"] = self.versions[self.serving_version]
         record["train_done_tick"] = self.tick + record["train_ticks"]
         record["deploy_tick"] = max(record["deploy_tick"], record["train_done_tick"])
         thread = threading.Thread(
@@ -1359,8 +1363,19 @@ class SimSession:
                     recall_at_k(production.user_tower, production.index, record["holdout"]),
                 )
 
+            eval_loss = production_loss = None
+            sample = record.pop("eval_sample", None)
+            if sample:
+                production = record["eval_production"]
+                eval_loss = evaluation_loss(user_tower, item_tower, sample, trainer.temperature)
+                try:
+                    production_loss = evaluation_loss(production.user_tower, production.item_tower, sample,
+                                                      trainer.temperature)
+                except Exception:      # the serving model takes other inputs (tower settings changed)
+                    production_loss = None
+            record["eval_losses"] = (eval_loss, production_loss)
             record["model_checks"] = validation.validate_model(record["losses"], embeddings,
-                                                               record["reference_loss"])
+                                                               eval_loss, production_loss)
             record["result"] = (user_tower, item_tower, index, ranker)
             record["train_seconds"] = round(time.monotonic() - started, 2)
         except Exception as error:  # surfaced in the log at deploy time
@@ -1499,8 +1514,6 @@ class SimSession:
                       % (version, ", ".join(model_failed)), cls="s-crit")
             self._end_workflow(record, "failed", "validate model")
             return
-        if not model_failed and record["losses"]:
-            self.model_reference_loss = record["losses"][-1]
         self._step(record, "validate model", "succeeded" if not model_failed else "skipped",
                    "all checks passed" if not model_failed
                    else "checks failed but validation is off: " + ", ".join(model_failed))

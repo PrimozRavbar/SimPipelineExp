@@ -24,7 +24,7 @@ CLICK_RATE_FLOOR = 0.5       # click rate (labels) at least half the last good r
 
 # Model checks
 MAX_LOSS_RATIO = 1.2         # the last epoch's loss at most 1.2x the first's
-MAX_LOSS_VS_REFERENCE = 1.15 # final loss at most 1.15x the last good model's
+MAX_LOSS_VS_PRODUCTION = 1.10  # on the same examples, at most 1.10x the production model's loss
 MIN_EMBEDDING_SPREAD = 1e-4  # std of item embeddings across movies
 
 
@@ -87,12 +87,15 @@ def validate_data(stats, reference=None):
     return checks
 
 
-def validate_model(losses, embeddings, reference_loss=None):
-    """Checks of a trained model: its per-epoch losses (and the final loss
-    of the last model that passed, if any) and its item embeddings
-    ({movie_id: tensor or list}). A bad learning rate rarely makes this
-    model's loss blow up (its embeddings are normalised); it trains a worse
-    model, which the comparison with the last good one catches."""
+def validate_model(losses, embeddings, eval_loss=None, production_eval_loss=None):
+    """Checks of a trained model: its per-epoch losses, its item embeddings
+    ({movie_id: tensor or list}) and, if given, its loss and the production
+    model's loss on the same sample of the new training set
+    (training.evaluation_loss). A bad learning rate rarely makes this
+    model's loss blow up (its embeddings are normalised): it trains a worse
+    model, which only a comparison on the same data shows. (Comparing
+    final training losses across retrains does not work: a model trained
+    on little data reaches a lower loss on it.)"""
     checks = []
     finite = bool(losses) and all(math.isfinite(x) for x in losses)
     checks.append(_check("loss is a number", losses[-1] if losses else None, "finite", finite,
@@ -101,11 +104,12 @@ def validate_model(losses, embeddings, reference_loss=None):
         ratio = losses[-1] / losses[0] if losses[0] else 1.0
         checks.append(_check("loss did not diverge", round(ratio, 3), MAX_LOSS_RATIO, ratio <= MAX_LOSS_RATIO,
                              "last epoch's loss / first epoch's loss"))
-        if reference_loss:
-            vs = losses[-1] / reference_loss
-            checks.append(_check("loss vs last good model", round(vs, 3), MAX_LOSS_VS_REFERENCE,
-                                 vs <= MAX_LOSS_VS_REFERENCE,
-                                 "final loss / the last good model's final loss (%.3f)" % reference_loss))
+    if eval_loss is not None and production_eval_loss:
+        vs = eval_loss / production_eval_loss if math.isfinite(eval_loss) else float("inf")
+        checks.append(_check("loss vs production model", round(vs, 3), MAX_LOSS_VS_PRODUCTION,
+                             vs <= MAX_LOSS_VS_PRODUCTION,
+                             "on the same new examples: this model's loss / the serving model's (%.3f)"
+                             % production_eval_loss))
     vectors = [list(map(float, v)) for v in embeddings.values()]
     ok = bool(vectors) and all(math.isfinite(x) for v in vectors for x in v)
     checks.append(_check("embeddings are finite", len(vectors), "all", ok, "no NaN or inf in item embeddings"))

@@ -276,7 +276,7 @@ red), the job log and the last 20 jobs. Actions: **Run feature job now** (5 cred
 | Learning rate | 0.001 | Real: too high or too low and the model trains worse. |
 | Checkpoint every (minutes) | 10 | A preempted job resumes from its last checkpoint; 0 = it restarts from scratch. |
 | Validate training data | on | Stop the run if the training set looks broken (see below). |
-| Validate the model | on | Do not deploy a model whose loss is broken or well above the last good model's. |
+| Validate the model | on | Do not deploy a model whose loss is broken or that is worse than the serving model on the same new data. |
 
 **Every retrain is a workflow** (an Airflow DAG run), shown step by step under Pipeline >
 Training: **features** (the Spark job), **validate data**, **train**, **validate model**,
@@ -294,7 +294,8 @@ model stays; an incident opens with the failing step.
   the GPU settings change when the model is ready, never the model (batch size and learning
   rate do change the model).
 - **Model validation** checks that the loss is a number, did not go up during training and is
-  within 15% of the last good model's, and that the movie embeddings are finite and not all the
+  no more than 10% above the serving model's on the same new examples (a sample of the training
+  set), and that the movie embeddings are finite and not all the
   same.
 
 ### Model registry
