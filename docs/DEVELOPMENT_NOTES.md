@@ -675,7 +675,26 @@ were replaced.
   the World, so the measured CTR baselines would move); the `viral_movie` fault starts one.
 - **Data lake files:** one file per (tick, topic); `compact(before_tick)` merges small files
   into ~512-row files (metadata only); `file_rows(start, end)` costs a scan.
-- **Measured:** see "Spark: measurements" below.
+- **Measured: the default game is unchanged.** Rich world, default console setup, retrain
+  every 200 ticks, 2000 ticks, this branch vs main: identical event logs (same hash) and CTR
+  over ticks 800-2000: static seed 42 56.67%, seed 1 56.47%; dynamic seed 42 28.36%, seed 1
+  28.57%. 28 Spark jobs per game (scheduled + retrains), all incremental, all inside their
+  tick (longest 97 s). Only cash differs (Spark cost, about $0.30 a job).
+- **Measured: failure modes** (plans only, 2000 ticks of game events = 140k events, 11k lake
+  files; incremental batch = the last 100 ticks, 6.8k events):
+
+  | Scenario | Job |
+  |---|---|
+  | default, incremental | 1.4 min, ready at once |
+  | default, full backfill | 6.1 min (5.4 with a compacted lake); hot-movie task 131 s, spills 1.6 GB |
+  | full backfill on 1 executor x 1 core | 56 min: 3 ticks late |
+  | full, 1 executor x 4 cores x 2 GB, no AQE, 8 partitions | out of memory after 16 failed attempts |
+  | viral burst (3000 watches of one movie), default | 2.0 min: one 34 s straggler |
+  | viral burst with 1 GB executors (AQE on or off) | out of memory (a single key cannot be split) |
+  | spot loss (10 min mean lifetime), default, full | 9.1 min, 10 failed attempts, succeeds |
+  | spot loss, 1 executor, full | fails: 3 executors lost |
+  | slow node 10x, full: speculation on / off | 6.9 / 12.5 min |
+  | cluster busy (30 min queue, half the executors) | 32 min: 2 ticks late |
 
 ## Why CTR was flat (fixed)
 
