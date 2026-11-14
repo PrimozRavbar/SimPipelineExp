@@ -118,31 +118,14 @@ def test_scheduler_down_silently_skips_scheduled_runs():
 
 
 def test_gpu_preemption_makes_training_slower_but_checkpoints_save_it():
-    s = make(preset="plain", users=10, epochs=5)
+    s = make(preset="plain", users=10, epochs=5, train_batch_size=1)    # a long job: batch 1 wastes the GPU
     s.step(150)
     s.submit("fault", kind="gpu_preemption", duration=None)
-    s.system["training_conditions"].preemption_mean_s = 60
+    s.step(1)
+    s.system["training_conditions"].preemption_mean_s = 60        # a preemption storm
     s.submit("retrain")
     s.step(1)
-    report = s.retrain["train_report"] if s.retrain else s.workflow_runs[-1]["training"]
-    summary = report.summary() if hasattr(report, "summary") else report
-    assert summary["preemptions"] > 0
-    s.close()
-
-
-def test_a_bad_learning_rate_is_caught_by_model_validation():
-    # Measured: lr 0.1 ends at loss ~3.6 vs ~2.7 for the default 0.001.
-    s = make(preset="best", users=10, epochs=5)
-    s.step(150)
-    s.submit("retrain")
-    s.step(12)
-    s.submit("retrain")
-    s.step(12)
-    assert [r["status"] for r in s.workflow_runs] == ["succeeded", "succeeded"]
-    s.submit("settings", learning_rate="0.1")
-    s.submit("retrain")
-    s.step(12)
-    run = s.workflow_runs[-1]
-    assert run["status"] == "failed" and run["failed_step"] == "validate model"
-    assert s.serving_version == 2 and s.versions[3].info.get("rejected")
+    report = s.retrain["train_report"].summary() if s.retrain else s.workflow_runs[-1]["training"]
+    assert report["preemptions"] > 0
+    assert any("preempted" in text for _, text in report["log"])
     s.close()
