@@ -754,7 +754,9 @@ and `tests/test_training_console.py`.
   (the good second retrain) 0.85, lr 0.0001 0.97, lr 0.1 1.087, lr 1.0 1.113. Legitimate
   retrains in the four 2000-tick default games (retrain every 200): 0.79-0.86 for the first,
   then 0.92 and ~1.00 +- 0.04 once the model has converged (max 1.036). A limit of 1.03 rejected
-  two good models in static s42; 1.06 sits between the two groups. The signal is small: a bad
+  two good models in static s42; 1.06 sits between the two groups. Skipped while the bootstrap
+  model (v0, untrained) serves, whose near-uniform scores beat a model trained on a few examples
+  (seed 3, 3 users a tick, 11 examples: 2.80 vs 2.56), and below 500 training examples. The signal is small: a bad
   learning rate trains a mediocre model, not a broken one. A first version
   compared final training losses across retrains (at most 1.15x the last good model's): it
   rejected a legitimate model in the dynamic s42 game (v2 at tick 400: 3.24 vs v1's 2.80; v1 was

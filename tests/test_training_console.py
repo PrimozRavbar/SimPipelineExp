@@ -134,7 +134,7 @@ def test_gpu_preemption_makes_training_slower_but_checkpoints_save_it():
 def test_a_bad_learning_rate_is_caught_by_model_validation():
     # Measured: lr 0.1 ends at loss ~3.6 vs ~2.7 for the default 0.001; the
     # check compares the new and the serving model on the same new examples.
-    s = make(preset="best", users=10, epochs=5)
+    s = make(preset="best", users=20, epochs=5)          # enough examples (>= 500) for the comparison
     s.step(150)
     s.submit("retrain")
     s.step(12)

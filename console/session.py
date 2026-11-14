@@ -65,6 +65,7 @@ BUDGET_TOTAL = 1000
 COST_RETRAIN = 40
 COST_SPARK = 5
 EVAL_SAMPLE = 2000           # training examples model validation scores both models on
+EVAL_MIN_EXAMPLES = 500      # ... only with at least this many, against a trained serving model
 
 DEFAULT_SETTINGS = {
     # Offline schedules (0 = off, the player triggers runs by hand).
@@ -1275,8 +1276,12 @@ class SimSession:
             return
         # Model validation scores the new and the serving model on the same
         # new examples (a sample of the training set).
-        record["eval_sample"] = training_data[:EVAL_SAMPLE]
-        record["eval_production"] = self.versions[self.serving_version]
+        # Skipped against the untrained bootstrap model (its near-uniform
+        # scores can beat a model trained on a few examples) and on small
+        # training sets (too noisy).
+        if self.serving_version > 0 and len(training_data) >= EVAL_MIN_EXAMPLES:
+            record["eval_sample"] = training_data[:EVAL_SAMPLE]
+            record["eval_production"] = self.versions[self.serving_version]
         record["train_done_tick"] = self.tick + record["train_ticks"]
         record["deploy_tick"] = max(record["deploy_tick"], record["train_done_tick"])
         thread = threading.Thread(
