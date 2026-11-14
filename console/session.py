@@ -1418,7 +1418,7 @@ class SimSession:
                "train_ticks": record.get("train_ticks"),
                "cluster": record["cluster"].summary(), "lr": record["lr"],
                "data_checks": record.get("data_checks"), "model_checks": record.get("model_checks"),
-               "losses": record.get("losses")}
+               "losses": record.get("losses"), "eval_losses": record.get("eval_losses")}
         self.workflow_runs.append(run)
         del self.workflow_runs[:-20]
         self.last_workflow_failure = None if status == "succeeded" else run
