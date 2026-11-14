@@ -230,7 +230,7 @@ def task_seconds(stage_kind, spec, config, slow=1.0):
     return seconds * slow, spill, oom
 
 
-def simulate(stages, config, conditions=None, rng=None, listing_files=0, commit_rows=0, max_timeline=3000):
+def simulate(stages, config, conditions=None, rng=None, listing_files=0, commit_rows=0, max_timeline=1000):
     """Run `stages` (StageSpecs; parents must come first) on a cluster.
     rng: a random.Random, used only when executors can be lost."""
     cond = conditions or C.Conditions()
