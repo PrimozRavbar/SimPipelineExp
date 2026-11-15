@@ -103,6 +103,15 @@ class OfflineFeaturePipeline:
     # and "profile_strength" (ml_system.features); off by default.
     engagement = False
 
+    # Fault injection (feature_nulls): a bad deploy of the job writes empty
+    # genre profiles for this share of users (picked by user id). Only what
+    # it writes is wrong (history snapshots and latest features); the
+    # carried state stays right, so a full backfill repairs the store.
+    null_profile_share = 0.0
+
+    def _broken(self, user_id):
+        return self.null_profile_share > 0 and (user_id * 2654435761) % 1000 < self.null_profile_share * 1000
+
     def config(self):
         """Settings the features depend on: a change needs a backfill."""
         return (self.profile_mode, bool(self.engagement))
@@ -307,10 +316,16 @@ class OfflineFeaturePipeline:
                                       (item_results, self.item_state, "item")):
             ordered = sorted(results.items(), key=first_order)
             for entity_id, (state, history) in ordered:
+                if kind == "user" and self._broken(entity_id):
+                    for _, snapshot in history:
+                        snapshot["genre_preferences"] = {}
                 store.append_history(kind, entity_id, history)
                 states[entity_id] = state
                 if kind == "user":
-                    store.write_user_features(entity_id, self.latest_user_features(state))
+                    latest = self.latest_user_features(state)
+                    if self._broken(entity_id):
+                        latest["genre_preferences"] = {}
+                    store.write_user_features(entity_id, latest)
                 else:
                     store.write_item_features(entity_id, deepcopy(state["features"]))
         if batch.full:

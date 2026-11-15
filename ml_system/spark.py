@@ -72,6 +72,8 @@ class Spark(Service):
         self.max_history = 20
         self.last_run = None
 
+        self.force_full = False       # the next job recomputes everything (a backfill)
+
         # Fault injection: while set, no executor can start (jobs fail).
         self.failing = False
 
@@ -83,7 +85,10 @@ class Spark(Service):
 
     def plan_offline_feature_job(self, events, feature_pipeline, lake=None, submitted_tick=None):
         """Plan and simulate one feature job over `events` (the lake)."""
-        batch = feature_pipeline.plan_batch(events, incremental=self.incremental)
+        batch = feature_pipeline.plan_batch(events, incremental=self.incremental and not self.force_full)
+        if self.force_full:
+            self.force_full = False
+            batch.reason = "backfill: requested"
         rows = batch.events_with_order()
         user_rows, item_rows = {}, {}
         for _, event in rows:

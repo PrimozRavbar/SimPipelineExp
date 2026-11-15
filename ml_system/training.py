@@ -310,3 +310,45 @@ class EmbeddingGenerator:
             )
 
         return embeddings
+
+
+def evaluation_loss(user_tower, item_tower, examples, temperature, batch_size=128):
+    """Mean in-batch softmax loss of a two-tower model on `examples` (the
+    training loss without popularity correction or random negatives), with
+    no gradients and no randomness: comparable between two models scored on
+    the same examples. Model validation scores the new model and the
+    production model this way on a sample of the new training set."""
+    total, batches = 0.0, 0
+    with torch.no_grad():
+        for start in range(0, len(examples), batch_size):
+            batch = examples[start:start + batch_size]
+            size = len(batch)
+            users = F.normalize(user_tower.forward(torch.stack([
+                user_tower.encode_features(e["user_features"]) for e in batch])), p=2, dim=1)
+            positives = F.normalize(item_tower.forward(torch.stack([
+                item_tower.encode_features(e["positive_item_features"]) for e in batch])), p=2, dim=1)
+            pair = (users @ positives.T) / temperature
+            positive = pair.diagonal().unsqueeze(1)
+            parts = [positive]
+            if size > 1:
+                off_diagonal = ~torch.eye(size, dtype=torch.bool)
+                parts.append(pair[off_diagonal].view(size, size - 1))
+            sampled = []
+            for i, e in enumerate(batch):
+                negatives = e["negative_item_features"]
+                if negatives:
+                    vectors = F.normalize(item_tower.forward(torch.stack([
+                        item_tower.encode_features(f) for f in negatives])), p=2, dim=1)
+                    sampled.append((users[i:i + 1] @ vectors.T) / temperature)
+                else:
+                    sampled.append(torch.empty(1, 0))
+            width = max(s.shape[1] for s in sampled)
+            if width:
+                padded = torch.full((size, width), float("-inf"))
+                for i, s in enumerate(sampled):
+                    padded[i, :s.shape[1]] = s[0]
+                parts.append(padded)
+            logits = torch.cat(parts, dim=1)
+            total += F.cross_entropy(logits, torch.zeros(size, dtype=torch.long)).item()
+            batches += 1
+    return total / batches if batches else float("nan")
